@@ -19,18 +19,21 @@ struct Cli {
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    let Some(path) = cli.path else {
-        eprintln!("mp3tui: falta el path. Uso: mp3tui <archivo-de-audio>");
-        return ExitCode::FAILURE;
+    // Sin path: explorador en el directorio actual.
+    // Con carpeta: explorador en esa carpeta.
+    // Con archivo: comportamiento original (reproducción directa a la TUI,
+    // con la biblioteca de la carpeta contenedora a mano en modo explorador).
+    let start = match cli.path.as_deref() {
+        None => ui::StartMode::Browse(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        ),
+        Some(path) if path.is_dir() => ui::StartMode::Browse(path.to_path_buf()),
+        Some(path) if path.is_file() => ui::StartMode::PlayFile(path.to_path_buf()),
+        Some(path) => {
+            eprintln!("mp3tui: '{}' no existe.", path.display());
+            return ExitCode::FAILURE;
+        }
     };
-
-    if path.is_dir() {
-        eprintln!(
-            "mp3tui: '{}' es una carpeta; la biblioteca por carpetas llega en T5. Pasá un archivo de audio.",
-            path.display()
-        );
-        return ExitCode::FAILURE;
-    }
 
     let mut engine = match audio::AudioEngine::new() {
         Ok(engine) => engine,
@@ -40,12 +43,14 @@ fn main() -> ExitCode {
         }
     };
 
-    if let Err(err) = engine.play(&path) {
+    if let ui::StartMode::PlayFile(path) = &start
+        && let Err(err) = engine.play(path)
+    {
         eprintln!("mp3tui: no se pudo reproducir '{}': {err}", path.display());
         return ExitCode::FAILURE;
     }
 
-    match ui::run(&mut engine, &path) {
+    match ui::run(&mut engine, start) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("mp3tui: error de la TUI: {err}");

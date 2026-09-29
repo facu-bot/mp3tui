@@ -141,12 +141,40 @@ Engram esté disponible.
       RDD: riesgo alto (mismo motivo estructural); consentimiento otorgado;
       revisión con 4 lentes, sin findings. Review aprobada y confirmada. Boundary
       revisado avanza a `88bc4c6`.
-- [ ] T5 — Explorador de archivos + biblioteca (alcance extendido por pedido del
+- [x] T5 — Explorador de archivos + biblioteca (alcance extendido por pedido del
       usuario: "agrega una tarea para agregar un explorador de archivos mp3, para
       buscar audios, reproducirlos"): panel interactivo para navegar carpetas, listar
       archivos de audio con metadata (título/artista/álbum vía lofty), elegir uno con
       el teclado y reproducirlo. Reescaneo recursivo de la carpeta pasada por CLI (o
-      cwd si no se pasa ninguna — a definir en la implementación). Ruta: delegada.
+      cwd si no se pasa ninguna). Ruta: delegada.
+      Implementación: modo Explorer (navegación ↑/↓, Enter reproduce, b/Tab
+      vuelve del reproductor al explorador re-sincronizando la selección con la
+      pista sonando), diseño con paleta única de acento, filas alineadas con
+      duración a la derecha y resaltado de selección/pista sonando.
+      Hallazgo real detectado en revisión de código (fork) antes de comitear:
+      `Playlist::from_dir_scan` (recorrido + `lofty::read_from_path` por archivo)
+      corría de forma síncrona en el hilo de la UI tanto al arrancar como en cada
+      `b`/Tab, lo que congelaba el teclado/render varios segundos en una
+      biblioteca real de miles de archivos. Corregido: el escaneo ahora corre en
+      un hilo aparte y entrega el resultado por `mpsc::channel`, sondeado sin
+      bloquear una vez por frame (`poll_scan`, mismo espíritu que
+      ingest()/analyze() del visualizador); un segundo `b` mientras ya hay un
+      escaneo en curso no lanza uno nuevo; un canal desconectado no deja la UI en
+      "Escaneando…" para siempre. Verificado con un escenario de 10.000 mp3 con
+      tags ID3v2 reales: el estado de carga se pinta desde el primer frame, el
+      scan completo tardó ~450ms, y `q` durante el escaneo cerró en 15ms sin
+      dejar la UI trabada. Segundo hallazgo menor (fila no respeta el ancho
+      exacto documentado con terminal muy angosta + duración ≥1h) también
+      corregido en el mismo pase, con test dedicado.
+      Evidencia: `cargo build`/`cargo clippy --all-targets` en 0/0, `cargo test`
+      21/21 (16 previos + 5 nuevos de scan en background/selección/fila angosta).
+      El agente extendió su harness E2E con escenarios F/G (arranque sin archivo,
+      navegación con Enter, vuelta con b, regresión de A/B/C) y el nuevo H
+      (biblioteca de 10k archivos), todos PASS. Orquestador verificó de forma
+      independiente: arranque sobre una carpeta real con música y sobre una
+      carpeta vacía, ambos sin crash ni proceso zombie; revisión de código vía
+      fork detectó el problema de bloqueo antes de comitear, evitando mergear un
+      defecto real de UX.
 - [ ] T6 — Atajos de teclado, shuffle/repeat, búsqueda/filtro de playlist. Ruta:
       delegada.
 - [ ] T7 — Seek (nueva, pedido del usuario: "adelantar segundos de la cancion"):
