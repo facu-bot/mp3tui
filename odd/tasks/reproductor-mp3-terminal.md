@@ -119,12 +119,25 @@ Engram esté disponible.
       review-resilience (`app.error` en ui/mod.rs nunca se limpia tras un fallo de
       replay, queda pegado en pantalla) — anotado como backlog. Review aprobada y
       confirmada. Boundary revisado avanza a `a190aca`.
-- [ ] T4 — Visualizador FFT estilo cava: rustfft sobre las muestras del ring buffer,
+- [x] T4 — Visualizador FFT estilo cava: rustfft sobre las muestras del ring buffer,
       barras logarítmicas con suavizado attack/decay y gradiente de color truecolor.
       Reforzado por pedido del usuario: la visualización y el layout que la rodea
       deben verse cuidados/atractivos, no solo funcionales. Ruta: delegada.
-      **En curso**: delegada al agente `mp3builder`, en progreso al momento de
-      registrar T5/T7/T8 más abajo (pedido nuevo del usuario llegó mientras corría).
+      Implementación: ventana Hann + FFT de 2048 muestras (rustfft), 32 bandas con
+      mapeo logarítmico de frecuencia (bordes contiguos, sin huecos/traslapes),
+      attack 0.55 / decay 0.16 para suavizado temporal. `ingest()` (copia del tap,
+      con el Mutex tomado brevemente) separado de `analyze()` (FFT, sin lock) para
+      que el callback de audio nunca espere una FFT. Barras pintadas celda a celda
+      con gradiente verde→amarillo→rojo (Color::Rgb).
+      Evidencia: `cargo build`/`cargo clippy --all-targets` en 0/0. 7 tests unitarios
+      (contigüidad de bandas en 22.05/44.1/48/96 kHz, decaimiento sin muestras,
+      colores del gradiente en los extremos y en el medio, alturas de barra
+      completa/media/vacía). El agente verificó con audio real (90210.mp3): log
+      temporal confirmó variación real de magnitudes entre ventanas (perfil con
+      graves dominando, coherente con música), y un escenario de pausa mostró las
+      barras cayendo a 0 en ~2.5s tras SPACE. Orquestador verificó de forma
+      independiente que el binario se recompiló con los cambios (timestamp
+      posterior al commit anterior).
 - [ ] T5 — Explorador de archivos + biblioteca (alcance extendido por pedido del
       usuario: "agrega una tarea para agregar un explorador de archivos mp3, para
       buscar audios, reproducirlos"): panel interactivo para navegar carpetas, listar

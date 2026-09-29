@@ -7,13 +7,14 @@ use std::path::Path;
 use std::time::Duration;
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Gauge, Paragraph};
 use ratatui::Frame;
 
 use crate::audio::AudioEngine;
+use crate::visualizer::{SpectrumAnalyzer, NUM_BANDS};
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const VOLUME_STEP: f32 = 0.05;
@@ -30,6 +31,7 @@ struct App {
     status: Status,
     error: Option<String>,
     should_quit: bool,
+    analyzer: SpectrumAnalyzer,
 }
 
 impl App {
@@ -39,6 +41,7 @@ impl App {
             status,
             error: None,
             should_quit: false,
+            analyzer: SpectrumAnalyzer::new(),
         }
     }
 }
@@ -100,19 +103,18 @@ fn event_loop(
     engine: &mut AudioEngine,
     path: &Path,
 ) -> io::Result<()> {
-    let mut needs_redraw = true;
-
     loop {
-        let previous = app.status;
         app.status = status_of(engine);
-        if app.status != previous {
-            needs_redraw = true;
-        }
 
-        if needs_redraw {
-            tui.terminal.draw(|frame| render(frame, app, engine))?;
-            needs_redraw = false;
+        // Lock corto: solo copiar muestras del tap; la FFT corre después, sin lock.
+        {
+            let tap = engine.visualizer();
+            let mut tap = tap.lock().unwrap();
+            app.analyzer.ingest(&mut tap);
         }
+        app.analyzer.analyze();
+
+        tui.terminal.draw(|frame| render(frame, app, engine))?;
 
         if !event::poll(FRAME_INTERVAL)? {
             continue;
@@ -124,9 +126,7 @@ fn event_loop(
                 if app.should_quit {
                     break;
                 }
-                needs_redraw = true;
             }
-            Event::Resize(..) => needs_redraw = true,
             _ => {}
         }
     }
@@ -180,7 +180,7 @@ fn render(frame: &mut Frame<'_>, app: &App, engine: &AudioEngine) {
         .split(frame.area());
 
     render_info(frame, zones[0], app, engine);
-    render_visualizer(frame, zones[1]);
+    render_visualizer(frame, zones[1], app.analyzer.bands());
     render_footer(frame, zones[2]);
 }
 
@@ -244,14 +244,66 @@ fn render_info(frame: &mut Frame<'_>, area: Rect, app: &App, engine: &AudioEngin
     );
 }
 
-fn render_visualizer(frame: &mut Frame<'_>, area: Rect) {
-    frame.render_widget(
-        Paragraph::new("(T4) espectro FFT proximamente")
-            .block(Block::bordered().title(" Visualizador "))
-            .style(Style::default().fg(Color::DarkGray))
-            .alignment(Alignment::Center),
-        area,
-    );
+fn render_visualizer(frame: &mut Frame<'_>, area: Rect, bands: &[f32; NUM_BANDS]) {
+    let block = Block::bordered().title(" Visualizador ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    paint_bands(frame.buffer_mut(), inner, bands);
+}
+
+/// Pinta las 32 barras dentro del área interior del bloque, sin widgets:
+/// cada celda recibe el simbolo y el color de su altura en el gradiente.
+fn paint_bands(buffer: &mut ratatui::buffer::Buffer, inner: Rect, bands: &[f32; NUM_BANDS]) {
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    // 32 slots de `slot_w` columnas: 1 para la barra + 1 de separación.
+    let slot_width = (inner.width / NUM_BANDS as u16).max(1);
+    let bar_width = slot_width.saturating_sub(1).max(1);
+    let right = inner.x + inner.width;
+    let bottom = inner.y + inner.height;
+
+    for (band, &magnitude) in bands.iter().enumerate() {
+        let x0 = inner.x + band as u16 * slot_width;
+        if x0 >= right {
+            break;
+        }
+        let width = bar_width.min(right - x0);
+        let height = ((magnitude.clamp(0.0, 1.0)) * inner.height as f32).round() as u16;
+
+        for row in 0..inner.height {
+            let y = bottom - 1 - row;
+            let (symbol, color) = if row < height {
+                let t = if inner.height > 1 {
+                    row as f32 / (inner.height - 1) as f32
+                } else {
+                    1.0
+                };
+                let (red, green, blue) = spectrum_color(t);
+                ('█', Color::Rgb(red, green, blue))
+            } else {
+                (' ', Color::Reset)
+            };
+            for dx in 0..width {
+                if let Some(cell) = buffer.cell_mut((x0 + dx, y)) {
+                    cell.set_char(symbol).set_fg(color);
+                }
+            }
+        }
+    }
+}
+
+/// Verde (abajo) → amarillo (medio) → rojo (arriba), estilo cava.
+fn spectrum_color(t: f32) -> (u8, u8, u8) {
+    let t = t.clamp(0.0, 1.0);
+    if t < 0.5 {
+        let u = t * 2.0;
+        ((u * 255.0) as u8, 255, 0)
+    } else {
+        let u = (t - 0.5) * 2.0;
+        (255, ((1.0 - u) * 255.0) as u8, 0)
+    }
 }
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect) {
@@ -261,4 +313,71 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect) {
             .style(Style::default().fg(Color::DarkGray)),
         area,
     );
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::buffer::Buffer;
+
+    #[test]
+    fn spectrum_color_extremes() {
+        assert_eq!(spectrum_color(0.0), (0, 255, 0));
+        assert_eq!(spectrum_color(0.5), (255, 255, 0));
+        assert_eq!(spectrum_color(1.0), (255, 0, 0));
+    }
+
+    #[test]
+    fn paint_bands_full_bar_is_green_at_bottom_and_red_at_top() {
+        let area = Rect::new(0, 0, 8, 10);
+        let mut buffer = Buffer::empty(area);
+        let mut bands = [0.0f32; NUM_BANDS];
+        bands[0] = 1.0;
+        paint_bands(&mut buffer, area, &bands);
+
+        let bottom = &buffer[(0u16, 9u16)];
+        assert_eq!(bottom.symbol(), "\u{2588}");
+        assert_eq!(bottom.fg, Color::Rgb(0, 255, 0));
+
+        let top = &buffer[(0u16, 0u16)];
+        assert_eq!(top.symbol(), "\u{2588}");
+        assert_eq!(top.fg, Color::Rgb(255, 0, 0));
+
+        let mid = &buffer[(0u16, 5u16)];
+        assert_eq!(mid.symbol(), "\u{2588}");
+        match mid.fg {
+            Color::Rgb(red, green, blue) => {
+                assert_eq!(green, 255);
+                assert_eq!(blue, 0);
+                assert!(red >= 100, "a mitad de altura debe ir hacia amarillo, red={red}");
+            }
+            other => panic!("esperaba Rgb, obtenido {other:?}"),
+        }
+    }
+
+    #[test]
+    fn paint_bands_zero_leaves_empty_reset_cells() {
+        let area = Rect::new(0, 0, 8, 10);
+        let mut buffer = Buffer::empty(area);
+        paint_bands(&mut buffer, area, &[0.0f32; NUM_BANDS]);
+
+        let cell = &buffer[(0u16, 9u16)];
+        assert_eq!(cell.symbol(), " ");
+        assert_eq!(cell.fg, Color::Reset);
+    }
+
+    #[test]
+    fn paint_bands_half_height_covers_bottom_half_only() {
+        let area = Rect::new(0, 0, 8, 10);
+        let mut buffer = Buffer::empty(area);
+        let mut bands = [0.0f32; NUM_BANDS];
+        bands[0] = 0.5;
+        paint_bands(&mut buffer, area, &bands);
+
+        // 5 filas de 10: y=9..5 son barra, y=4 queda vacia.
+        assert_eq!(buffer[(0u16, 5u16)].symbol(), "\u{2588}");
+        assert_eq!(buffer[(0u16, 4u16)].symbol(), " ");
+        assert_eq!(buffer[(0u16, 4u16)].fg, Color::Reset);
+    }
 }
