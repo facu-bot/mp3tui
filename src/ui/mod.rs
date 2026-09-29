@@ -17,6 +17,7 @@ use ratatui::widgets::{Block, Gauge, Paragraph};
 use ratatui::Frame;
 
 use crate::audio::AudioEngine;
+use crate::playback::{filter_tracks, next_track, shuffle_order, RepeatMode};
 use crate::playlist::{move_selection, scroll_offset, Playlist, Track};
 use crate::visualizer::{SpectrumAnalyzer, NUM_BANDS};
 
@@ -63,7 +64,21 @@ struct App {
     library: Option<Playlist>,
     /// Resultado del escaneo en curso (thread de background). `Some` = escaneando.
     scan_rx: Option<Receiver<Playlist>>,
+    /// Índices de la biblioteca que se muestran (filtrados por la búsqueda).
+    view: Vec<usize>,
+    /// Selección dentro de `view` (nunca un índice directo de la biblioteca).
     selected: usize,
+    /// Filtro de búsqueda confirmado (Enter); la lista visible lo respeta.
+    filter: Option<String>,
+    /// Texto de la búsqueda en curso; `Some` = modo búsqueda activo.
+    search: Option<String>,
+    /// Shuffle activo: next/previous recorren `shuffle_order` en vez del
+    /// orden de archivo.
+    shuffle: bool,
+    repeat: RepeatMode,
+    /// Permutación de `0..view.len()`; válida mientras `shuffle` esté activo
+    /// y `shuffle_order.len() == view.len()`.
+    shuffle_order: Vec<usize>,
     current_path: Option<PathBuf>,
     has_player: bool,
     track_label: String,
@@ -133,7 +148,13 @@ pub fn run(engine: &mut AudioEngine, start: StartMode) -> io::Result<()> {
         root,
         library: None,
         scan_rx: None,
+        view: Vec::new(),
         selected: 0,
+        filter: None,
+        search: None,
+        shuffle: false,
+        repeat: RepeatMode::Off,
+        shuffle_order: Vec::new(),
         current_path,
         has_player,
         track_label,
@@ -158,7 +179,13 @@ fn fallback_cwd() -> PathBuf {
 
 fn event_loop(tui: &mut Tui, app: &mut App, engine: &mut AudioEngine) -> io::Result<()> {
     loop {
+        // La transición Playing → Ended es el fin natural de la pista: ahí
+        // decide repeat (uno la relanza, todo salta y envuelve).
+        let previous_status = app.status;
         app.status = status_of(engine);
+        if previous_status == Status::Playing && app.status == Status::Ended {
+            handle_natural_end(app, engine);
+        }
         poll_scan(app);
 
         // Lock corto: solo copiar muestras del tap; la FFT corre después, sin lock.
@@ -207,6 +234,13 @@ fn handle_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine) {
         return;
     }
 
+    // Con la búsqueda abierta todo lo demás se escribe en el query: ni 'q'
+    // sale ni las flechas mueven la selección.
+    if app.search.is_some() {
+        handle_search_key(key, app);
+        return;
+    }
+
     match app.mode {
         Mode::Player => handle_player_key(key, app, engine),
         Mode::Browser => handle_browser_key(key, app, engine),
@@ -220,11 +254,20 @@ fn handle_player_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine) {
         KeyCode::Up => engine.set_volume((engine.volume() + VOLUME_STEP).clamp(0.0, 1.0)),
         KeyCode::Down => engine.set_volume((engine.volume() - VOLUME_STEP).clamp(0.0, 1.0)),
         KeyCode::Char('b') | KeyCode::Char('B') | KeyCode::Tab => enter_browser(app),
+        KeyCode::Char('n') | KeyCode::Char('N') => play_step(app, engine, 1),
+        KeyCode::Char('p') | KeyCode::Char('P') => play_step(app, engine, -1),
+        KeyCode::Char('s') | KeyCode::Char('S') => toggle_shuffle(app),
+        KeyCode::Char('r') | KeyCode::Char('R') => app.repeat = app.repeat.cycle(),
+        KeyCode::Char('/') => {
+            enter_browser(app);
+            open_search(app);
+        }
         _ => {}
     }
 }
 
 fn handle_browser_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine) {
+    let view_len = app.view.len();
     match key.code {
         KeyCode::Char('q') | KeyCode::Char('Q') => app.should_quit = true,
         KeyCode::Esc | KeyCode::Tab => {
@@ -239,31 +282,118 @@ fn handle_browser_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine) {
         }
         KeyCode::Enter => play_selected(app, engine),
         KeyCode::Char(' ') => toggle_play(app, engine),
-        KeyCode::Up => app.selected = move_selection(app.selected, -1, library_len(app)),
-        KeyCode::Down => app.selected = move_selection(app.selected, 1, library_len(app)),
-        KeyCode::PageUp => app.selected = move_selection(app.selected, -PAGE_STEP, library_len(app)),
-        KeyCode::PageDown => app.selected = move_selection(app.selected, PAGE_STEP, library_len(app)),
-        KeyCode::Home => app.selected = move_selection(app.selected, isize::MIN, library_len(app)),
-        KeyCode::End => app.selected = move_selection(app.selected, isize::MAX, library_len(app)),
+        KeyCode::Char('n') | KeyCode::Char('N') => play_step(app, engine, 1),
+        KeyCode::Char('p') | KeyCode::Char('P') => play_step(app, engine, -1),
+        KeyCode::Char('s') | KeyCode::Char('S') => toggle_shuffle(app),
+        KeyCode::Char('r') | KeyCode::Char('R') => app.repeat = app.repeat.cycle(),
+        KeyCode::Char('/') => open_search(app),
+        KeyCode::Up => app.selected = move_selection(app.selected, -1, view_len),
+        KeyCode::Down => app.selected = move_selection(app.selected, 1, view_len),
+        KeyCode::PageUp => app.selected = move_selection(app.selected, -PAGE_STEP, view_len),
+        KeyCode::PageDown => app.selected = move_selection(app.selected, PAGE_STEP, view_len),
+        KeyCode::Home => app.selected = move_selection(app.selected, isize::MIN, view_len),
+        KeyCode::End => app.selected = move_selection(app.selected, isize::MAX, view_len),
         _ => {}
     }
 }
 
-fn library_len(app: &App) -> usize {
-    app.library.as_ref().map_or(0, Playlist::len)
+/// Modo búsqueda incremental: '/' lo abre, y mientras está activo la lista se
+/// filtra en vivo. Enter confirma el filtro, Esc cancela y restaura la lista
+/// completa.
+fn handle_search_key(key: KeyEvent, app: &mut App) {
+    match key.code {
+        KeyCode::Esc => {
+            app.search = None;
+            app.filter = None;
+        }
+        KeyCode::Enter => {
+            let text = app.search.take().unwrap_or_default();
+            app.filter = (!text.trim().is_empty()).then_some(text);
+        }
+        KeyCode::Backspace => {
+            if let Some(query) = app.search.as_mut() {
+                query.pop();
+            }
+        }
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(query) = app.search.as_mut() {
+                query.push(c);
+            }
+        }
+        _ => {}
+    }
+    refresh_view(app);
+}
+
+fn open_search(app: &mut App) {
+    // El texto arranca del filtro actual para poder editarlo.
+    app.search = Some(app.filter.clone().unwrap_or_default());
+    refresh_view(app);
 }
 
 fn library_get(app: &App, index: usize) -> Option<&Track> {
     app.library.as_ref().and_then(|library| library.get(index))
 }
 
+fn view_get(app: &App, index: usize) -> Option<&Track> {
+    app.view
+        .get(index)
+        .and_then(|&library_index| library_get(app, library_index))
+}
+
+/// Posición de un path dentro de la lista visible.
+fn position_in_view(app: &App, path: &Path) -> Option<usize> {
+    let library_index = app.library.as_ref()?.index_of(path)?;
+    app.view.iter().position(|&index| index == library_index)
+}
+
+/// Posición de la pista sonando dentro de la lista visible (la que recorren
+/// next/previous con shuffle y repeat).
+fn current_view_position(app: &App) -> Option<usize> {
+    let path = app.current_path.as_ref()?;
+    position_in_view(app, path)
+}
+
+/// Recalcula la lista visible (biblioteca filtrada por búsqueda/filtro) sin
+/// perder la selección: se preserva la pista seleccionada por path, si ya no
+/// existe se usa la sonando y si ninguna está en la vista se acota a rango.
+/// Con shuffle activo regenera el orden mezclado para la nueva lista.
+fn refresh_view(app: &mut App) {
+    let previous_path = app
+        .view
+        .get(app.selected)
+        .and_then(|&library_index| library_get(app, library_index))
+        .map(|track| track.path.clone());
+
+    let needle = app
+        .search
+        .as_ref()
+        .or(app.filter.as_ref())
+        .map(String::as_str);
+    app.view = app
+        .library
+        .as_ref()
+        .map(|library| filter_tracks(library.tracks(), needle))
+        .unwrap_or_default();
+
+    let new_selected = previous_path
+        .as_ref()
+        .and_then(|path| position_in_view(app, path))
+        .or_else(|| current_view_position(app))
+        .unwrap_or(0)
+        .min(app.view.len().saturating_sub(1));
+    app.selected = new_selected;
+
+    if app.shuffle {
+        app.shuffle_order = shuffle_order(app.view.len());
+    }
+}
+
 /// Ubica la selección en la pista que está sonando (si está en la biblioteca).
 fn resync_selection(app: &mut App) {
-    app.selected = app
-        .current_path
-        .as_ref()
-        .and_then(|path| app.library.as_ref().and_then(|library| library.index_of(path)))
-        .unwrap_or(0);
+    if let Some(position) = current_view_position(app) {
+        app.selected = position;
+    }
 }
 
 /// Lanza el escaneo de `app.root` en un thread aparte. Si ya hay un escaneo en
@@ -289,21 +419,18 @@ fn poll_scan(app: &mut App) {
     match result {
         None | Some(Err(TryRecvError::Empty)) => {}
         Some(Ok(playlist)) => {
-            let had_library = app.library.is_some();
             app.library = Some(playlist);
             app.scan_rx = None;
-            if had_library {
-                // Rescann: no patear la selección del usuario, solo acotarla.
-                app.selected = app.selected.min(library_len(app).saturating_sub(1));
-            } else {
-                resync_selection(app);
-            }
+            // Reaplica filtro y, si había shuffle activo, regenera el orden
+            // mezclado; la selección se preserva por pista.
+            refresh_view(app);
         }
         Some(Err(TryRecvError::Disconnected)) => {
             // El thread murió sin entregar: biblioteca vacía para no dejar la
             // UI en "Escaneando…" para siempre.
             app.library = Some(Playlist::new());
             app.scan_rx = None;
+            refresh_view(app);
         }
     }
 }
@@ -325,15 +452,18 @@ fn toggle_play(app: &mut App, engine: &mut AudioEngine) {
 /// reproducción. Si el archivo no se puede abrir, seguimos en el explorador
 /// con el error visible.
 fn play_selected(app: &mut App, engine: &mut AudioEngine) {
-    let Some(track) = library_get(app, app.selected) else {
+    let Some(library_index) = app.view.get(app.selected).copied() else {
+        return;
+    };
+    let Some(track) = library_get(app, library_index) else {
         return;
     };
     let path = track.path.clone();
-    let label = track.path.to_string_lossy().into_owned();
+    let label = path.to_string_lossy().into_owned();
     match engine.play(&path) {
         Ok(()) => {
             if let Some(library) = app.library.as_mut() {
-                library.set_current(Some(app.selected));
+                library.set_current(Some(library_index));
             }
             app.current_path = Some(path);
             app.track_label = label;
@@ -345,10 +475,77 @@ fn play_selected(app: &mut App, engine: &mut AudioEngine) {
     }
 }
 
-/// 'b' / Tab desde el reproductor: abre el explorador y reescanea la raíz en
-/// background (si ya hay un escaneo en curso, no lanza otro).
+/// 'n' / 'p': salta a la siguiente/anterior pista de la playlist visible,
+/// respetando shuffle y repeat, sin salir del modo actual (en el explorador
+/// además mueve la selección). No envuelve con repeat Off/One.
+fn play_step(app: &mut App, engine: &mut AudioEngine, step: isize) {
+    if app.shuffle && app.shuffle_order.len() != app.view.len() {
+        // La lista cambió desde que se armó el orden (filtro/rescann).
+        app.shuffle_order = shuffle_order(app.view.len());
+    }
+    let current = current_view_position(app);
+    let Some(target) = next_track(
+        app.view.len(),
+        current,
+        app.repeat,
+        app.shuffle,
+        &app.shuffle_order,
+        step,
+    ) else {
+        return;
+    };
+    let Some(library_index) = app.view.get(target).copied() else {
+        return;
+    };
+    let Some(track) = library_get(app, library_index) else {
+        return;
+    };
+    let path = track.path.clone();
+    let label = path.to_string_lossy().into_owned();
+    match engine.play(&path) {
+        Ok(()) => {
+            if let Some(library) = app.library.as_mut() {
+                library.set_current(Some(library_index));
+            }
+            app.current_path = Some(path);
+            app.track_label = label;
+            app.has_player = true;
+            app.selected = target;
+            app.error = None;
+        }
+        Err(err) => app.error = Some(err.to_string()),
+    }
+}
+
+fn toggle_shuffle(app: &mut App) {
+    app.shuffle = !app.shuffle;
+    if app.shuffle {
+        app.shuffle_order = shuffle_order(app.view.len());
+    }
+}
+
+/// Fin natural de la pista (transición Playing → Ended): decide el repeat
+/// sin esperar que el usuario apriete espacio.
+fn handle_natural_end(app: &mut App, engine: &mut AudioEngine) {
+    match app.repeat {
+        RepeatMode::Off => {}
+        RepeatMode::One => {
+            if let Some(path) = app.current_path.clone()
+                && let Err(err) = engine.play(&path)
+            {
+                app.error = Some(err.to_string());
+            }
+        }
+        RepeatMode::All => play_step(app, engine, 1),
+    }
+}
+
+/// 'b' / Tab desde el reproductor: abre el explorador, apunta la selección a
+/// la pista sonando y reescanea la raíz en background (si ya hay un escaneo en
+/// curso, no lanza otro).
 fn enter_browser(app: &mut App) {
     app.mode = Mode::Browser;
+    refresh_view(app);
     resync_selection(app);
     start_scan(app);
 }
@@ -382,15 +579,38 @@ fn status_parts(status: Status) -> (&'static str, Color) {
     }
 }
 
-fn status_line(status: Status) -> Line<'static> {
+fn status_line(status: Status, repeat: RepeatMode, shuffle: bool) -> Line<'static> {
     let (text, color) = status_parts(status);
-    Line::from(vec![
+    let mut spans = vec![
         Span::styled("Estado:  ", Style::default().fg(DIM)),
         Span::styled(
             text,
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ),
-    ])
+    ];
+    spans.extend(repeat_shuffle_spans(repeat, shuffle));
+    Line::from(spans)
+}
+
+/// Indicadores de estado compartidos: solo lo que está activo ("repeat: todo",
+/// "shuffle: sí"), así en los defaults la pantalla queda limpia.
+fn repeat_shuffle_spans(repeat: RepeatMode, shuffle: bool) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    if let Some(label) = repeat.label() {
+        spans.push(Span::styled("  ·  ", Style::default().fg(DIM)));
+        spans.push(Span::styled(
+            format!("repeat: {label}"),
+            Style::default().fg(ACCENT),
+        ));
+    }
+    if shuffle {
+        spans.push(Span::styled("  ·  ", Style::default().fg(DIM)));
+        spans.push(Span::styled(
+            "shuffle: sí",
+            Style::default().fg(ACCENT),
+        ));
+    }
+    spans
 }
 
 fn error_line(app: &App) -> Line<'static> {
@@ -409,7 +629,7 @@ fn render_player(frame: &mut Frame<'_>, app: &App, engine: &AudioEngine) {
         .constraints([
             Constraint::Length(8),
             Constraint::Min(4),
-            Constraint::Length(3),
+            Constraint::Length(4),
         ])
         .split(frame.area());
 
@@ -438,7 +658,11 @@ fn render_player_info(frame: &mut Frame<'_>, area: Rect, app: &App, engine: &Aud
     ]);
 
     frame.render_widget(
-        Paragraph::new(vec![file_line, status_line(app.status), error_line(app)]),
+        Paragraph::new(vec![
+            file_line,
+            status_line(app.status, app.repeat, app.shuffle),
+            error_line(app),
+        ]),
         rows[0],
     );
 
@@ -463,7 +687,7 @@ fn render_browser(frame: &mut Frame<'_>, app: &App) {
                 Constraint::Length(5),
                 Constraint::Min(6),
                 Constraint::Length(6),
-                Constraint::Length(3),
+                Constraint::Length(4),
             ])
             .split(frame.area())
     } else {
@@ -472,7 +696,7 @@ fn render_browser(frame: &mut Frame<'_>, app: &App) {
             .constraints([
                 Constraint::Length(5),
                 Constraint::Min(6),
-                Constraint::Length(3),
+                Constraint::Length(4),
             ])
             .split(frame.area())
     };
@@ -512,12 +736,14 @@ fn render_browser_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
     };
 
     let status = if app.has_player {
-        status_line(app.status)
+        status_line(app.status, app.repeat, app.shuffle)
     } else {
-        Line::from(vec![
+        let mut spans = vec![
             Span::styled("Estado:  ", Style::default().fg(DIM)),
             Span::styled("Explorando", Style::default().fg(DIM)),
-        ])
+        ];
+        spans.extend(repeat_shuffle_spans(app.repeat, app.shuffle));
+        Line::from(spans)
     };
 
     frame.render_widget(Paragraph::new(vec![now_line, status, error_line(app)]), inner);
@@ -525,18 +751,8 @@ fn render_browser_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
 fn render_library(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let folder = folder_label(&app.root);
-    let title = match (&app.library, app.scan_rx.is_some()) {
-        (Some(library), true) => format!(
-            " Biblioteca · {} pistas · {folder} · actualizando… ",
-            library.len()
-        ),
-        (Some(library), false) => {
-            format!(" Biblioteca · {} pistas · {folder} ", library.len())
-        }
-        (None, _) => format!(" Biblioteca · {folder} "),
-    };
     let block = themed_block(Span::styled(
-        title,
+        library_title(app, &folder),
         Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
     ));
     let inner = block.inner(area);
@@ -555,36 +771,79 @@ fn render_library(frame: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     };
 
-    if library.is_empty() {
-        frame.render_widget(
-            Paragraph::new(Line::styled(
+    if app.view.is_empty() {
+        let (message, style) = if library.is_empty() {
+            (
                 " Sin archivos de audio (mp3, flac, ogg, wav) en esta carpeta ",
                 Style::default().fg(DIM),
-            )),
-            inner,
-        );
+            )
+        } else {
+            (
+                " Sin coincidencias para la búsqueda ",
+                Style::default().fg(ACCENT),
+            )
+        };
+        frame.render_widget(Paragraph::new(Line::styled(message, style)), inner);
         return;
     }
 
     let view_height = inner.height as usize;
-    let first = scroll_offset(app.selected, library.len(), view_height);
+    let first = scroll_offset(app.selected, app.view.len(), view_height);
 
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(view_height);
-    for index in first..first + view_height {
-        let Some(track) = library.get(index) else {
+    for (position, library_index) in app.view.iter().enumerate().skip(first) {
+        if lines.len() >= view_height {
+            break;
+        }
+        let Some(track) = library.get(*library_index) else {
             break;
         };
-        let is_selected = index == app.selected;
+        let is_selected = position == app.selected;
         let is_playing = app.current_path.as_deref() == Some(track.path.as_path());
         lines.push(row_line(
             track,
-            index + 1,
+            position + 1,
             is_selected,
             is_playing,
             inner.width,
         ));
     }
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Título del bloque biblioteca: lista visible, filtro, búsqueda activa y
+/// modos de reproducción (solo cuando están prendidos, para no ensuciar).
+fn library_title(app: &App, folder: &str) -> String {
+    let mut title = if let Some(query) = &app.search {
+        format!(" Buscar: {query} · {} coincidencias ", app.view.len())
+    } else {
+        match &app.library {
+            None => format!(" Biblioteca · {folder} "),
+            Some(library) => {
+                let count = if app.filter.is_some() {
+                    format!("{}/{}", app.view.len(), library.len())
+                } else {
+                    format!("{}", library.len())
+                };
+                let mut base = if app.scan_rx.is_some() {
+                    format!(" Biblioteca · {count} pistas · {folder} · actualizando… ")
+                } else {
+                    format!(" Biblioteca · {count} pistas · {folder} ")
+                };
+                if let Some(filter) = &app.filter {
+                    base.push_str(&format!("· filtro \"{filter}\" "));
+                }
+                base
+            }
+        }
+    };
+    if let Some(label) = app.repeat.label() {
+        title.push_str(&format!("· repeat: {label} "));
+    }
+    if app.shuffle {
+        title.push_str("· shuffle ");
+    }
+    title
 }
 
 fn folder_label(root: &Path) -> String {
@@ -740,19 +999,36 @@ fn spectrum_color(t: f32) -> (u8, u8, u8) {
     }
 }
 
-fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let hints = match app.mode {
-        Mode::Player => {
-            " espacio: play/pausa   flechas arriba/abajo: volumen   b/Tab: biblioteca   q/Esc: salir "
-        }
-        Mode::Browser if app.has_player => {
-            " ↑/↓ PgUp/PgDn: mover   Enter: reproducir   espacio: pausa   Esc/Tab: volver   q: salir "
-        }
-        Mode::Browser => " ↑/↓ PgUp/PgDn: mover   Enter: reproducir   q/Esc: salir ",
-    };
+/// El pie de atajos creció a dos líneas (T6): shuffle/repeat/n-p/buscar no
+/// entraban en una. Con la búsqueda abierta muestra su propio contexto.
+fn footer_lines(app: &App) -> Vec<Line<'static>> {
+    if app.search.is_some() {
+        return vec![
+            Line::from(" Escribí para filtrar por título, artista, álbum o archivo "),
+            Line::from(
+                " Backspace: borrar   Enter: aplicar   Esc: cancelar (lista completa) ",
+            ),
+        ];
+    }
+    match app.mode {
+        Mode::Player => vec![
+            Line::from(" espacio: play/pausa   flechas ↑/↓: volumen   n/p: pista sig/ant   /: buscar "),
+            Line::from(" s: shuffle   r: repeat   b/Tab: biblioteca   q/Esc: salir "),
+        ],
+        Mode::Browser => vec![
+            Line::from(
+                " ↑/↓ PgUp/PgDn: mover   Enter: reproducir   n/p: pista sig/ant   /: buscar ",
+            ),
+            Line::from(
+                " s: shuffle   r: repeat   espacio: pausa   Esc/Tab: volver   q/Esc: salir ",
+            ),
+        ],
+    }
+}
 
+fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(
-        Paragraph::new(hints)
+        Paragraph::new(footer_lines(app))
             .block(
                 Block::bordered()
                     .border_style(Style::default().fg(DIM))
@@ -891,7 +1167,13 @@ mod tests {
             root: PathBuf::from("."),
             library: None,
             scan_rx: None,
+            view: Vec::new(),
             selected: 0,
+            filter: None,
+            search: None,
+            shuffle: false,
+            repeat: RepeatMode::Off,
+            shuffle_order: Vec::new(),
             current_path: None,
             has_player: false,
             track_label: String::new(),
@@ -974,9 +1256,9 @@ mod tests {
         let (_tx, rx) = mpsc::channel(); // tx vivo: escaneo "en curso"
         app.scan_rx = Some(rx);
 
-        assert_eq!(library_len(&app), 0);
-        assert!(library_get(&app, 0).is_none());
-        app.selected = move_selection(app.selected, 5, library_len(&app));
+        assert_eq!(app.view.len(), 0);
+        assert!(view_get(&app, 0).is_none());
+        app.selected = move_selection(app.selected, 5, app.view.len());
         assert_eq!(app.selected, 0, "la seleccion no sale del rango vacio");
 
         poll_scan(&mut app);
@@ -995,5 +1277,153 @@ mod tests {
         // Con muy poco ancho la duración se descarta y el título manda.
         let line = row_line(&track, 1, false, false, 6);
         assert!(!line_text(&line).contains("1:02:05"));
+    }
+
+    fn library_with_three() -> App {
+        let mut app = test_app();
+        app.library = Some(crate::playlist::from_tracks_for_test(vec![
+            track_named("alpha"),
+            track_named("beta"),
+            track_named("gamma"),
+        ]));
+        refresh_view(&mut app);
+        app
+    }
+
+    #[test]
+    fn refresh_view_filters_and_keeps_the_selected_track() {
+        let mut app = library_with_three();
+        app.selected = 1; // beta
+
+        app.filter = Some("bet".to_string());
+        refresh_view(&mut app);
+        assert_eq!(app.view, vec![1], "filtro por prefijo del título");
+        assert_eq!(app.selected, 0, "la seleccionada sigue visible");
+
+        app.filter = Some("no-existe".to_string());
+        refresh_view(&mut app);
+        assert!(app.view.is_empty(), "sin coincidencias la lista queda vacia");
+        assert_eq!(app.selected, 0, "seleccion acotada al rango vacio");
+
+        app.filter = None;
+        refresh_view(&mut app);
+        assert_eq!(app.view, vec![0, 1, 2], "sin filtro vuelve la lista completa");
+    }
+
+    #[test]
+    fn refresh_view_syncs_selection_to_playing_track_on_first_scan() {
+        let mut app = test_app();
+        app.library = Some(crate::playlist::from_tracks_for_test(vec![
+            track_named("alpha"),
+            track_named("beta"),
+        ]));
+        app.current_path = Some(PathBuf::from(r"C:\x\beta.mp3"));
+        refresh_view(&mut app);
+        assert_eq!(app.selected, 1, "seleccion en la pista sonando");
+    }
+
+    #[test]
+    fn search_mode_types_into_query_enter_applies_and_esc_clears() {
+        let mut app = library_with_three();
+
+        open_search(&mut app);
+        assert!(app.search.is_some(), "'/' abre la búsqueda");
+
+        handle_search_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE), &mut app);
+        assert_eq!(app.search.as_deref(), Some("g"));
+        assert_eq!(app.view, vec![2], "filtrado en vivo");
+
+        handle_search_key(
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+            &mut app,
+        );
+        assert_eq!(app.view, vec![0, 1, 2], "backspace amplía de vuelta");
+
+        handle_search_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE), &mut app);
+        handle_search_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE), &mut app);
+        handle_search_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE), &mut app);
+        handle_search_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut app);
+        assert!(app.search.is_none(), "Enter cierra el modo búsqueda");
+        assert_eq!(app.filter.as_deref(), Some("bet"), "Enter confirma el filtro");
+        assert_eq!(app.view, vec![1]);
+
+        open_search(&mut app);
+        assert_eq!(app.search.as_deref(), Some("bet"), "reabre con el filtro actual");
+        handle_search_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut app);
+        assert!(app.search.is_none());
+        assert!(app.filter.is_none(), "Esc cancela y limpia el filtro");
+        assert_eq!(app.view, vec![0, 1, 2], "lista completa restaurada");
+    }
+
+    #[test]
+    fn shuffle_order_is_regenerated_when_view_changes() {
+        let mut app = test_app();
+        app.library = Some(crate::playlist::from_tracks_for_test(vec![
+            track_named("alpha"),
+            track_named("beta"),
+            track_named("gamma"),
+            track_named("delta"),
+        ]));
+        refresh_view(&mut app);
+
+        assert!(!app.shuffle, "arranca sin shuffle");
+        toggle_shuffle(&mut app);
+        assert!(app.shuffle, "'s' activa el shuffle");
+        assert_eq!(app.shuffle_order.len(), 4, "orden mezclado de la lista visible");
+
+        app.filter = Some("ta".to_string()); // "ta" matchea beta y delta
+        refresh_view(&mut app);
+        assert_eq!(app.view, vec![1, 3]);
+        assert_eq!(app.shuffle_order.len(), 2, "orden re-armado al cambiar el filtro");
+        let mut sorted = app.shuffle_order.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, vec![0, 1], "sigue siendo una permutación");
+    }
+
+    #[test]
+    fn footer_shows_the_new_shortcuts_in_each_mode() {
+        let mut app = library_with_three();
+        app.mode = Mode::Player;
+        let player: String = footer_lines(&app)
+            .iter()
+            .map(|line| line_text(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for hint in ["s: shuffle", "r: repeat", "n/p: pista", "/: buscar", "q/Esc: salir"] {
+            assert!(player.contains(hint), "footer del player falta '{hint}': {player}");
+        }
+
+        app.mode = Mode::Browser;
+        let browser: String = footer_lines(&app)
+            .iter()
+            .map(|line| line_text(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for hint in ["s: shuffle", "r: repeat", "n/p: pista", "/: buscar", "q/Esc: salir"] {
+            assert!(browser.contains(hint), "footer del explorador falta '{hint}': {browser}");
+        }
+
+        app.search = Some(String::new());
+        let search: String = footer_lines(&app)
+            .iter()
+            .map(|line| line_text(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(search.contains("Backspace"));
+        assert!(search.contains("Esc: cancelar"));
+    }
+
+    #[test]
+    fn repeat_and_shuffle_show_up_in_the_status_line_only_when_active() {
+        let plain = status_line(Status::Playing, RepeatMode::Off, false);
+        let plain_text = line_text(&plain);
+        assert!(plain_text.contains("Reproduciendo"));
+        assert!(!plain_text.contains("repeat"));
+        assert!(!plain_text.contains("shuffle"));
+
+        let active = status_line(Status::Playing, RepeatMode::All, true);
+        let active_text = line_text(&active);
+        assert!(active_text.contains("repeat: todo"), "{active_text}");
+        assert!(active_text.contains("shuffle: sí"), "{active_text}");
     }
 }

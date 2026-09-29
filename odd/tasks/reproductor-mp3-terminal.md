@@ -179,8 +179,27 @@ Engram esté disponible.
       revisión con 4 lentes, sin findings adicionales (el hallazgo real ya estaba
       corregido en el propio commit revisado). Review aprobada y confirmada.
       Boundary revisado avanza a `b989127`.
-- [ ] T6 — Atajos de teclado, shuffle/repeat, búsqueda/filtro de playlist. Ruta:
+- [x] T6 — Atajos de teclado, shuffle/repeat, búsqueda/filtro de playlist. Ruta:
       delegada.
+      Implementación: nuevo módulo `src/playback.rs` (422 líneas) con el orden de
+      reproducción (shuffle Fisher-Yates, next/previous con wraparound según modo
+      de repeat, re-derivación de posición sin cachear un índice viejo) separado
+      de la UI. Atajos: `s` shuffle on/off, `r` cicla repeat off→uno→todo, `n`/`p`
+      siguiente/anterior (respetando shuffle), `/` búsqueda incremental por
+      título/artista/álbum/nombre de archivo (Enter confirma el filtro, Esc
+      cancela y restaura la lista completa). Footer de atajos actualizado.
+      Evidencia: `cargo build`/`cargo clippy --all-targets` en 0/0, `cargo test`
+      42/42 (11 nuevos: permutación de shuffle en 6 longitudes × 3 semillas, ciclo
+      de repeat, wraparound por modo, filtro sobre 4 campos). Harness E2E 8/8 PASS
+      (regresión A/B/C/F/G/H + nuevos I con teclas reales de repeat/next/prev/
+      shuffle, J con búsqueda incremental en vivo). Orquestador verificó de forma
+      independiente que el binario se recompiló y arranca sin stderr ni proceso
+      zombie. Revisión de código vía fork (segunda pasada, mismo criterio que
+      T5): sin hallazgos de correctitud — confirmó permutación válida de Fisher-
+      Yates, disparo exactamente una vez del fin natural de pista (sin doble
+      disparo con espacio), sin index out-of-bounds en next/previous con
+      playlist vacía/de 1 pista, manejo correcto de Unicode multi-byte en
+      backspace de búsqueda, y que un rescan en curso no pierde el filtro activo.
 - [ ] T7 — Seek (nueva, pedido del usuario: "adelantar segundos de la cancion"):
       extender AudioEngine (T2) para exponer posición/duración de la pista actual y
       un método `seek(Duration)` que reposicione la decodificación con la API de

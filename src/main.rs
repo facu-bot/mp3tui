@@ -1,4 +1,5 @@
 mod audio;
+mod playback;
 mod playlist;
 mod ui;
 mod visualizer;
