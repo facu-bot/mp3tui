@@ -95,6 +95,10 @@ Engram esté disponible.
   corridas posteriores. Probablemente flake del entorno de test (conhost heredado
   de un proceso matado a la fuerza), no del código; mantener en observación si
   vuelve a aparecer al usar la app real.
+- `app.error` en src/ui/mod.rs (T3) se setea si falla el replay tras fin de pista,
+  pero nunca se limpia a `None` después; un error transitorio queda pegado en
+  pantalla aunque luego la reproducción funcione bien. Limpiar en un próximo touch
+  de ui/mod.rs (p.ej. al arrancar T4/T5), no bloqueante hoy.
 - [x] T3 — Shell de TUI con ratatui: layout base, controles de reproducción
       (play/pause/volumen) conectados al motor de audio. Ruta: delegada.
       Alcance real: play/pause (espacio, con replay tras fin natural), volumen
@@ -109,6 +113,11 @@ Engram esté disponible.
       Orquestador verificó de forma independiente: arranque real con
       `C:\Users\facu\Music\90210.mp3`, proceso vivo 3s sin stderr, kill forzado sin
       dejar zombie.
+      RDD: riesgo alto (mismo motivo, hilos en audio/mod.rs); consentimiento
+      otorgado; revisión con 4 lentes, 1 finding SUGGESTION no bloqueante en
+      review-resilience (`app.error` en ui/mod.rs nunca se limpia tras un fallo de
+      replay, queda pegado en pantalla) — anotado como backlog. Review aprobada y
+      confirmada. Boundary revisado avanza a `a190aca`.
 - [ ] T4 — Visualizador FFT estilo cava: rustfft sobre las muestras del ring buffer,
       barras logarítmicas con suavizado attack/decay y gradiente de color truecolor.
       Ruta: delegada.
