@@ -378,6 +378,7 @@ where
         }
 
         if shared.decoder_done.load(Ordering::Acquire) && playback.is_empty() {
+            shared.state.store(STATE_STOPPED, Ordering::Release);
             shared.finished.store(true, Ordering::Release);
         }
     };

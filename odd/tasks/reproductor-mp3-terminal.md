@@ -90,8 +90,25 @@ Engram esté disponible.
   estado (src/audio/mod.rs, ver stop() y el chequeo al tope de run_decode). Sin
   impacto para archivos locales; revisar si T3 conecta stop/pause a la UI y se nota
   latencia, o si en el futuro se soporta streaming remoto.
-- [ ] T3 — Shell de TUI con ratatui: layout base, controles de reproducción
-      (play/pause/seek/volumen) conectados al motor de audio. Ruta: delegada.
+- El agente de T3 reportó un colgado intermitente de conhost en una sola corrida de
+  su harness E2E, justo después de un force-kill previo; no se reprodujo en 4+
+  corridas posteriores. Probablemente flake del entorno de test (conhost heredado
+  de un proceso matado a la fuerza), no del código; mantener en observación si
+  vuelve a aparecer al usar la app real.
+- [x] T3 — Shell de TUI con ratatui: layout base, controles de reproducción
+      (play/pause/volumen) conectados al motor de audio. Ruta: delegada.
+      Alcance real: play/pause (espacio, con replay tras fin natural), volumen
+      ↑/↓ (±5%), salir con q/Esc/Ctrl+C restaurando la terminal (guard con Drop),
+      loop de eventos no bloqueante a ~60fps. Seek queda pendiente (el motor de
+      audio de T2 no expone posición/duración todavía; no se agregó en T3 para no
+      inventar una API a medias — se retoma si T4/T5 necesitan posición).
+      Evidencia: `cargo build`/`cargo clippy --all-targets` en 0/0. El agente corrió
+      un harness E2E propio (AttachConsole + inyección de teclas + lectura de
+      screen buffer) con 3 escenarios (pausa/volumen/resume, fin natural + replay,
+      Ctrl+C) verificando exit 0, raw mode restaurado y sin procesos zombie.
+      Orquestador verificó de forma independiente: arranque real con
+      `C:\Users\facu\Music\90210.mp3`, proceso vivo 3s sin stderr, kill forzado sin
+      dejar zombie.
 - [ ] T4 — Visualizador FFT estilo cava: rustfft sobre las muestras del ring buffer,
       barras logarítmicas con suavizado attack/decay y gradiente de color truecolor.
       Ruta: delegada.

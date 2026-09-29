@@ -45,15 +45,10 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    println!("Reproduciendo: {}", path.display());
-
-    match engine.wait_until_done() {
-        Ok(()) => {
-            println!("mp3tui: fin de la pista.");
-            ExitCode::SUCCESS
-        }
+    match ui::run(&mut engine, &path) {
+        Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("mp3tui: error durante la reproducción: {err}");
+            eprintln!("mp3tui: error de la TUI: {err}");
             ExitCode::FAILURE
         }
     }
