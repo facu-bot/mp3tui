@@ -138,6 +138,9 @@ Engram esté disponible.
       barras cayendo a 0 en ~2.5s tras SPACE. Orquestador verificó de forma
       independiente que el binario se recompiló con los cambios (timestamp
       posterior al commit anterior).
+      RDD: riesgo alto (mismo motivo estructural); consentimiento otorgado;
+      revisión con 4 lentes, sin findings. Review aprobada y confirmada. Boundary
+      revisado avanza a `88bc4c6`.
 - [ ] T5 — Explorador de archivos + biblioteca (alcance extendido por pedido del
       usuario: "agrega una tarea para agregar un explorador de archivos mp3, para
       buscar audios, reproducirlos"): panel interactivo para navegar carpetas, listar
