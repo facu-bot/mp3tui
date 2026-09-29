@@ -77,6 +77,19 @@ Engram esté disponible.
       mp3 del sistema (`C:\Users\facu\Music\90210.mp3`) confirmada de forma
       independiente (el proceso sigue vivo y sonando 4s después de arrancar, sin
       errores en stderr).
+      RDD: riesgo alto (thread spawn interno); consentimiento otorgado; revisión con
+      4 lentes, 1 finding SUGGESTION no bloqueante en review-resilience
+      (`AudioEngine::stop()` puede bloquear brevemente si `next_packet()` está en I/O
+      cuando se llama stop/pause; sin impacto para archivos locales, relevante si en
+      el futuro se soporta streaming/red) — anotado como backlog para T8. Review
+      aprobada y confirmada. Boundary revisado avanza a `ebc56ee`.
+
+## Backlog de hardening (no bloqueante, detectado en revisiones RDD)
+- `AudioEngine::stop()`/`pause()` pueden tardar hasta la duración de un
+  `next_packet()` en curso antes de que el hilo decodificador note el cambio de
+  estado (src/audio/mod.rs, ver stop() y el chequeo al tope de run_decode). Sin
+  impacto para archivos locales; revisar si T3 conecta stop/pause a la UI y se nota
+  latencia, o si en el futuro se soporta streaming remoto.
 - [ ] T3 — Shell de TUI con ratatui: layout base, controles de reproducción
       (play/pause/seek/volumen) conectados al motor de audio. Ruta: delegada.
 - [ ] T4 — Visualizador FFT estilo cava: rustfft sobre las muestras del ring buffer,
