@@ -175,6 +175,10 @@ Engram esté disponible.
       carpeta vacía, ambos sin crash ni proceso zombie; revisión de código vía
       fork detectó el problema de bloqueo antes de comitear, evitando mergear un
       defecto real de UX.
+      RDD: riesgo alto (mismo motivo estructural); consentimiento otorgado;
+      revisión con 4 lentes, sin findings adicionales (el hallazgo real ya estaba
+      corregido en el propio commit revisado). Review aprobada y confirmada.
+      Boundary revisado avanza a `b989127`.
 - [ ] T6 — Atajos de teclado, shuffle/repeat, búsqueda/filtro de playlist. Ruta:
       delegada.
 - [ ] T7 — Seek (nueva, pedido del usuario: "adelantar segundos de la cancion"):
