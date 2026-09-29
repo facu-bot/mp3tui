@@ -200,6 +200,9 @@ Engram esté disponible.
       disparo con espacio), sin index out-of-bounds en next/previous con
       playlist vacía/de 1 pista, manejo correcto de Unicode multi-byte en
       backspace de búsqueda, y que un rescan en curso no pierde el filtro activo.
+      RDD: riesgo alto (mismo motivo estructural); consentimiento otorgado;
+      revisión con 4 lentes, sin findings. Review aprobada y confirmada. Boundary
+      revisado avanza a `b57507d`.
 - [ ] T7 — Seek (nueva, pedido del usuario: "adelantar segundos de la cancion"):
       extender AudioEngine (T2) para exponer posición/duración de la pista actual y
       un método `seek(Duration)` que reposicione la decodificación con la API de
