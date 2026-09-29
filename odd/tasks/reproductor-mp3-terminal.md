@@ -59,7 +59,12 @@ Engram esté disponible.
       no triviales (Cargo.toml + módulos iniciales).
       Evidencia: `cargo build` OK (verificado además ejecutando
       `target\debug\mp3tui.exe --help` directamente, sin cargo disponible en el shell
-      del orquestador). Commit: ver más abajo.
+      del orquestador). Commit: `d5dfe5b` en `feature/reproductor-mp3-terminal`.
+      RDD: riesgo alto (detectado por mención de proceso en src/audio/mod.rs);
+      consentimiento solicitado al usuario y otorgado ("Revisar este cambio"); revisión
+      nativa con 4 lentes (risk, resilience, readability, reliability) corrida por el
+      orquestador como reviewer, sin findings; review aprobada y confirmada
+      (`review.acknowledge-approved`). Boundary revisado avanza a `d5dfe5b`.
 - [ ] T2 — Motor de audio: decodificar con symphonia y reproducir con cpal un archivo
       pasado por CLI; tap de muestras PCM a un ring buffer compartido. Ruta: delegada.
 - [ ] T3 — Shell de TUI con ratatui: layout base, controles de reproducción
