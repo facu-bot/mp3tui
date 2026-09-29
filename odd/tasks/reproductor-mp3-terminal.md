@@ -40,6 +40,14 @@ salida de audio real ni el render de terminal de forma automatizada en esta fase
 Fuente de la decisión: default del orquestador ante ausencia de configuración explícita,
 sin objeción del usuario a este momento.
 
+## Estrategia de entrega
+`ask-on-risk` (default): se sigue commiteando en `feature/reproductor-mp3-terminal`
+sin slicing intermedio; si en algún punto hay riesgo real de entrega (push/PR), se
+pregunta una vez por la estrategia de encadenado (`stacked-to-main` o
+`feature-branch-chain`). Confirmado por el usuario al cruzar el heurístico de ~400
+líneas acumuladas (T1-T3 ya suman ~1150 líneas autoría propia). Distribución sigue
+siendo uso personal (`cargo run --release`), sin push/PR planeado por ahora.
+
 ## Delegación
 Ejecución delegada a un agente `opencode` corriendo dentro de una pane de Herdr
 (pedido explícito del usuario: "usá opencode run para codear"). El orquestador (Claude)
