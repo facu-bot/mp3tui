@@ -5,8 +5,9 @@ mod visualizer;
 
 use clap::Parser;
 use std::path::PathBuf;
+use std::process::ExitCode;
 
-/// Reproductor de música para terminal (stub T1 — scaffold que compila).
+/// Reproductor MP3 visual para terminal.
 #[derive(Parser, Debug)]
 #[command(name = "mp3tui", about = "Reproductor MP3 visual para terminal")]
 struct Cli {
@@ -15,19 +16,45 @@ struct Cli {
     path: Option<PathBuf>,
 }
 
-fn main() {
+fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    match &cli.path {
-        Some(path) => println!("mp3tui: path recibido: {}", path.display()),
-        None => println!("mp3tui: sin path, solo stub T1 (scaffold)."),
+    let Some(path) = cli.path else {
+        eprintln!("mp3tui: falta el path. Uso: mp3tui <archivo-de-audio>");
+        return ExitCode::FAILURE;
+    };
+
+    if path.is_dir() {
+        eprintln!(
+            "mp3tui: '{}' es una carpeta; la biblioteca por carpetas llega en T5. Pasá un archivo de audio.",
+            path.display()
+        );
+        return ExitCode::FAILURE;
     }
 
-    // Referencias a los stubs para verificar que los módulos enlazan.
-    let _engine = audio::AudioEngine::new();
-    let _playlist = playlist::Playlist::new();
-    let _analyzer = visualizer::SpectrumAnalyzer::new();
-    let _app = ui::App::new();
+    let mut engine = match audio::AudioEngine::new() {
+        Ok(engine) => engine,
+        Err(err) => {
+            eprintln!("mp3tui: no se pudo inicializar el device de audio: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
 
-    println!("mp3tui scaffold OK (T1). Lógica real en T2+.");
+    if let Err(err) = engine.play(&path) {
+        eprintln!("mp3tui: no se pudo reproducir '{}': {err}", path.display());
+        return ExitCode::FAILURE;
+    }
+
+    println!("Reproduciendo: {}", path.display());
+
+    match engine.wait_until_done() {
+        Ok(()) => {
+            println!("mp3tui: fin de la pista.");
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("mp3tui: error durante la reproducción: {err}");
+            ExitCode::FAILURE
+        }
+    }
 }

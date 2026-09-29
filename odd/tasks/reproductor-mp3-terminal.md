@@ -65,8 +65,18 @@ Engram esté disponible.
       nativa con 4 lentes (risk, resilience, readability, reliability) corrida por el
       orquestador como reviewer, sin findings; review aprobada y confirmada
       (`review.acknowledge-approved`). Boundary revisado avanza a `d5dfe5b`.
-- [ ] T2 — Motor de audio: decodificar con symphonia y reproducir con cpal un archivo
+- [x] T2 — Motor de audio: decodificar con symphonia y reproducir con cpal un archivo
       pasado por CLI; tap de muestras PCM a un ring buffer compartido. Ruta: delegada.
+      Nota tamaño: 673 líneas en audio/mod.rs, por encima del heurístico de ~400; se
+      mantiene como una sola tarea porque decode+resample+channel-mapping+tap+manejo
+      de errores sin panics son una única unidad coherente (motor de audio completo),
+      no se fuerza un split artificial.
+      Evidencia: `cargo build` y `cargo clippy --all-targets` en 0/0 (reportado por el
+      agente); verificado además por el orquestador: `mp3tui.exe` con archivo
+      inexistente devuelve error claro y exit 1 sin panic; reproducción real de un
+      mp3 del sistema (`C:\Users\facu\Music\90210.mp3`) confirmada de forma
+      independiente (el proceso sigue vivo y sonando 4s después de arrancar, sin
+      errores en stderr).
 - [ ] T3 — Shell de TUI con ratatui: layout base, controles de reproducción
       (play/pause/seek/volumen) conectados al motor de audio. Ruta: delegada.
 - [ ] T4 — Visualizador FFT estilo cava: rustfft sobre las muestras del ring buffer,
