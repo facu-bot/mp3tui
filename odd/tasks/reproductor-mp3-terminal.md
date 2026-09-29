@@ -2,18 +2,27 @@
 
 ## Objetivo
 Construir una aplicación de terminal (TUI) para Windows que reproduce archivos de audio
-(mp3 y otros formatos comunes) y muestra una visualización de espectro en vivo estilo
-"cava" (barras de frecuencia con gradiente de color truecolor), con playlist, biblioteca
-por carpetas, metadata ID3 y atajos de teclado configurables.
+(mp3 y otros formatos comunes), con un diseño visual cuidado (no solo funcional) y una
+visualización de espectro en vivo estilo "cava" (barras de frecuencia con gradiente de
+color truecolor), con un explorador de archivos para buscar y elegir pistas, seek,
+velocidad de reproducción variable, playlist, metadata ID3 y atajos de teclado
+configurables.
 
 ## Problema / por qué
 El usuario quiere un reproductor de música que corra 100% en terminal en Windows, con
-una visualización atractiva del audio en tiempo real, para uso personal.
+una visualización atractiva del audio en tiempo real y un diseño de terminal prolijo,
+para uso personal.
 
 ## Alcance
-- Reproducción de audio (play/pause/stop/seek/volumen) para mp3/flac/ogg/wav.
+- Reproducción de audio (play/pause/stop/volumen) para mp3/flac/ogg/wav.
+- Seek: adelantar/retroceder segundos en la pista actual.
+- Velocidad de reproducción variable (más rápida/más lenta).
 - Visualización de espectro FFT en tiempo real, estilo cava, con colores truecolor.
-- Playlist y biblioteca escaneada desde una carpeta.
+- Diseño visual cuidado en toda la TUI (no solo el visualizador): layout prolijo,
+  paleta de colores coherente, no una interfaz meramente funcional. Criterio de
+  aceptación explícito del usuario, transversal a T4/T5/T9.
+- Explorador de archivos interactivo: navegar carpetas, buscar/filtrar mp3s, elegir y
+  reproducir. Biblioteca escaneada recursivamente desde una carpeta.
 - Metadata ID3/Vorbis (título, artista, álbum, duración).
 - Shuffle, repeat, búsqueda/filtro en la playlist.
 - Atajos de teclado configurables y temas de color vía archivo TOML.
@@ -89,31 +98,15 @@ Engram esté disponible.
       4 lentes, 1 finding SUGGESTION no bloqueante en review-resilience
       (`AudioEngine::stop()` puede bloquear brevemente si `next_packet()` está en I/O
       cuando se llama stop/pause; sin impacto para archivos locales, relevante si en
-      el futuro se soporta streaming/red) — anotado como backlog para T8. Review
-      aprobada y confirmada. Boundary revisado avanza a `ebc56ee`.
-
-## Backlog de hardening (no bloqueante, detectado en revisiones RDD)
-- `AudioEngine::stop()`/`pause()` pueden tardar hasta la duración de un
-  `next_packet()` en curso antes de que el hilo decodificador note el cambio de
-  estado (src/audio/mod.rs, ver stop() y el chequeo al tope de run_decode). Sin
-  impacto para archivos locales; revisar si T3 conecta stop/pause a la UI y se nota
-  latencia, o si en el futuro se soporta streaming remoto.
-- El agente de T3 reportó un colgado intermitente de conhost en una sola corrida de
-  su harness E2E, justo después de un force-kill previo; no se reprodujo en 4+
-  corridas posteriores. Probablemente flake del entorno de test (conhost heredado
-  de un proceso matado a la fuerza), no del código; mantener en observación si
-  vuelve a aparecer al usar la app real.
-- `app.error` en src/ui/mod.rs (T3) se setea si falla el replay tras fin de pista,
-  pero nunca se limpia a `None` después; un error transitorio queda pegado en
-  pantalla aunque luego la reproducción funcione bien. Limpiar en un próximo touch
-  de ui/mod.rs (p.ej. al arrancar T4/T5), no bloqueante hoy.
+      el futuro se soporta streaming/red) — anotado como backlog. Review aprobada y
+      confirmada. Boundary revisado avanza a `ebc56ee`.
 - [x] T3 — Shell de TUI con ratatui: layout base, controles de reproducción
       (play/pause/volumen) conectados al motor de audio. Ruta: delegada.
       Alcance real: play/pause (espacio, con replay tras fin natural), volumen
       ↑/↓ (±5%), salir con q/Esc/Ctrl+C restaurando la terminal (guard con Drop),
-      loop de eventos no bloqueante a ~60fps. Seek queda pendiente (el motor de
-      audio de T2 no expone posición/duración todavía; no se agregó en T3 para no
-      inventar una API a medias — se retoma si T4/T5 necesitan posición).
+      loop de eventos no bloqueante a ~60fps. Seek queda pendiente para T7 (el motor
+      de audio de T2 no expone posición/duración todavía; no se agregó en T3 para no
+      inventar una API a medias).
       Evidencia: `cargo build`/`cargo clippy --all-targets` en 0/0. El agente corrió
       un harness E2E propio (AttachConsole + inyección de teclas + lectura de
       screen buffer) con 3 escenarios (pausa/volumen/resume, fin natural + replay,
@@ -128,23 +121,66 @@ Engram esté disponible.
       confirmada. Boundary revisado avanza a `a190aca`.
 - [ ] T4 — Visualizador FFT estilo cava: rustfft sobre las muestras del ring buffer,
       barras logarítmicas con suavizado attack/decay y gradiente de color truecolor.
-      Ruta: delegada.
-- [ ] T5 — Playlist + biblioteca: escaneo recursivo de carpeta, parsing de metadata con
-      lofty, panel de playlist en la UI. Ruta: delegada.
+      Reforzado por pedido del usuario: la visualización y el layout que la rodea
+      deben verse cuidados/atractivos, no solo funcionales. Ruta: delegada.
+      **En curso**: delegada al agente `mp3builder`, en progreso al momento de
+      registrar T5/T7/T8 más abajo (pedido nuevo del usuario llegó mientras corría).
+- [ ] T5 — Explorador de archivos + biblioteca (alcance extendido por pedido del
+      usuario: "agrega una tarea para agregar un explorador de archivos mp3, para
+      buscar audios, reproducirlos"): panel interactivo para navegar carpetas, listar
+      archivos de audio con metadata (título/artista/álbum vía lofty), elegir uno con
+      el teclado y reproducirlo. Reescaneo recursivo de la carpeta pasada por CLI (o
+      cwd si no se pasa ninguna — a definir en la implementación). Ruta: delegada.
 - [ ] T6 — Atajos de teclado, shuffle/repeat, búsqueda/filtro de playlist. Ruta:
       delegada.
-- [ ] T7 — Config y temas vía TOML (colores del visualizador, keybindings). Ruta:
-      delegada.
-- [ ] T8 — Pulido: manejo de errores (archivos corruptos/formatos no soportados),
+- [ ] T7 — Seek (nueva, pedido del usuario: "adelantar segundos de la cancion"):
+      extender AudioEngine (T2) para exponer posición/duración de la pista actual y
+      un método `seek(Duration)` que reposicione la decodificación con la API de
+      seek de symphonia, reseteando el pipeline de resample/ring buffers de forma
+      consistente. En la UI: atajos ←/→ para retroceder/adelantar (propuesta: 5s por
+      paso, ajustable en T9), y una barra de progreso con tiempo transcurrido/total.
+      Ruta: delegada.
+- [ ] T8 — Velocidad de reproducción variable (nueva, pedido del usuario: "poner en
+      una reproducion de velocidad mas rapida o lenta"): extender AudioEngine con un
+      multiplicador de velocidad (ej. 0.5x–2.0x) aplicado en el pipeline de resample
+      ya existente (T2), sin distorsionar el pitch más de lo esperable para un
+      resampler simple (documentar la limitación si no se hace pitch-correction).
+      En la UI: atajos para subir/bajar velocidad (propuesta: `[`/`]`) y mostrar la
+      velocidad actual. Ruta: delegada.
+- [ ] T9 — Config y temas vía TOML (colores del visualizador, keybindings, incluyendo
+      los nuevos de T7/T8). Reforzado por pedido del usuario: el tema por defecto
+      debe verse pulido y atractivo (paleta coherente, no colores por defecto sin
+      cuidar), no solo ser funcional. Ruta: delegada.
+- [ ] T10 — Pulido: manejo de errores (archivos corruptos/formatos no soportados),
       README con instrucciones de build/run. Ruta: delegada.
+
+## Backlog de hardening (no bloqueante, detectado en revisiones RDD)
+- `AudioEngine::stop()`/`pause()` pueden tardar hasta la duración de un
+  `next_packet()` en curso antes de que el hilo decodificador note el cambio de
+  estado (src/audio/mod.rs, ver stop() y el chequeo al tope de run_decode). Sin
+  impacto para archivos locales; revisar si en el futuro se soporta streaming remoto.
+- El agente de T3 reportó un colgado intermitente de conhost en una sola corrida de
+  su harness E2E, justo después de un force-kill previo; no se reprodujo en 4+
+  corridas posteriores. Probablemente flake del entorno de test (conhost heredado
+  de un proceso matado a la fuerza), no del código; mantener en observación si
+  vuelve a aparecer al usar la app real.
+- `app.error` en src/ui/mod.rs (T3) se setea si falla el replay tras fin de pista,
+  pero nunca se limpia a `None` después; un error transitorio queda pegado en
+  pantalla aunque luego la reproducción funcione bien. Limpiar en un próximo touch
+  de ui/mod.rs (p.ej. al arrancar T4/T5), no bloqueante hoy.
 
 ## Progreso
 - Documento de tareas creado. Repo git inicializado en
   `C:\Users\facu\Desktop\reproductor-mp3-terminal`.
-- T1 completada por el agente `mp3builder` (opencode, pane wG:p2 de Herdr): scaffold de
-  Cargo con todas las dependencias y stubs de los 4 módulos, build verificado por el
-  orquestador de forma independiente.
+- T1, T2, T3 completadas, revisadas por RDD y commiteadas (ver evidencia en cada
+  tarea arriba).
+- Mientras T4 corría delegada, el usuario pidió: (a) que el diseño visual de toda la
+  TUI se vea cuidado, no solo funcional — incorporado como criterio transversal en
+  Alcance y en T4/T5/T9; (b) un explorador de archivos para buscar/reproducir mp3s
+  — incorporado como alcance extendido de T5; (c) seek (adelantar segundos) —
+  nueva T7; (d) velocidad de reproducción variable — nueva T8. Se renumeraron las
+  tareas siguientes (T7 temas → T9, T8 pulido → T10).
 
 ## Próximo paso
-Delegar T2 (motor de audio: decodificar con symphonia y reproducir con cpal, tap de PCM
-a ring buffer) al agente `mp3builder`.
+Esperar a que termine la delegación en curso de T4 (visualizador FFT), revisar y
+commitear: luego delegar T5 (explorador de archivos, alcance extendido).
