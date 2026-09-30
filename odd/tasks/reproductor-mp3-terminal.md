@@ -362,6 +362,9 @@ Engram esté disponible.
       seek con stall de driver, documentado también en el código; formatos
       sin duración conocida; escaneo de bibliotecas grandes por tandas),
       stack de dependencias, estructura de `src/`, y cómo correr los tests.
+      RDD: riesgo alto (mismo motivo estructural); consentimiento otorgado;
+      revisión con 4 lentes, sin findings. Review aprobada y confirmada.
+      Boundary revisado avanza a `3f1d2c3`.
 
 ## Cierre del plan
 Con T10 completada, las 10 tareas planificadas (incluyendo las 3 agregadas a
