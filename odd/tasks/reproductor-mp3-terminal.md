@@ -318,6 +318,9 @@ Engram esté disponible.
       funciona; N: TOML roto muestra warning sin crashear). Orquestador
       verificó de forma independiente: binario recompilado, arranque limpio
       sin archivo de config (default) sin stderr ni zombie.
+      RDD: riesgo alto (mismo motivo estructural); consentimiento otorgado;
+      revisión con 4 lentes, sin findings. Review aprobada y confirmada.
+      Boundary revisado avanza a `df27210`.
 - [ ] T10 — Pulido: manejo de errores (archivos corruptos/formatos no soportados),
       README con instrucciones de build/run. Ruta: delegada.
 
