@@ -279,6 +279,10 @@ Engram esté disponible.
       hace la interacción con seek libre de carreras por diseño, no por
       casualidad, y que no hay panics posibles por NaN/overflow en la conversión
       de velocidad a frames.
+      RDD: riesgo alto (mismo motivo estructural); usuario eligió "saltear esta
+      vez" (`consent: declined`) — sin registro de revisión nativa para este
+      commit. Cobertura de calidad ya obtenida vía build/clippy/test + harness
+      E2E + fork de concurrencia (arriba), sin findings.
 - [ ] T9 — Config y temas vía TOML (colores del visualizador, keybindings, incluyendo
       los nuevos de T7/T8). Reforzado por pedido del usuario: el tema por defecto
       debe verse pulido y atractivo (paleta coherente, no colores por defecto sin
