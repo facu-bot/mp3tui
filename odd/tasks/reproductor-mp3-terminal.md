@@ -578,7 +578,7 @@ las que el usuario agregue. Eligió explícitamente la opción "varias carpetas
 conocidas + las que yo agregue" (no disco completo, no requiere editar TOML
 a mano como único mecanismo).
 
-- [ ] T15 — Biblioteca por defecto multi-carpeta: cuando no hay CLI arg ni
+- [x] T15 — Biblioteca por defecto multi-carpeta: cuando no hay CLI arg ni
       `[library] roots` configurado, escanear la UNIÓN de las carpetas
       conocidas típicas que existan en el sistema (`%USERPROFILE%\Music`,
       `\Downloads`, `\Desktop`, `\Documents` — saltear silenciosamente las
@@ -590,6 +590,33 @@ a mano como único mecanismo).
       teniendo prioridad total sobre todo esto (comportamiento sin cambios).
       Mantener el agrupado por carpeta de T14 (ahora con más carpetas de
       origen típicamente, tiene más sentido todavía). Ruta: delegada.
+      Implementación: `LibraryConfig::scan_roots()` arma el set final como
+      conocidas-existentes ∪ configuradas, deduplicando y preservando orden
+      (conocidas primero); si queda vacío (sin `USERPROFILE` y sin roots),
+      cae al `cwd` igual que T14. `known_dirs()` filtra por `is_dir()` sin
+      avisar en las faltantes (es un default automático, no algo que el
+      usuario tipeó a mano — eso sigue avisando en `parse_library`).
+      Hallazgo de performance real (no es un bug, es un trade-off medido):
+      el Desktop real del usuario tiene ~79.500 archivos (repos de código
+      con `target/`), lo que hace que el escaneo en frío de las 4 carpetas
+      tarde ~9.4s antes de mostrar la lista completa (no bloquea la UI —
+      corre en background desde T5 — pero se nota la espera del primer
+      pintado). Presentado al usuario como decisión explícita: **eligió
+      dejarlo así** (mantener Desktop en el default), aceptando la espera
+      inicial a cambio de cobertura más completa.
+      Evidencia: `cargo build`/`cargo clippy --all-targets -- -D warnings`
+      en 0/0, `cargo test` 82/82 (3 ignorados; 4 nuevos: sin roots propias
+      escanea las conocidas que existan, faltantes salteadas sin queja,
+      unión sin duplicados, fallback a cwd cuando no hay ni conocidas ni
+      configuradas — y que configuradas-solas no agregan cwd). Harness E2E
+      18/18 PASS (escenarios Q y R corridos contra un `USERPROFILE` falso
+      controlado con carpetas conocidas creadas a propósito, sin depender
+      del perfil real de la máquina). Orquestador leyó el diff completo de
+      `config.rs` línea por línea (sin delegar a un fork, dado el tamaño
+      acotado —169 líneas— y la simplicidad verificable de la lógica de
+      unión/dedup) y confirmó que no hay panics posibles (todo pasa por
+      `is_dir()`/`Option` en vez de `unwrap`), build verificado de forma
+      independiente.
 - `library_rows`/`visible_start` (T14) puede renderizar la lista vacía por
   un frame si la altura visible del panel es de exactamente 1 fila y la
   selección cae justo en el primer track de un grupo nuevo (el cálculo de

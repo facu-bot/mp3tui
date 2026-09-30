@@ -402,6 +402,35 @@ mod tests {
         let _ = fs::remove_dir_all(&root_b);
     }
 
+    /// Escaneo del set por defecto (T15) contra el perfil real del usuario:
+    /// diagnóstico de rendimiento, fuera de la suite normal. Imprime el
+    /// total (frío, como al arrancar) y el desglose por raíz (cálido).
+    /// `cargo test perf_scan_default_roots -- --ignored --nocapture`
+    #[test]
+    #[ignore = "escanea carpetas reales del usuario; corrida manual"]
+    fn perf_scan_default_roots_reports_duration() {
+        let roots = crate::config::LibraryConfig::default().scan_roots();
+        let start = std::time::Instant::now();
+        let playlist = Playlist::from_dirs_scan(&roots);
+        println!(
+            "total: roots={} tracks={} en {:?}",
+            roots.len(),
+            playlist.len(),
+            start.elapsed()
+        );
+        for root in &roots {
+            let root_start = std::time::Instant::now();
+            let root_playlist = Playlist::from_dirs_scan(std::slice::from_ref(root));
+            println!(
+                "  {} -> {} tracks en {:?}",
+                root.display(),
+                root_playlist.len(),
+                root_start.elapsed()
+            );
+        }
+        assert!(!roots.is_empty());
+    }
+
     #[test]
     fn scan_falls_back_to_filename_without_tags() {
         let root = temp_root("fallback");

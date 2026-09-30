@@ -21,8 +21,9 @@ cargo run --release -- "C:\Users\yo\Music"
 # Archivo puntual (reproduce directo; su carpeta queda como biblioteca):
 cargo run --release -- "C:\Users\yo\Music\tema.mp3"
 
-# Sin argumentos: la biblioteca de [library] roots en config.toml
-# (default: %USERPROFILE%\Music); la lista se agrupa por carpeta.
+# Sin argumentos: biblioteca por defecto con las carpetas conocidas que
+# existan en %USERPROFILE% (Music, Downloads, Desktop, Documents) unidas a
+# las [library] roots de config.toml; la lista se agrupa por carpeta.
 cargo run --release
 ```
 
@@ -90,9 +91,16 @@ al que volver) y `Enter` pasa al modo reproducción con la pista sonando.
 
 La lista del explorador agrupa los tracks por su carpeta de origen, con un
 encabezado por grupo (la ruta relativa a la raíz escaneada). Los encabezados
-no son seleccionables: `↑`/`↓` los saltan solos. Con varias raíces
-(`[library]` roots) los grupos siguen el orden de las raíces y, dentro de
-cada una, las carpetas en orden alfabético.
+no son seleccionables: `↑`/`↓` los saltan solos. Con varias raíces los
+grupos siguen el orden de las raíces y, dentro de cada una, las carpetas en
+orden alfabético.
+
+Sin argumento de CLI la biblioteca por defecto es la unión de las carpetas
+conocidas que existan en el sistema (`%USERPROFILE%\Music`, `\Downloads`,
+`\Desktop` y `\Documents`; las que falten se saltean sin aviso) más las
+`[library] roots` configuradas — si las hay, se suman a las conocidas, no
+las reemplazan. Un archivo o carpeta pasado por CLI manda sobre todo lo
+anterior.
 
 ### Búsqueda (cuando está abierta)
 
@@ -137,8 +145,10 @@ seek_back = "left"
 #   comma, minus, plus (o un carácter simple como "q" o "/")
 
 [library]
-# Carpetas a escanear sin argumento de CLI (T14). Varios roots agrupan la
-# lista por carpeta siguiendo este orden. Default: %USERPROFILE%\Music.
+# Carpetas EXTRA a escanear sin argumento de CLI (T15): se AGREGAN a las
+# carpetas conocidas (Music, Downloads, Desktop, Documents en %USERPROFILE%),
+# nunca las reemplazan. Varios roots agrupan la lista por carpeta siguiendo
+# este orden (primero las conocidas, después estas).
 # Con backslashes usá strings literales de TOML ('C:\Musica') o barras
 # normales ("C:/Musica").
 roots = ["C:/Musica"]

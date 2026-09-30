@@ -28,7 +28,7 @@
 
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use ratatui::crossterm::event::KeyCode;
@@ -698,32 +698,57 @@ pub fn pressed(bindings: &[KeyCode], code: KeyCode) -> bool {
 // Biblioteca (T14)
 // ---------------------------------------------------------------------------
 
-/// Carpetas a escanear cuando la CLI no recibe ningún path (T14). Se
-/// escanean todas y los tracks quedan agrupados por carpeta de origen en la
-/// lista del explorador.
-#[derive(Debug, Clone, PartialEq)]
+/// Carpetas a escanear cuando la CLI no recibe ningún path (T14/T15). El
+/// set final ([`LibraryConfig::scan_roots`]) une las carpetas conocidas del
+/// sistema con las configuradas a mano; los tracks quedan agrupados por
+/// carpeta de origen en la lista del explorador.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct LibraryConfig {
+    /// Raíces escritas por el usuario en `[library] roots`: se AGREGAN a las
+    /// carpetas conocidas (T15), no las reemplazan. Vacío = solo conocidas.
     pub roots: Vec<PathBuf>,
 }
 
-impl Default for LibraryConfig {
-    fn default() -> Self {
-        Self {
-            roots: vec![default_music_dir()],
-        }
-    }
+/// Carpetas conocidas típicas bajo `%USERPROFILE%` (T15): la biblioteca
+/// por defecto cubre las cuatro sin que el usuario configure nada.
+const KNOWN_DIR_NAMES: [&str; 4] = ["Music", "Downloads", "Desktop", "Documents"];
+
+/// Solo las carpetas conocidas que existen bajo `home`: una faltante se
+/// saltea en silencio, porque es un default automático y no una ruta
+/// configurada a mano (esas sí avisan en `parse_library`).
+fn known_dirs(home: &Path) -> Vec<PathBuf> {
+    KNOWN_DIR_NAMES
+        .iter()
+        .map(|name| home.join(name))
+        .filter(|path| path.is_dir())
+        .collect()
 }
 
-/// `%USERPROFILE%\Music`: la biblioteca sensible para un comando global en
-/// el PATH (T14). El `cwd` solo entra como fallback si la variable no
-/// existe; un config.toml sin `[library]` usa este default.
-fn default_music_dir() -> PathBuf {
-    env::var_os("USERPROFILE")
-        .map(PathBuf::from)
-        .map(|home| home.join("Music"))
-        .unwrap_or_else(|| {
-            env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-        })
+impl LibraryConfig {
+    /// Set final a escanear sin argumento de CLI (T15): las carpetas
+    /// conocidas que existen en el sistema, unidas con las configuradas,
+    /// sin duplicados y en ese orden (las conocidas primero). Si queda vacío
+    /// (sin `USERPROFILE` y sin roots) se usa el `cwd`, como en T14.
+    pub fn scan_roots(&self) -> Vec<PathBuf> {
+        let home = env::var_os("USERPROFILE").map(PathBuf::from);
+        self.scan_roots_with(home.as_deref())
+    }
+
+    /// [`Self::scan_roots`] con el home resuelto por el caller: las pruebas
+    /// pasan un home temporal para no depender del perfil de la máquina.
+    fn scan_roots_with(&self, home: Option<&Path>) -> Vec<PathBuf> {
+        let mut roots: Vec<PathBuf> = Vec::new();
+        let known = home.map(known_dirs).unwrap_or_default();
+        for path in known.into_iter().chain(self.roots.iter().cloned()) {
+            if !roots.contains(&path) {
+                roots.push(path);
+            }
+        }
+        if roots.is_empty() {
+            roots.push(env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        }
+        roots
+    }
 }
 
 fn parse_library(
@@ -762,7 +787,8 @@ fn parse_library(
                         }
                         roots.push(path);
                     }
-                    // Lista vacía o todo inválido: se mantiene el default.
+                    // Lista vacía o todo inválido: no hay roots propios y
+                    // la biblioteca queda en las carpetas conocidas (T15).
                     if !roots.is_empty() {
                         library.roots = roots;
                     }
@@ -1056,15 +1082,78 @@ mod tests {
     }
 
     #[test]
-    fn library_roots_default_to_userprofile_music() {
+    fn library_has_no_roots_by_default_and_scans_the_known_dirs() {
         let config = parse("");
         assert_eq!(config.library, LibraryConfig::default());
+        assert!(config.library.roots.is_empty());
         if let Some(home) = env::var_os("USERPROFILE") {
-            assert_eq!(
-                config.library.roots,
-                vec![PathBuf::from(home).join("Music")]
-            );
+            let music = PathBuf::from(home).join("Music");
+            if music.is_dir() {
+                assert!(
+                    config.library.scan_roots().contains(&music),
+                    "si Music existe, la biblioteca por defecto la incluye"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn known_dirs_skip_missing_folders_without_complaining() {
+        let home = env::temp_dir().join("mp3tui_t15_home_only_two");
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(home.join("Music")).unwrap();
+        fs::create_dir_all(home.join("Documents")).unwrap();
+        // Downloads y Desktop no existen: se saltean, en silencio y en el
+        // orden de KNOWN_DIR_NAMES.
+        assert_eq!(
+            known_dirs(&home),
+            vec![home.join("Music"), home.join("Documents")]
+        );
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn scan_roots_unions_known_and_configured_without_duplicates() {
+        let home = env::temp_dir().join("mp3tui_t15_home_union");
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(home.join("Music")).unwrap();
+        fs::create_dir_all(home.join("Downloads")).unwrap();
+        // Downloads duplicada (también conocida) y una carpeta custom que
+        // ni siquiera existe: ambas se agregan sin repetir lo conocido.
+        let custom = home.join("MiMusica");
+        let config = LibraryConfig {
+            roots: vec![home.join("Downloads"), custom.clone()],
+        };
+        assert_eq!(
+            config.scan_roots_with(Some(&home)),
+            vec![home.join("Music"), home.join("Downloads"), custom]
+        );
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn scan_roots_without_known_or_configured_falls_back_to_cwd() {
+        let empty = env::temp_dir().join("mp3tui_t15_home_empty");
+        let _ = fs::remove_dir_all(&empty);
+        fs::create_dir_all(&empty).unwrap();
+
+        // Home sin ninguna carpeta conocida y sin roots: va al cwd.
+        let config = LibraryConfig::default();
+        assert_eq!(
+            config.scan_roots_with(Some(&empty)),
+            vec![env::current_dir().unwrap()]
+        );
+
+        // Con roots configuradas no se mete el cwd: manda lo del usuario.
+        let custom = empty.join("custom");
+        let config = LibraryConfig {
+            roots: vec![custom.clone()],
+        };
+        assert_eq!(config.scan_roots_with(Some(&empty)), vec![custom.clone()]);
+        // Sin USERPROFILE (None) tampoco.
+        assert_eq!(config.scan_roots_with(None), vec![custom]);
+
+        let _ = fs::remove_dir_all(&empty);
     }
 
     #[test]

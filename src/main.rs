@@ -28,13 +28,13 @@ fn main() -> ExitCode {
         eprintln!("mp3tui: config: {warning}");
     }
 
-    // Sin path: biblioteca de la config ([library] roots, T14; default
-    // %USERPROFILE%\Music).
+    // Sin path: biblioteca por defecto (T15: carpetas conocidas del sistema
+    // que existan, unidas a las [library] roots configuradas).
     // Con carpeta: explorador solo en esa carpeta (la CLI tiene prioría).
     // Con archivo: comportamiento original (reproducción directa a la TUI,
     // con la biblioteca de la carpeta contenedora a mano en modo explorador).
     let start = match cli.path.as_deref() {
-        None => ui::StartMode::Browse(config::config().library.roots.clone()),
+        None => ui::StartMode::Browse(config::config().library.scan_roots()),
         Some(path) if path.is_dir() => {
             ui::StartMode::Browse(vec![path.to_path_buf()])
         }

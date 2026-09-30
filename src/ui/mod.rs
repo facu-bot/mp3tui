@@ -53,8 +53,8 @@ enum Status {
 pub enum StartMode {
     /// Archivo por CLI: reproducción directa (comportamiento original).
     PlayFile(PathBuf),
-    /// Sin argumento (raíces de `[library]`, T14) o con carpeta: explorador
-    /// de la biblioteca, agrupado por carpeta de origen.
+    /// Sin argumento (T15: carpetas conocidas + `[library]` roots) o con
+    /// carpeta: explorador de la biblioteca, agrupado por carpeta de origen.
     Browse(Vec<PathBuf>),
 }
 
@@ -73,7 +73,8 @@ struct App {
     /// Panel lateral del explorador superpuesto sobre el reproductor (T13).
     /// Solo tiene efecto en `Mode::Player`.
     explorer_open: bool,
-    /// Raíces escaneadas (T14): CLI o `[library]` roots de la config.
+    /// Raíces escaneadas (T14/T15): CLI, o bien las carpetas conocidas del
+    /// sistema unidas a las `[library]` roots de la config.
     roots: Vec<PathBuf>,
     /// Última biblioteca conocida; `None` mientras no terminó el primer escaneo.
     library: Option<Playlist>,
