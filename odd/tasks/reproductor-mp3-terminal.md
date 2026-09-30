@@ -245,6 +245,11 @@ Engram esté disponible.
       limpio con audio real sin stderr ni zombie, lectura directa del código del
       fix de concurrencia (el lock compartido cierra la ventana de carrera
       correctamente).
+      RDD: riesgo alto (mismo motivo estructural); consentimiento otorgado;
+      revisión con 4 lentes, 1 finding SUGGESTION no bloqueante en
+      review-resilience (el mismo timeout de drain de (b), ya documentado en
+      código y en el backlog de este archivo). Review aprobada y confirmada.
+      Boundary revisado avanza a `4db9ac0`.
 - [ ] T8 — Velocidad de reproducción variable (nueva, pedido del usuario: "poner en
       una reproducion de velocidad mas rapida o lenta"): extender AudioEngine con un
       multiplicador de velocidad (ej. 0.5x–2.0x) aplicado en el pipeline de resample
