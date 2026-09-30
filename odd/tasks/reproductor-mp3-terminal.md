@@ -495,6 +495,41 @@ lateral con Ctrl+Tab) están implementadas, commiteadas y verificadas. El
 reproductor sigue siendo el mismo funcionalmente (T1-T10), con mejor diseño
 visual y una interacción de explorador menos disruptiva.
 
+Reabierto de nuevo: tras instalar `mp3tui` como comando global (copiado a
+`C:\Users\facu\bin`, ya en el PATH), el usuario reportó que Tab y Esc sacan
+de la app por igual cuando no hay ninguna pista cargada (arrancando con
+`mp3tui` sin archivo), y pidió que el explorador liste archivos
+reproducibles de forma global (no atado al cwd desde donde se invoca el
+comando) y agrupados por la carpeta de origen.
+
+- [ ] T14 — Fix real diagnosticado por el orquestador (no por el agente):
+      en `src/config.rs`, la tecla `Tab` está en las listas de atajo tanto
+      de `explorer` (abrir panel) como de `back` (volver/cerrar), y en
+      `handle_list_key` (ui/mod.rs) se chequea `back` ANTES que `explorer`.
+      Sin sesión de audio activa (`has_player = false`, ej. `mp3tui` sin
+      argumentos), `go_back` (disparado por `back`) cae en su rama de
+      "salir" — y como el chequeo de `back` intercepta a Tab antes de que
+      `toggle_explorer` (que ya no-opea correctamente sin player) llegue a
+      ejecutarse, Tab termina saliendo de la app igual que Esc, en vez de
+      no hacer nada. Fix: sacar `Tab` de la lista default de `back` (dejar
+      `back = [Esc]` únicamente; `explorer` sigue siendo `[b, Tab]`), así el
+      chequeo de `back` ya no intercepta a Tab y el flujo cae en
+      `toggle_explorer`, que ya maneja el caso sin player correctamente.
+      Actualizar los tests y comentarios que documentaban el comportamiento
+      viejo (`go_back_closes_the_panel_and_only_quits_from_the_bare_explorer`
+      tenía un assert explícito "sin player Esc/Tab salen" que ahora es
+      incorrecto — debe pasar a afirmar que sin player, Tab no hace nada y
+      solo Esc/q salen).
+      Mejora pedida: el explorador debe poder listar archivos reproducibles
+      de forma global (no solo la carpeta pasada por CLI o el cwd desde
+      donde se invocó `mp3tui`) y agruparlos visualmente por la carpeta de
+      origen en vez de una lista plana. Implica decidir una fuente
+      razonable para "global" (¿una o varias carpetas de biblioteca
+      configurables en `[library]` del config.toml, con un default sensato
+      tipo `%USERPROFILE%\Music` cuando no se pasa nada por CLI, en vez de
+      escanear el cwd?) y un formato de agrupación en la lista (encabezados
+      de carpeta entre los tracks). Ruta: delegada.
+
 ## Backlog de hardening (no bloqueante, detectado en revisiones RDD)
 - `AudioEngine::stop()`/`pause()` pueden tardar hasta la duración de un
   `next_packet()` en curso antes de que el hilo decodificador note el cambio de
