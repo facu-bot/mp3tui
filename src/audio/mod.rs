@@ -139,6 +139,11 @@ struct Shared {
     /// decodificador en cada ciclo, igual que `volume`.
     speed: AtomicU32,
     error: Mutex<Option<AudioError>>,
+    /// Sticky: la última reproducción falló (apertura, decode o device).
+    /// A diferencia de `error` (que se consume con `take_error`), este flag
+    /// queda en true hasta el próximo `play()` exitoso, para que la UI
+    /// distinga «Detenido por fallo» de «Fin de la pista».
+    had_playback_error: AtomicBool,
     /// Seek pedido desde la UI, tomado por el hilo decodificador en su loop.
     seek: Mutex<Option<Duration>>,
     /// Error del último seek (si `format.seek` falló), tomado por la UI.
@@ -185,6 +190,7 @@ impl AudioEngine {
                 volume: AtomicU32::new(1.0f32.to_bits()),
                 speed: AtomicU32::new(1.0f32.to_bits()),
                 error: Mutex::new(None),
+                had_playback_error: AtomicBool::new(false),
                 seek: Mutex::new(None),
                 seek_error: Mutex::new(None),
                 playback_clear: AtomicBool::new(false),
@@ -202,6 +208,14 @@ impl AudioEngine {
 
     pub fn play(&mut self, path: &Path) -> Result<(), AudioError> {
         self.stop();
+
+        // Si el arranque falla en cualquier punto (archivo, device, hilo),
+        // el flag queda en true y la UI muestra «Detenido» en vez de decir
+        // «Fin de la pista» para algo que nunca arrancó. Se limpia recién
+        // cuando todo está listo para sonar.
+        self.shared
+            .had_playback_error
+            .store(true, Ordering::Release);
 
         if !path.exists() {
             return Err(AudioError::FileNotFound(path.to_path_buf()));
@@ -255,6 +269,12 @@ impl AudioEngine {
         };
 
         let thread_shared = Arc::clone(&self.shared);
+        // Último punto sin carrera: el hilo de decode recién va a existir,
+        // así que ningún fallo async pudo pisar este reset todavía. Los err
+        // paths posteriores (spawn, stream.play) vuelven a marcar el flag.
+        self.shared
+            .had_playback_error
+            .store(false, Ordering::Release);
         let spawned = thread::Builder::new()
             .name("mp3tui-decoder".to_string())
             .spawn(move || {
@@ -273,6 +293,9 @@ impl AudioEngine {
             Err(err) => {
                 drop(stream);
                 self.reset_state();
+                self.shared
+                    .had_playback_error
+                    .store(true, Ordering::Release);
                 return Err(AudioError::Device(format!(
                     "no se pudo crear el hilo de decodificación: {err}"
                 )));
@@ -284,6 +307,9 @@ impl AudioEngine {
             let _ = decoder_thread.join();
             drop(stream);
             self.reset_state();
+            self.shared
+                .had_playback_error
+                .store(true, Ordering::Release);
             return Err(AudioError::Device(err.to_string()));
         }
 
@@ -434,8 +460,16 @@ impl AudioEngine {
         }
     }
 
-    fn take_error(&self) -> Option<AudioError> {
+    /// Error del último decode/device fallido (si lo hubo), para mostrarlo
+    /// en la UI. Se consume una sola vez.
+    pub fn take_error(&self) -> Option<AudioError> {
         self.shared.error.lock().unwrap().take()
+    }
+
+    /// ¿La última reproducción falló (o falló el arranque)? A diferencia de
+    /// `take_error`, no se consume: queda hasta el próximo `play()` exitoso.
+    pub fn had_playback_error(&self) -> bool {
+        self.shared.had_playback_error.load(Ordering::Acquire)
     }
 
     fn reset_state(&self) {
@@ -543,7 +577,15 @@ where
 
     let error_callback = move |err: cpal::Error| {
         *error_shared.error.lock().unwrap() = Some(AudioError::Device(err.to_string()));
+        // El device murió en caliente (cambio de salida, sleep): mismo caso
+        // que un decode fallido — estado STOPPED y error visible en la TUI,
+        // no «Reproduciendo» eterno. El error se escribe primero que el
+        // estado por la misma razón que en decode_loop.
+        error_shared.state.store(STATE_STOPPED, Ordering::Release);
         error_shared.finished.store(true, Ordering::Release);
+        error_shared
+            .had_playback_error
+            .store(true, Ordering::Release);
     };
 
     device
@@ -646,6 +688,12 @@ fn decode_loop(
         &shared,
     ) {
         *shared.error.lock().unwrap() = Some(err);
+        // Estado honesto: sin esto el state queda PLAYING y la TUI mostraría
+        // «Reproduciendo» para siempre mientras el device suena silencio (el
+        // error nadie lo leía). El orden importa: el error se escribe ANTES
+        // que el estado, así quien lea state = STOPPED ya ve el error listo.
+        shared.state.store(STATE_STOPPED, Ordering::Release);
+        shared.had_playback_error.store(true, Ordering::Release);
     }
     // Cierre atómico con AudioEngine::seek() (mismo lock): o el último pedido
     // lo tomó el chequeo de fin de pista del loop, o se descarta acá. Si se

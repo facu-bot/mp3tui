@@ -321,8 +321,57 @@ Engram esté disponible.
       RDD: riesgo alto (mismo motivo estructural); consentimiento otorgado;
       revisión con 4 lentes, sin findings. Review aprobada y confirmada.
       Boundary revisado avanza a `df27210`.
-- [ ] T10 — Pulido: manejo de errores (archivos corruptos/formatos no soportados),
+- [x] T10 — Pulido: manejo de errores (archivos corruptos/formatos no soportados),
       README con instrucciones de build/run. Ruta: delegada.
+      Bug real encontrado y corregido durante el repaso de manejo de errores:
+      cuando `run_decode` fallaba a mitad de archivo (formato corrupto después
+      de un header válido) o el device de audio moría en caliente (cambio de
+      salida, sleep del sistema), el error se guardaba en `shared.error` pero
+      el `state` seguía en `PLAYING` — la TUI mostraba "Reproduciendo" para
+      siempre sobre silencio, y si repeat estaba activo, el auto-advance de
+      T6 podía tratar la falla como fin natural de pista. Corregido: nuevo
+      estado `had_playback_error` (sticky, distinto del `error` que se
+      consume una vez) y un nuevo `Status::Stopped` ("Detenido") en la UI,
+      distinto de `Status::Ended` ("Fin de la pista"); el error se escribe
+      siempre ANTES que la transición de estado (mismo orden ya usado en el
+      seek de T7) para que quien lea `state = STOPPED` ya tenga el error
+      disponible. El auto-advance de repeat ahora se suprime explícitamente
+      cuando hubo un error, no solo cuando la pista llegó a su fin real.
+      También: `.gitignore` ahora cubre `.atl/` además de `/target`; revisión
+      de la paleta/layout sin cambios (ya estaba coherente desde T4-T9, no se
+      tocó para no arriesgar lo ya pulido).
+      Evidencia: `cargo build`/`cargo clippy --all-targets -- -D warnings` en
+      0/0, `cargo test` 67/67 (2 ignorados, requieren device real). Harness
+      E2E 15/15 PASS (regresión completa A-N + nuevo escenario O: wav truncado
+      a mitad de archivo con header RIFF intacto — el probe inicial pasa pero
+      el decode falla en curso — asertando "Detenido", error visible en
+      pantalla, sin "Reproduciendo" eterno ni "Fin de la pista" falso).
+      Orquestador leyó el diff completo de audio/mod.rs y ui/mod.rs línea por
+      línea (sin delegar a un fork esta vez, dado el tamaño acotado — 90
+      líneas — y que la lógica de ordering ya seguía el mismo patrón
+      documentado y verificado en T7) y confirmó el orden correcto de
+      escritura (error antes que state) en los 3 puntos donde aplica.
+      Verificó además de forma independiente, reproduciendo el mismo wav
+      truncado usado en el escenario E2E: el proceso sigue vivo sin crash ni
+      zombie tras el fallo de decode.
+
+      **README.md agregado** en la raíz: qué es la app, requisitos y cómo
+      compilar/correr, tabla completa de atajos (reproductor/explorador/
+      búsqueda), formato y ubicación del archivo de config opcional,
+      limitaciones conocidas (velocidad cambia el pitch; caso de borde del
+      seek con stall de driver, documentado también en el código; formatos
+      sin duración conocida; escaneo de bibliotecas grandes por tandas),
+      stack de dependencias, estructura de `src/`, y cómo correr los tests.
+
+## Cierre del plan
+Con T10 completada, las 10 tareas planificadas (incluyendo las 3 agregadas a
+pedido del usuario a mitad de camino: explorador extendido, seek, velocidad
+variable) están implementadas, commiteadas y verificadas. El proyecto es un
+reproductor de terminal completo y funcional: reproduce mp3/flac/ogg/wav/aac
+reales, visualiza el espectro en vivo, permite navegar/buscar una biblioteca,
+soporta seek y velocidad variable, shuffle/repeat, y es configurable/temable
+vía TOML sin dejar de funcionar out-of-the-box. Distribución: uso personal
+vía `cargo run --release`, como se acordó al inicio.
 
 ## Backlog de hardening (no bloqueante, detectado en revisiones RDD)
 - `AudioEngine::stop()`/`pause()` pueden tardar hasta la duración de un

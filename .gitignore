@@ -1,1 +1,4 @@
 /target
+
+# Artefactos locales de herramientas (no son parte del proyecto).
+.atl/

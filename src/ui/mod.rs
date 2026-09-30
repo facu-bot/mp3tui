@@ -41,6 +41,9 @@ enum Status {
     Playing,
     Paused,
     Ended,
+    /// No suena y además falló (apertura, decode o device): distinto de
+    /// `Ended`, que es la pista que llegó a su fin natural.
+    Stopped,
 }
 
 /// Cómo arranca la TUI según el argumento de CLI.
@@ -182,11 +185,25 @@ fn fallback_cwd() -> PathBuf {
 
 fn event_loop(tui: &mut Tui, app: &mut App, engine: &mut AudioEngine) -> io::Result<()> {
     loop {
+        // Error en curso del decoder o del device (archivo corrupto a
+        // mitad, device desconectado): se muestra una vez y corta el
+        // auto-advance de fin natural — la pista no terminó, falló. Se lee
+        // ANTES de la transición de estado: el hilo de decode escribe el
+        // error primero que el state, así que si el estado ya cambió, el
+        // error está disponible.
+        let playback_error = engine.take_error();
+        if let Some(err) = &playback_error {
+            app.error = Some(err.to_string());
+        }
+
         // La transición Playing → Ended es el fin natural de la pista: ahí
         // decide repeat (uno la relanza, todo salta y envuelve).
         let previous_status = app.status;
         app.status = status_of(engine);
-        if previous_status == Status::Playing && app.status == Status::Ended {
+        if playback_error.is_none()
+            && previous_status == Status::Playing
+            && app.status == Status::Ended
+        {
             handle_natural_end(app, engine);
         }
         // Un seek fallido en el decodificador se toma una sola vez para
@@ -229,6 +246,10 @@ fn status_of(engine: &AudioEngine) -> Status {
         Status::Paused
     } else if engine.is_playing() {
         Status::Playing
+    } else if engine.had_playback_error() {
+        // No terminó: falló. «Fin de la pista» para un archivo que nunca
+        // llegó al final sería mentira (y dispararía el auto-advance).
+        Status::Stopped
     } else {
         Status::Ended
     }
@@ -652,6 +673,7 @@ fn status_parts(status: Status) -> (&'static str, Color) {
         Status::Playing => ("Reproduciendo", theme().ok),
         Status::Paused => ("Pausado", theme().warn),
         Status::Ended => ("Fin de la pista", theme().dim),
+        Status::Stopped => ("Detenido", theme().error),
     }
 }
 
@@ -1650,5 +1672,21 @@ mod tests {
         let active_text = line_text(&active);
         assert!(active_text.contains("repeat: todo"), "{active_text}");
         assert!(active_text.contains("shuffle: sí"), "{active_text}");
+    }
+
+    #[test]
+    fn playback_failure_shows_detenido_not_fin_de_la_pista() {
+        let failed = status_line(Status::Stopped, RepeatMode::Off, false);
+        let failed_text = line_text(&failed);
+        assert!(failed_text.contains("Detenido"), "{failed_text}");
+        assert!(
+            !failed_text.contains("Fin de la pista"),
+            "{failed_text}"
+        );
+
+        let ended = status_line(Status::Ended, RepeatMode::Off, false);
+        let ended_text = line_text(&ended);
+        assert!(ended_text.contains("Fin de la pista"), "{ended_text}");
+        assert!(!ended_text.contains("Detenido"), "{ended_text}");
     }
 }
