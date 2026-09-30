@@ -565,6 +565,11 @@ comando) y agrupados por la carpeta de origen.
       Orquestador verificó de forma independiente: diff de `config.rs`
       confirmando `back = [Esc]` exactamente como se pidió, binario
       recompilado.
+      RDD: riesgo alto (mismo motivo estructural); consentimiento otorgado;
+      revisión con 4 lentes, 1 finding SUGGESTION no bloqueante en
+      review-resilience (el mismo glitch de render de 1 fila de altura, ya
+      documentado en el backlog de arriba). Review aprobada y confirmada.
+      Boundary revisado avanza a `18bb799`.
 
 ## Backlog de hardening (no bloqueante, detectado en revisiones RDD)
 - `library_rows`/`visible_start` (T14) puede renderizar la lista vacía por
