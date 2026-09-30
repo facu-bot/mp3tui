@@ -38,6 +38,7 @@ fn theme() -> &'static Theme {
 
 const CURSOR: &str = "\u{258c}"; // ▌ fila seleccionada
 const PLAYING: &str = "\u{25b6}"; // ▶ pista en reproducción
+const SEARCH_CARET: &str = "\u{258f}"; // ▏ cursor de texto en modo búsqueda
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Status {
@@ -903,11 +904,13 @@ fn progress_gauge(app: &App, engine: &AudioEngine) -> Gauge<'static> {
         None => format!("Progreso {} / —", format_duration(position)),
     };
 
+    // Color distinto al de la barra de volumen (acento): con las dos en el
+    // mismo tono eran indistinguibles a simple vista salvo por la etiqueta.
     let mut gauge = Gauge::default().label(label);
     match duration.filter(|total| !total.is_zero()) {
         Some(total) => {
             let ratio = position.as_secs_f64() / total.as_secs_f64();
-            gauge = gauge.gauge_style(Style::default().fg(theme().accent)).ratio(ratio.clamp(0.0, 1.0));
+            gauge = gauge.gauge_style(Style::default().fg(theme().ok)).ratio(ratio.clamp(0.0, 1.0));
         }
         None => {
             gauge = gauge.gauge_style(Style::default().fg(theme().dim)).ratio(0.0);
@@ -979,10 +982,17 @@ fn render_browser_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
 fn render_library(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let folder = library_folder_label(app);
-    let block = themed_block(Span::styled(
-        library_title(app, &folder),
-        Style::default().fg(theme().accent).add_modifier(Modifier::BOLD),
-    ));
+    // Buscando: borde y título en el color de aviso (warn) en vez del acento
+    // normal, para que el modo búsqueda se note de un vistazo y no sólo por
+    // el texto "Buscar:" (que puede pasar desapercibido).
+    let searching = app.search.is_some();
+    let highlight = if searching { theme().warn } else { theme().accent };
+    let block = Block::bordered()
+        .border_style(Style::default().fg(if searching { theme().warn } else { theme().dim }))
+        .title(Span::styled(
+            library_title(app, &folder),
+            Style::default().fg(highlight).add_modifier(Modifier::BOLD),
+        ));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1150,7 +1160,10 @@ fn folder_header_line(folder: &str, width: u16) -> Line<'static> {
 /// modos de reproducción (solo cuando están prendidos, para no ensuciar).
 fn library_title(app: &App, folder: &str) -> String {
     let mut title = if let Some(query) = &app.search {
-        format!(" Buscar: {query} · {} coincidencias ", app.view.len())
+        format!(
+            " Buscar: {query}{SEARCH_CARET} · {} coincidencias ",
+            app.view.len()
+        )
     } else {
         match &app.library {
             None => format!(" Biblioteca · {folder} "),

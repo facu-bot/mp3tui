@@ -621,6 +621,39 @@ a mano como único mecanismo).
       esta vez" (`consent: declined`) — sin registro de revisión nativa.
       Cobertura de calidad ya obtenida vía build/clippy/test + lectura
       completa del orquestador.
+
+Pedido nuevo del usuario: "quiero que vos, no opencode, actualice algo de
+la ui" — dos problemas de distinguibilidad visual que notó usando la app:
+la barra de progreso y la de volumen se ven iguales, y nada indica que se
+está en modo búsqueda.
+
+- [x] T16 — Distinguibilidad visual: (a) la barra de progreso y la de
+      volumen usaban el mismo color de acento y el mismo tipo de widget,
+      indistinguibles a simple vista salvo leyendo la etiqueta de texto;
+      (b) el modo búsqueda no tenía ningún indicador visual aparte del
+      texto "Buscar:" en el título, con el mismo estilo que el título
+      normal — fácil de no notar que se está escribiendo. Ruta: **directa**
+      (pedido explícito del usuario de que la haga yo, no delegada a
+      opencode) — 2 archivos no triviales tocados (src/ui/mod.rs), toda la
+      lógica de cambio de color/estilo, sin arquitectura nueva.
+      Implementación: la barra de progreso pasa de `theme().accent`
+      (mismo violeta que volumen) a `theme().ok` (verde), quedando
+      visualmente distinta de un vistazo. El modo búsqueda ahora resalta
+      todo el bloque (borde + título) con `theme().warn` (amarillo) en vez
+      del acento/dim normal, y el texto de la query lleva un cursor de
+      texto simulado (`▏`, constante `SEARCH_CARET`) al final para que se
+      lea como un campo de entrada activo.
+      Evidencia: `cargo build`, `cargo clippy --all-targets -- -D warnings`
+      y `cargo test` en 0 errores/82 tests OK (sin tests nuevos: es un
+      cambio de estilo visual, no de lógica testeable más allá de lo que
+      ya cubren los tests de color existentes). Verificado de forma
+      independiente ejecutando el binario contra un mp3 real y confirmando
+      en el output crudo (ANSI) que ambas barras emiten sus códigos de
+      color RGB distintos (verde `38;2;135;169;135` para progreso, violeta
+      `38;2;149;127;184` para volumen) — no solo que compila, que
+      efectivamente se pinta distinto. Sin proceso zombie tras la prueba.
+
+## Backlog de hardening (no bloqueante, detectado en revisiones RDD)
 - `library_rows`/`visible_start` (T14) puede renderizar la lista vacía por
   un frame si la altura visible del panel es de exactamente 1 fila y la
   selección cae justo en el primer track de un grupo nuevo (el cálculo de
