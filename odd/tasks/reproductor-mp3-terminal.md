@@ -617,6 +617,10 @@ a mano como único mecanismo).
       unión/dedup) y confirmó que no hay panics posibles (todo pasa por
       `is_dir()`/`Option` en vez de `unwrap`), build verificado de forma
       independiente.
+      RDD: riesgo alto (mismo motivo estructural); usuario eligió "saltear
+      esta vez" (`consent: declined`) — sin registro de revisión nativa.
+      Cobertura de calidad ya obtenida vía build/clippy/test + lectura
+      completa del orquestador.
 - `library_rows`/`visible_start` (T14) puede renderizar la lista vacía por
   un frame si la altura visible del panel es de exactamente 1 fila y la
   selección cae justo en el primer track de un grupo nuevo (el cálculo de
