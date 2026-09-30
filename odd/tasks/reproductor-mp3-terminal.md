@@ -483,6 +483,17 @@ son mejoras sobre trabajo ya aceptado, no correcciones de un defecto.
       panic nuevas para tamaños de terminal degenerados. Orquestador
       verificó de forma independiente: binario recompilado, arranque limpio
       con audio real sin stderr ni zombie.
+      RDD: riesgo alto (mismo motivo estructural); usuario eligió "saltear
+      esta vez" (`consent: declined`) — sin registro de revisión nativa.
+      Cobertura de calidad ya obtenida vía build/clippy/test + revisión
+      independiente por fork (arriba), sin findings.
+
+## Cierre de la ronda de mejoras visuales (T11-T13)
+Con T13 completada, las tres mejoras que pidió el usuario tras probar el MVP
+(paleta Kanagawa Dragon, visualizador más sensible, explorador como panel
+lateral con Ctrl+Tab) están implementadas, commiteadas y verificadas. El
+reproductor sigue siendo el mismo funcionalmente (T1-T10), con mejor diseño
+visual y una interacción de explorador menos disruptiva.
 
 ## Backlog de hardening (no bloqueante, detectado en revisiones RDD)
 - `AudioEngine::stop()`/`pause()` pueden tardar hasta la duración de un
