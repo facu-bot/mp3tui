@@ -652,6 +652,9 @@ está en modo búsqueda.
       color RGB distintos (verde `38;2;135;169;135` para progreso, violeta
       `38;2;149;127;184` para volumen) — no solo que compila, que
       efectivamente se pinta distinto. Sin proceso zombie tras la prueba.
+      RDD: riesgo alto (mismo heurístico estructural, sin relación real con
+      este cambio de estilo puro); usuario eligió "saltear esta vez"
+      (`consent: declined`) — sin registro de revisión nativa.
 
 ## Backlog de hardening (no bloqueante, detectado en revisiones RDD)
 - `library_rows`/`visible_start` (T14) puede renderizar la lista vacía por
