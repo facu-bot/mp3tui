@@ -366,7 +366,7 @@ Engram esté disponible.
       revisión con 4 lentes, sin findings. Review aprobada y confirmada.
       Boundary revisado avanza a `3f1d2c3`.
 
-## Cierre del plan
+## Cierre del MVP (T1-T10)
 Con T10 completada, las 10 tareas planificadas (incluyendo las 3 agregadas a
 pedido del usuario a mitad de camino: explorador extendido, seek, velocidad
 variable) están implementadas, commiteadas y verificadas. El proyecto es un
@@ -375,6 +375,40 @@ reales, visualiza el espectro en vivo, permite navegar/buscar una biblioteca,
 soporta seek y velocidad variable, shuffle/repeat, y es configurable/temable
 vía TOML sin dejar de funcionar out-of-the-box. Distribución: uso personal
 vía `cargo run --release`, como se acordó al inicio.
+
+Reabierto después del cierre: el usuario probó la app y pidió mejoras de
+diseño visual concretas — la paleta actual (T9) "se ve feo, poco estético y
+con colores horrendos", el visualizador reacciona muy poco aunque se suba el
+volumen, y el explorador de archivos debería ser un panel lateral togglable
+(Ctrl+Tab) en vez de una pantalla completa que reemplaza al reproductor. Se
+agregan T11-T13 para esto. No se retira ni se marca inválido nada de T1-T10;
+son mejoras sobre trabajo ya aceptado, no correcciones de un defecto.
+
+- [ ] T11 — Rediseño visual completo con la paleta **Kanagawa Dragon**
+      (elegida por el usuario): reemplazar el tema por defecto de T9 (cian +
+      semáforo verde/amarillo/rojo) por los tonos oscuros y cálidos de Dragon
+      (fondo casi negro, acentos violeta/azul/rojo/verde muy desaturados,
+      texto gris cálido). Aplica a todos los bloques (info, explorador,
+      footer, gauges) y al gradiente del visualizador. Sigue siendo
+      configurable vía `[theme]` de T9 (Dragon pasa a ser el default, no
+      reemplaza el mecanismo de config). Ruta: delegada.
+- [ ] T12 — El visualizador debe notarse más: ajustar la ganancia/
+      normalización de las bandas FFT (src/visualizer/mod.rs) para que
+      reaccione visiblemente con audio real a volumen normal, no solo con
+      picos extremos. Revisar la constante de normalización actual
+      (`norm = FFT_SIZE / 4`, calibrada para un tono puro de escala completa,
+      demasiado conservadora para música real con energía repartida en
+      muchas bandas) y el rango de attack/decay. Ruta: delegada.
+- [ ] T13 — Explorador de archivos como panel lateral togglable con
+      Ctrl+Tab (en vez del cambio de pantalla completa actual de T3/T5):
+      el reproductor (con visualizador) queda visible de fondo, y Ctrl+Tab
+      abre/cierra un panel lateral con la lista de la biblioteca superpuesto
+      o compartiendo el layout. Hay que decidir el ancho del panel y qué pasa
+      con el visualizador cuando el panel está abierto (¿se achica, se tapa
+      parcialmente?) — dejarlo a criterio de implementación con buen
+      resultado visual. `b`/Tab actuales quedan a reconciliar con el nuevo
+      atajo (¿se mantienen como alias o se reemplazan por Ctrl+Tab?, usar
+      criterio y documentarlo). Ruta: delegada.
 
 ## Backlog de hardening (no bloqueante, detectado en revisiones RDD)
 - `AudioEngine::stop()`/`pause()` pueden tardar hasta la duración de un
