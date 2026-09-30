@@ -2,8 +2,8 @@
 
 Reproductor de audio para la terminal: suena de verdad (no es una demo), y
 acompaña con una TUI en [ratatui] con visualizador de espectro FFT en vivo,
-explorador de biblioteca, seek, velocidad variable y configuración opcional
-por TOML.
+explorador de biblioteca como panel lateral superpuesto, seek, velocidad
+variable y configuración opcional por TOML.
 
 Desarrollado en Rust, con interfaz completamente operable por teclado.
 
@@ -42,28 +42,46 @@ Windows.
 | `s` | Aleatorio (shuffle) |
 | `r` | Modo repetir (off → una → todas) |
 | `[` / `]` | Velocidad 0.50x – 2.00x (pasos de 0.25x) |
-| `b` / `Tab` | Abrir el explorador |
-| `/` | Abrir el explorador con la búsqueda |
+| `b` / `Tab` / `Ctrl+Tab` | Abrir o cerrar el panel del explorador |
+| `/` | Abrir el panel del explorador con la búsqueda |
 | `q` / `Esc` | Salir |
 
-### Explorador
+Con música sonando, el explorador ya no reemplaza la pantalla: se superpone
+como panel lateral derecho (~36% del ancho) y el reproductor con su
+visualizador queda visible de fondo, achicado pero animando. Sin sesión de
+audio (arranque sin archivo) el explorador sigue ocupando toda la pantalla.
+
+### Panel lateral del explorador
 
 | Tecla | Acción |
 | --- | --- |
 | `↑` / `↓` | Mover la selección |
 | `PgUp` / `PgDn` | Mover de a pantalla |
 | `Inicio` / `Fin` | Primera / última pista |
-| `Enter` | Reproducir la seleccionada |
-| `espacio` | Reproducir / pausar (sin salir del explorador) |
+| `Enter` | Reproducir la seleccionada (**no cierra** el panel: la pista arranca en el reproductor de fondo) |
+| `espacio` | Reproducir / pausar (el panel sigue abierto) |
 | `←` / `→` | Seek ±5 s |
 | `[` / `]` | Velocidad |
 | `n` / `p` | Pista siguiente / anterior |
 | `s` | Aleatorio |
 | `r` | Modo repetir |
-| `/` | Búsqueda incremental |
-| `Esc` / `Tab` | Volver al reproductor (si hay uno activo) |
-| `q` / `Esc` | Salir (solo si no hay reproducción activa) |
+| `/` | Búsqueda incremental (vive en el panel) |
+| `Esc` / `Tab` / `Ctrl+Tab` / `b` | Cerrar el panel (el reproductor de fondo queda solo) |
+| `q` | Salir |
 
+Mientras el panel está abierto **los atajos de reproducción siguen
+activos**: puedes pausar, hacer seek, cambiar de pista o ajustar la
+velocidad sin cerrarlo primero. La única excepción es el volumen: `↑`/`↓`
+navegan la lista mientras el panel está abierto (coinciden con los atajos de
+volumen del reproductor), así que el volumen se ajusta con el panel cerrado.
+El footer de atajos muestra este contexto y se actualiza al abrir/cerrar.
+
+### Explorador a pantalla completa (sin reproducción activa)
+
+Sin sesión de audio (arranque sin archivo) la lista ocupa toda la pantalla y
+se maneja con las mismas teclas que el panel lateral, con dos diferencias:
+`Esc` / `Tab` / `q` salen de la app (no hay panel que cerrar ni reproductor
+al que volver) y `Enter` pasa al modo reproducción con la pista sonando.
 `Ctrl+C` sale siempre, en cualquier modo.
 
 ### Búsqueda (cuando está abierta)

@@ -336,7 +336,9 @@ pub struct Keys {
     pub search: Vec<KeyCode>,
     pub speed_up: Vec<KeyCode>,
     pub speed_down: Vec<KeyCode>,
-    /// Entrar al explorador desde el player.
+    /// Abrir/cerrar el panel lateral del explorador (T13): `b` / `Tab` /
+    /// `Ctrl+Tab` (el dispatch ignora modificadores, así que las tres variantes
+    /// caen en la misma acción).
     pub explorer: Vec<KeyCode>,
     pub move_up: Vec<KeyCode>,
     pub move_down: Vec<KeyCode>,
@@ -346,7 +348,8 @@ pub struct Keys {
     pub end: Vec<KeyCode>,
     /// Reproducir la pista seleccionada en el explorador.
     pub select: Vec<KeyCode>,
-    /// Volver al player desde el explorador.
+    /// Cerrar el panel lateral del explorador / volver al player (T13); sin
+    /// player en pantalla completa, sale de la app.
     pub back: Vec<KeyCode>,
 }
 

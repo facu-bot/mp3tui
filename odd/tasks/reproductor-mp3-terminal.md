@@ -438,7 +438,7 @@ son mejoras sobre trabajo ya aceptado, no correcciones de un defecto.
       esta vez" (`consent: declined`) — sin registro de revisión nativa.
       Cobertura de calidad ya obtenida vía build/clippy/test + revisión
       manual del orquestador línea por línea del diff de visualizer/mod.rs.
-- [ ] T13 — Explorador de archivos como panel lateral togglable con
+- [x] T13 — Explorador de archivos como panel lateral togglable con
       Ctrl+Tab (en vez del cambio de pantalla completa actual de T3/T5):
       el reproductor (con visualizador) queda visible de fondo, y Ctrl+Tab
       abre/cierra un panel lateral con la lista de la biblioteca superpuesto
@@ -448,6 +448,41 @@ son mejoras sobre trabajo ya aceptado, no correcciones de un defecto.
       resultado visual. `b`/Tab actuales quedan a reconciliar con el nuevo
       atajo (¿se mantienen como alias o se reemplazan por Ctrl+Tab?, usar
       criterio y documentarlo). Ruta: delegada.
+      Implementación: el reproductor (info + visualizador + footer) se
+      renderiza siempre de fondo; el panel ocupa el 36% del ancho a un
+      costado y se abre/cierra con Ctrl+Tab (`b`/Tab/Esc quedan como alias
+      del mismo toggle, sin sacar los atajos que el usuario ya conocía). Con
+      el panel abierto, la mayoría de los atajos de reproducción (play/pausa,
+      seek, velocidad, shuffle, repeat, búsqueda, next/prev) siguen andando
+      sin cerrar el panel; la única excepción deliberada es volumen ↑/↓, que
+      con el panel abierto mueve la selección de la lista en su lugar (mismo
+      criterio que ya tenía el explorador de T5) — documentado en el footer
+      y el README. Esc/q solo salen con el panel ya cerrado; con el panel
+      abierto, Esc lo cierra primero (hace falta un segundo Esc para salir).
+      El visualizador se achica pero sigue animando con el panel abierto (se
+      midió 62 celdas vs 105 con el panel cerrado), no desaparece.
+      Evidencia: `cargo build`/`cargo clippy --all-targets -- -D warnings` en
+      0/0, `cargo test` 71/71 (nuevos: el layout achica la columna principal
+      y mantiene el footer a ancho completo; volver cierra el panel y solo
+      sale desde el explorador "pelado"; el test de deduplicación de escaneo
+      renombrado para reflejar que ahora se dispara desde el toggle, no desde
+      un modo separado). Harness E2E 16/16 PASS (regresión completa A-O +
+      nuevo escenario P con capturas reales: Ctrl+Tab abre, navega, Enter
+      cambia de pista sin cerrar el panel y con el visualizador animando,
+      espacio pausa/reanuda sin cerrar, Ctrl+Tab cierra y la reproducción
+      sigue sonando).
+      Revisión de código vía fork (mismo criterio que T5-T7, foco en
+      dispatch de teclas/lógica de salir/layout en vez de concurrencia dado
+      que este cambio no toca hilos de audio): sin hallazgos de
+      correctitud. Confirmó que el dispatch de teclas es inequívoco (una
+      sola rama aplicable por combinación de modo/panel), que Esc/q no están
+      invertidos (cierra panel primero, sale en la segunda pulsación desde
+      el estado "pelado"), que un escaneo de biblioteca terminando después
+      de cerrar el panel no corrompe nada (`poll_scan` corre cada frame sin
+      importar si el panel está abierto), y que el layout no tiene rutas de
+      panic nuevas para tamaños de terminal degenerados. Orquestador
+      verificó de forma independiente: binario recompilado, arranque limpio
+      con audio real sin stderr ni zombie.
 
 ## Backlog de hardening (no bloqueante, detectado en revisiones RDD)
 - `AudioEngine::stop()`/`pause()` pueden tardar hasta la duración de un

@@ -1,7 +1,10 @@
 #![allow(dead_code)]
 
 //! Interfaz de terminal: layout con ratatui y loop de eventos no bloqueante.
-//! Dos modos: reproducción (T3+T4) y explorador de biblioteca (T5).
+//! Reproducción (T3+T4) y explorador de biblioteca (T5). Con sesión de audio
+//! el reproductor (info + visualizador) es el fondo permanente y el
+//! explorador se superpone como panel lateral con Ctrl+Tab/b/Tab (T13); a
+//! pantalla completa solo cuando no hay player (arranque por directorio).
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -55,6 +58,10 @@ pub enum StartMode {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+/// Pantalla de fondo. Con sesión de audio siempre es `Player`; el explorador
+/// se superpone como panel lateral (`App::explorer_open`, T13) sin
+/// reemplazarlo. `Browser` a pantalla completa es el caso sin player
+/// (arranque por directorio): no hay fondo que mostrar detrás de la lista.
 enum Mode {
     Player,
     Browser,
@@ -62,6 +69,9 @@ enum Mode {
 
 struct App {
     mode: Mode,
+    /// Panel lateral del explorador superpuesto sobre el reproductor (T13).
+    /// Solo tiene efecto en `Mode::Player`.
+    explorer_open: bool,
     root: PathBuf,
     /// Última biblioteca conocida; `None` mientras no terminó el primer escaneo.
     library: Option<Playlist>,
@@ -148,6 +158,7 @@ pub fn run(engine: &mut AudioEngine, start: StartMode) -> io::Result<()> {
     // de tags (lofty, I/O por archivo) no puede congelar el hilo de la UI.
     let mut app = App {
         mode,
+        explorer_open: false,
         root,
         library: None,
         scan_rx: None,
@@ -271,8 +282,11 @@ fn handle_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine) {
     }
 
     match app.mode {
+        // Panel lateral abierto (T13): la lista manda las flechas, pero los
+        // atajos de reproducción (pausa, seek, n/p…) siguen activos.
+        Mode::Player if app.explorer_open => handle_list_key(key, app, engine),
         Mode::Player => handle_player_key(key, app, engine),
-        Mode::Browser => handle_browser_key(key, app, engine),
+        Mode::Browser => handle_list_key(key, app, engine),
     }
 }
 
@@ -296,7 +310,7 @@ fn handle_player_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine) {
     } else if config::pressed(&keys.speed_up, code) {
         step_speed(app, engine, 1.0);
     } else if config::pressed(&keys.explorer, code) {
-        enter_browser(app);
+        toggle_explorer(app);
     } else if config::pressed(&keys.next_track, code) {
         play_step(app, engine, 1);
     } else if config::pressed(&keys.prev_track, code) {
@@ -306,23 +320,25 @@ fn handle_player_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine) {
     } else if config::pressed(&keys.repeat, code) {
         app.repeat = app.repeat.cycle();
     } else if config::pressed(&keys.search, code) {
-        enter_browser(app);
+        toggle_explorer(app);
         open_search(app);
     }
 }
 
-fn handle_browser_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine) {
+/// Teclas de la lista del explorador: navegar y reproducir. Con el panel
+/// lateral abierto (T13) corre en `Mode::Player` y suma los atajos de
+/// reproducción (pausa, seek, n/p, velocidad…) sobre la lista; con el
+/// explorador a pantalla completa (sin player) es el modo viejo de T5.
+fn handle_list_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine) {
     let keys = &config::config().keys;
     let view_len = app.view.len();
     let code = key.code;
-    // El orden importa: «back» antes que «quit» — Esc/Tab vuelven al player
-    // aunque Esc también esté en «quit» (para salir desde el modo player).
+    // El orden importa: «back» antes que «quit» — Esc/Tab cierran el panel
+    // (o salen del explorador sin player) aunque Esc también esté en «quit».
     if config::pressed(&keys.back, code) {
-        if app.has_player {
-            app.mode = Mode::Player;
-        } else {
-            app.should_quit = true;
-        }
+        go_back(app);
+    } else if config::pressed(&keys.explorer, code) {
+        toggle_explorer(app);
     } else if config::pressed(&keys.quit, code) {
         app.should_quit = true;
     } else if config::pressed(&keys.select, code) {
@@ -513,9 +529,10 @@ fn toggle_play(app: &mut App, engine: &mut AudioEngine) {
     }
 }
 
-/// Enter en el explorador: reproduce la pista seleccionada y pasa al modo
-/// reproducción. Si el archivo no se puede abrir, seguimos en el explorador
-/// con el error visible.
+/// Enter en la lista: reproduce la pista seleccionada. Con el explorador a
+/// pantalla completa pasa al modo reproducción; con el panel lateral abierto
+/// (T13) el panel se mantiene y el reproductor de fondo arranca la pista. Si
+/// el archivo no se puede abrir, seguimos donde estábamos con el error visible.
 fn play_selected(app: &mut App, engine: &mut AudioEngine) {
     let Some(library_index) = app.view.get(app.selected).copied() else {
         return;
@@ -637,14 +654,33 @@ fn handle_natural_end(app: &mut App, engine: &mut AudioEngine) {
     }
 }
 
-/// 'b' / Tab desde el reproductor: abre el explorador, apunta la selección a
-/// la pista sonando y reescanea la raíz en background (si ya hay un escaneo en
-/// curso, no lanza otro).
-fn enter_browser(app: &mut App) {
-    app.mode = Mode::Browser;
-    refresh_view(app);
-    resync_selection(app);
-    start_scan(app);
+/// Acción de «back» (Esc/Tab) desde la lista: con el panel lateral abierto
+/// (T13) lo cierra y deja el reproductor de fondo; con el explorador a
+/// pantalla completa vuelve al player si hay sesión y si no sale de la app.
+fn go_back(app: &mut App) {
+    if app.explorer_open {
+        app.explorer_open = false;
+    } else if app.has_player {
+        app.mode = Mode::Player;
+    } else {
+        app.should_quit = true;
+    }
+}
+
+/// 'b' / Tab / Ctrl+Tab: alterna el panel lateral del explorador (T13).
+/// Al abrirlo re-sincroniza la selección con la pista sonando y reescanea la
+/// raíz en background (si ya hay un escaneo en curso, no lanza otro). Sin
+/// sesión de audio no hace nada: el explorador ya ocupa toda la pantalla.
+fn toggle_explorer(app: &mut App) {
+    if !app.has_player {
+        return;
+    }
+    app.explorer_open = !app.explorer_open;
+    if app.explorer_open {
+        refresh_view(app);
+        resync_selection(app);
+        start_scan(app);
+    }
 }
 
 fn render(frame: &mut Frame<'_>, app: &App, engine: &AudioEngine) {
@@ -721,19 +757,62 @@ fn error_line(app: &App) -> Line<'static> {
     }
 }
 
-fn render_player(frame: &mut Frame<'_>, app: &App, engine: &AudioEngine) {
+/// Áreas del reproductor: info (8 filas), visualizador (resto) y pie. Con el
+/// panel lateral abierto (T13) info + visualizador se achican al 64% del
+/// ancho y el explorador ocupa el 36% derecho superpuesto (más barras
+/// visibles pero el espectro sigue animando); el pie crece a 5 filas (3 de
+/// texto) para los atajos del panel y sigue a todo lo ancho para no cortarse.
+fn player_areas(area: Rect, explorer_open: bool) -> (Rect, Rect, Rect, Option<Rect>) {
     let zones = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(8),
             Constraint::Min(4),
-            Constraint::Length(4),
+            Constraint::Length(if explorer_open { 5 } else { 4 }),
         ])
-        .split(frame.area());
+        .split(area);
+    let footer = zones[2];
+    if !explorer_open {
+        return (zones[0], zones[1], footer, None);
+    }
+    let upper = Rect {
+        height: zones[0].height + zones[1].height,
+        ..zones[0]
+    };
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(64),
+            Constraint::Percentage(36),
+        ])
+        .split(upper);
+    let left = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(8),
+            Constraint::Min(4),
+        ])
+        .split(columns[0]);
+    (left[0], left[1], footer, Some(columns[1]))
+}
 
-    render_player_info(frame, zones[0], app, engine);
-    render_visualizer(frame, zones[1], app.analyzer.bands());
-    render_footer(frame, zones[2], app);
+fn render_player(frame: &mut Frame<'_>, app: &App, engine: &AudioEngine) {
+    let (info_area, visual_area, footer_area, panel) =
+        player_areas(frame.area(), app.explorer_open);
+
+    render_player_info(frame, info_area, app, engine);
+    render_visualizer(frame, visual_area, app.analyzer.bands());
+    if let Some(panel_area) = panel {
+        render_explorer_panel(frame, panel_area, app);
+    }
+    render_footer(frame, footer_area, app);
+}
+
+/// Panel lateral del explorador (T13): la biblioteca superpuesta sobre el
+/// costado derecho, con el mismo bloque, título, scroll y marcadores de
+/// selección/reproducción que el explorador a pantalla completa.
+fn render_explorer_panel(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    render_library(frame, area, app);
 }
 
 fn render_player_info(frame: &mut Frame<'_>, area: Rect, app: &App, engine: &AudioEngine) {
@@ -831,38 +910,27 @@ fn progress_gauge(app: &App, engine: &AudioEngine) -> Gauge<'static> {
     gauge
 }
 
+/// Explorador a pantalla completa: solo cuando no hay sesión de audio (T13);
+/// con player el explorador va como panel lateral en `render_player`. Sin
+/// sesión no hay nada que visualizar, así que la lista se queda con toda la
+/// altura en vez de mostrar un bloque Visualizador vacío.
 fn render_browser(frame: &mut Frame<'_>, app: &App) {
-    // Sin sesión de audio no hay nada que visualizar: la lista se queda con
-    // toda la altura en vez de mostrar un bloque Visualizador vacío.
-    let zones = if app.has_player {
-        Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(5),
-                Constraint::Min(6),
-                Constraint::Length(6),
-                Constraint::Length(5),
-            ])
-            .split(frame.area())
-    } else {
-        Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(5),
-                Constraint::Min(6),
-                Constraint::Length(5),
-            ])
-            .split(frame.area())
-    };
+    debug_assert!(
+        !app.has_player,
+        "con sesión de audio el explorador es panel lateral, no pantalla completa"
+    );
+    let zones = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(5),
+            Constraint::Min(6),
+            Constraint::Length(5),
+        ])
+        .split(frame.area());
 
     render_browser_header(frame, zones[0], app);
     render_library(frame, zones[1], app);
-    if app.has_player {
-        render_visualizer(frame, zones[2], app.analyzer.bands());
-        render_footer(frame, zones[3], app);
-    } else {
-        render_footer(frame, zones[2], app);
-    }
+    render_footer(frame, zones[2], app);
 }
 
 fn render_browser_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -889,18 +957,18 @@ fn render_browser_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ]),
     };
 
-    let status = if app.has_player {
-        status_line(app.status, app.repeat, app.shuffle)
-    } else {
-        let mut spans = vec![
-            Span::styled("Estado:  ", Style::default().fg(theme().dim)),
-            Span::styled("Explorando", Style::default().fg(theme().dim)),
-        ];
-        spans.extend(repeat_shuffle_spans(app.repeat, app.shuffle));
-        Line::from(spans)
-    };
+    // Con !has_player (único caso que llega acá, T13) no hay sesión: la
+    // línea de estado es siempre «Explorando» + repeat/shuffle si están.
+    let mut spans = vec![
+        Span::styled("Estado:  ", Style::default().fg(theme().dim)),
+        Span::styled("Explorando", Style::default().fg(theme().dim)),
+    ];
+    spans.extend(repeat_shuffle_spans(app.repeat, app.shuffle));
 
-    frame.render_widget(Paragraph::new(vec![now_line, status, error_line(app)]), inner);
+    frame.render_widget(
+        Paragraph::new(vec![now_line, Line::from(spans), error_line(app)]),
+        inner,
+    );
 }
 
 fn render_library(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -1188,6 +1256,36 @@ fn footer_lines(app: &App) -> Vec<Line<'static>> {
 
     let keys = &config::config().keys;
     match app.mode {
+        // Panel lateral abierto (T13): 3 líneas — lista, reproducción y el
+        // recordatorio de que ↑/↓ son volumen solo con el panel cerrado.
+        Mode::Player if app.explorer_open => vec![
+            Line::from(format!(
+                " {}/{}: mover   {}: reproducir   {}: buscar   {}: cerrar",
+                key_labels(&keys.move_up),
+                key_labels(&keys.move_down),
+                key_labels(&keys.select),
+                key_labels(&keys.search),
+                key_labels(&keys.back),
+            )),
+            Line::from(format!(
+                " {}: pausa   {}/{}: ±5s   {}/{}: vel   {}: shuffle   {}: repeat   {}: salir",
+                key_labels(&keys.play_pause),
+                key_labels(&keys.seek_back),
+                key_labels(&keys.seek_fwd),
+                key_labels(&keys.speed_down),
+                key_labels(&keys.speed_up),
+                key_labels(&keys.shuffle),
+                key_labels(&keys.repeat),
+                key_labels(&keys.quit),
+            )),
+            Line::from(format!(
+                " {}/{}: pista sig/ant   volumen {}/{}: con el panel cerrado",
+                key_labels(&keys.next_track),
+                key_labels(&keys.prev_track),
+                key_labels(&keys.volume_up),
+                key_labels(&keys.volume_down),
+            )),
+        ],
         Mode::Player => vec![
             Line::from(format!(
                 " {}: pausa   {}/{}: volumen   {}/{}: ±5s   \
@@ -1394,6 +1492,7 @@ mod tests {
     fn test_app() -> App {
         App {
             mode: Mode::Browser,
+            explorer_open: false,
             root: PathBuf::from("."),
             library: None,
             scan_rx: None,
@@ -1462,15 +1561,26 @@ mod tests {
     }
 
     #[test]
-    fn enter_browser_never_starts_a_second_scan() {
+    fn toggle_explorer_never_starts_a_second_scan() {
         let mut app = test_app();
+        app.mode = Mode::Player;
+        app.has_player = true;
         let (tx, rx) = mpsc::channel();
         app.scan_rx = Some(rx);
 
         // Segundo 'b' con un escaneo ya en curso: conserva el receiver original.
-        enter_browser(&mut app);
-        assert!(app.mode == Mode::Browser);
+        toggle_explorer(&mut app);
+        assert!(app.explorer_open, "primer 'b' abre el panel");
         assert!(app.scan_rx.is_some());
+
+        toggle_explorer(&mut app);
+        assert!(!app.explorer_open, "segundo 'b' cierra el panel");
+        assert!(app.scan_rx.is_some(), "cerrar tampoco toca el escaneo");
+
+        // Sin sesión de audio el explorador ya está a pantalla completa.
+        let mut bare = test_app();
+        toggle_explorer(&mut bare);
+        assert!(!bare.explorer_open, "sin player no hay panel que abrir");
 
         // El escaneo original es el que entrega el resultado.
         tx.send(crate::playlist::from_tracks_for_test(vec![track_named("alpha")]))
@@ -1478,6 +1588,69 @@ mod tests {
         poll_scan(&mut app);
         assert_eq!(app.library.as_ref().map(Playlist::len), Some(1));
         assert!(app.scan_rx.is_none());
+    }
+
+    #[test]
+    fn player_areas_shrinks_the_main_column_and_keeps_the_footer_full_width() {
+        let area = Rect::new(0, 0, 100, 30);
+
+        let (info, visual, footer, panel) = player_areas(area, false);
+        assert_eq!(panel, None, "panel cerrado = layout clásico");
+        assert_eq!((info.x, info.width), (0, 100));
+        assert_eq!((visual.x, visual.width), (0, 100));
+        assert_eq!(footer.height, 4, "pie clásico con 2 líneas");
+
+        let (info, visual, footer, panel) = player_areas(area, true);
+        let panel = panel.expect("panel abierto");
+        assert_eq!((panel.x, panel.width), (64, 36), "36% derecho para la lista");
+        assert_eq!(
+            info.x + info.width,
+            64,
+            "la info se achica antes del panel"
+        );
+        assert_eq!(
+            visual.x + visual.width,
+            64,
+            "el visualizador sigue visible (comprimido) a la izquierda"
+        );
+        assert_eq!(
+            visual.y,
+            info.y + info.height,
+            "el visualizador arranca debajo de la info"
+        );
+        assert_eq!(footer.width, 100, "el pie sigue a todo lo ancho");
+        assert_eq!(footer.height, 5, "pie con 3 líneas para los atajos del panel");
+        assert_eq!(
+            info.y + info.height + visual.height,
+            footer.y,
+            "sin solapes entre zonas"
+        );
+    }
+
+    #[test]
+    fn go_back_closes_the_panel_and_only_quits_from_the_bare_explorer() {
+        // Panel abierto: Esc/Tab cierran el panel, no salen de la app.
+        let mut app = test_app();
+        app.mode = Mode::Player;
+        app.has_player = true;
+        app.explorer_open = true;
+        go_back(&mut app);
+        assert!(!app.explorer_open, "back cierra el panel");
+        assert!(app.mode == Mode::Player, "el player de fondo queda");
+        assert!(!app.should_quit, "no sale de la app");
+
+        // Explorador a pantalla completa sin player: sale (como antes de T13).
+        let mut bare = test_app();
+        go_back(&mut bare);
+        assert!(bare.should_quit, "sin player Esc/Tab salen");
+
+        // Player sin panel (estado clásico): back vuelve al modo player.
+        let mut classic = test_app();
+        classic.mode = Mode::Browser;
+        classic.has_player = true;
+        go_back(&mut classic);
+        assert!(classic.mode == Mode::Player);
+        assert!(!classic.should_quit);
     }
 
     #[test]
@@ -1633,10 +1806,43 @@ mod tests {
             assert!(browser.contains(hint), "footer del explorador falta '{hint}': {browser}");
         }
 
+        // Panel lateral abierto (T13): lista + playback + aviso de volumen.
+        app.mode = Mode::Player;
+        app.explorer_open = true;
+        let panel: String = footer_lines(&app)
+            .iter()
+            .map(|line| line_text(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for hint in [
+            "↑/↓: mover",
+            "Enter: reproducir",
+            "Esc/Tab: cerrar",
+            "espacio: pausa",
+            "←/→: ±5s",
+            "[/]: vel",
+            "n/p: pista sig/ant",
+            "q/Esc: salir",
+            "volumen ↑/↓: con el panel cerrado",
+        ] {
+            assert!(panel.contains(hint), "footer del panel falta '{hint}': {panel}");
+        }
+        assert_eq!(
+            footer_lines(&app).len(),
+            3,
+            "el pie con panel usa sus 3 líneas"
+        );
+        app.explorer_open = false;
+
         // Ninguna línea del pie puede exceder el ancho útil (78): si no, se
         // trunca en pantalla.
-        for mode in [Mode::Player, Mode::Browser] {
+        for (mode, open) in [
+            (Mode::Player, false),
+            (Mode::Player, true),
+            (Mode::Browser, false),
+        ] {
             app.mode = mode;
+            app.explorer_open = open;
             for line in footer_lines(&app) {
                 assert!(
                     line_width(&line) <= 78,
@@ -1646,6 +1852,7 @@ mod tests {
                 );
             }
         }
+        app.explorer_open = false;
 
         app.search = Some(String::new());
         let search: String = footer_lines(&app)
