@@ -14,8 +14,8 @@
 //!
 //! ```toml
 //! [theme]
-//! accent = "#22D3EE"        # «#RRGGBB» o nombre: cyan, blanco, gris, ...
-//! spectrum_low = "#22C55E"  # gradiente del visualizador (abajo)
+//! accent = "#957FB8"        # «#RRGGBB» o nombre: cyan, blanco, gris, ...
+//! spectrum_low = "#8992A7"  # gradiente del visualizador (abajo)
 //!
 //! [keybindings]
 //! quit = "q,esc"            # varias teclas separadas por coma
@@ -184,9 +184,10 @@ pub fn parse(text: &str) -> Config {
 // Theme
 // ---------------------------------------------------------------------------
 
-/// Paleta de la app. Los defaults son la versión pulida (T9) de la paleta
-/// original: mismo sistema (acento cian, cava verde→amarillo→rojo) con
-/// matices más cohesivos y mejor contraste sobre fondo oscuro.
+/// Paleta de la app. El default es la variante **Kanagawa Dragon** de
+/// kanagawa.nvim (T11): tonos oscuros y cálidos, acentos desaturados y
+/// gradiente frío→cálido. Sigue siendo configurable campo a campo desde
+/// `[theme]` del config.toml.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Theme {
     /// Títulos, bordes destacados, selección de cursor, barras activas.
@@ -214,25 +215,29 @@ pub struct Theme {
 impl Default for Theme {
     fn default() -> Self {
         Self {
-            // Cian suave (cyan-400): mismo matiz que el Cyan ANSI original
-            // pero menos chillón y con mejor jerarquía junto al texto.
-            accent: Color::Rgb(0x22, 0xD3, 0xEE),
-            // Blanco ahumado: contraste alto sin el glare del blanco puro.
-            text: Color::Rgb(0xE2, 0xE8, 0xF0),
-            // Gris azulado (slate): cohesiona con el acento frío y respira
-            // menos que el DarkGray neutro.
-            dim: Color::Rgb(0x64, 0x74, 0x8B),
-            // Azul carbón para la selección: destaca sobre el fondo negro
-            // sin competir con el acento.
-            select_bg: Color::Rgb(0x1E, 0x29, 0x3B),
-            error: Color::Rgb(0xF8, 0x71, 0x71),
-            ok: Color::Rgb(0x4A, 0xDE, 0x80),
-            warn: Color::Rgb(0xFA, 0xCC, 0x15),
-            // Esencia cava intacta (verde → amarillo → rojo) con matices
-            // tailwind: misma energía, saturación más pareja entre pasos.
-            spectrum_low: Color::Rgb(0x22, 0xC5, 0x5E),
-            spectrum_mid: Color::Rgb(0xEA, 0xB3, 0x08),
-            spectrum_high: Color::Rgb(0xEF, 0x44, 0x44),
+            // oniViolet (palette kanagawa): violeta con el contraste justo
+            // para bordes y cursor sin el glare de un violeta saturado.
+            accent: Color::Rgb(0x95, 0x7F, 0xB8),
+            // dragonWhite: gris cálido claro, el fg de la variante dragon.
+            text: Color::Rgb(0xC5, 0xC9, 0xC5),
+            // dragonGray3: gris medio-tibio; etiquetas legibles que no
+            // compiten con el texto principal.
+            dim: Color::Rgb(0x7A, 0x83, 0x82),
+            // dragonBlack5: selección visible sobre el fondo casi negro
+            // (dragonBlack3, #181616) sin desentonar con la paleta.
+            select_bg: Color::Rgb(0x39, 0x38, 0x36),
+            // dragonRed: rojo muy desaturado de kanagawa.
+            error: Color::Rgb(0xC4, 0x74, 0x6E),
+            // dragonGreen: verde apagado, «ok» sin semáforo chillón.
+            ok: Color::Rgb(0x87, 0xA9, 0x87),
+            // dragonYellow: amarillo cálido para «pausado».
+            warn: Color::Rgb(0xC4, 0xB2, 0x8A),
+            // Gradiente del visualizador dentro de la paleta Dragon:
+            // violeta (base) → celeste (mitad) → rojo (pico): frío en lo
+            // bajo, cálido solo en los máximos, coherente con el resto.
+            spectrum_low: Color::Rgb(0x89, 0x92, 0xA7),  // dragonViolet
+            spectrum_mid: Color::Rgb(0x7F, 0xB4, 0xCA),  // springBlue
+            spectrum_high: Color::Rgb(0xC4, 0x74, 0x6E), // dragonRed
         }
     }
 }

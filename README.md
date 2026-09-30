@@ -77,18 +77,23 @@ Archivo: `%APPDATA%\mp3tui\config.toml`. La variable de entorno
 `MP3TUI_CONFIG` permite apuntar a otro archivo (útil para instalaciones
 portables y para probar). Sin archivo, todo arranca con los defaults.
 
+El tema por defecto es **Kanagawa Dragon** (la variante `dragon` de
+[kanagawa.nvim](https://github.com/rebelot/kanagawa.nvim)). El ejemplo de
+abajo son justamente esos valores: solo hace falta escribir las claves que
+se quieran cambiar.
+
 ```toml
 [theme]
-accent = "#22D3EE"       # #RRGGBB o nombre (cyan, cian, gris oscuro, ...)
-text = "#E2E8F0"
-dim = "#64748B"
-select_bg = "#1E293B"
-error = "#F87171"
-ok = "#4ADE80"
-warn = "#FACC15"
-spectrum_low = "#22C55E" # gradiente del visualizador
-spectrum_mid = "#EAB308"
-spectrum_high = "#EF4444"
+accent = "#957FB8"       # #RRGGBB o nombre (cyan, cian, gris oscuro, ...)
+text = "#C5C9C5"
+dim = "#7A8382"
+select_bg = "#393836"
+error = "#C4746E"
+ok = "#87A987"
+warn = "#C4B28A"
+spectrum_low = "#8992A7" # gradiente del visualizador (violeta)
+spectrum_mid = "#7FB4CA" # celeste
+spectrum_high = "#C4746E" # rojo (solo en los picos)
 
 [keybindings]
 quit = "q,esc"           # una tecla o lista separada por comas

@@ -384,7 +384,7 @@ volumen, y el explorador de archivos debería ser un panel lateral togglable
 agregan T11-T13 para esto. No se retira ni se marca inválido nada de T1-T10;
 son mejoras sobre trabajo ya aceptado, no correcciones de un defecto.
 
-- [ ] T11 — Rediseño visual completo con la paleta **Kanagawa Dragon**
+- [x] T11 — Rediseño visual completo con la paleta **Kanagawa Dragon**
       (elegida por el usuario): reemplazar el tema por defecto de T9 (cian +
       semáforo verde/amarillo/rojo) por los tonos oscuros y cálidos de Dragon
       (fondo casi negro, acentos violeta/azul/rojo/verde muy desaturados,
@@ -392,13 +392,48 @@ son mejoras sobre trabajo ya aceptado, no correcciones de un defecto.
       footer, gauges) y al gradiente del visualizador. Sigue siendo
       configurable vía `[theme]` de T9 (Dragon pasa a ser el default, no
       reemplaza el mecanismo de config). Ruta: delegada.
-- [ ] T12 — El visualizador debe notarse más: ajustar la ganancia/
+      Implementación: paleta con nombres reales de kanagawa.nvim (oniViolet
+      #957FB8 de acento, dragonWhite #C5C9C5 de texto, dragonGray3 #7A8382
+      dim, dragonBlack5 #393836 selección, dragonRed #C4746E error,
+      dragonGreen #87A987 ok, dragonYellow #C4B28A warn). Gradiente del
+      visualizador dentro de la misma paleta: violeta (dragonViolet
+      #8992A7) → celeste (springBlue #7FB4CA) → rojo (dragonRed) en vez del
+      semáforo verde/amarillo/rojo anterior — frío en la base, cálido solo
+      en los picos. El mecanismo de `[theme]` configurable de T9 no se tocó,
+      solo cambió el default.
+- [x] T12 — El visualizador debe notarse más: ajustar la ganancia/
       normalización de las bandas FFT (src/visualizer/mod.rs) para que
       reaccione visiblemente con audio real a volumen normal, no solo con
       picos extremos. Revisar la constante de normalización actual
       (`norm = FFT_SIZE / 4`, calibrada para un tono puro de escala completa,
       demasiado conservadora para música real con energía repartida en
       muchas bandas) y el rango de attack/decay. Ruta: delegada.
+      Bug real encontrado y corregido en el camino: la normalización usaba
+      el PROMEDIO de magnitud por bin en vez de la suma, así que cada banda
+      se diluía en 1/(cantidad de bins) — las bandas logarítmicamente más
+      anchas (agudos) casi no se movían nunca, independientemente de la
+      ganancia. Cambiado a energía de banda = suma de magnitudes / norm
+      (recupera la amplitud real del seno sin importar el ancho de banda).
+      Sobre eso, nueva curva de compresión `shape(energy) = (energy *
+      GAIN).powf(EXPO).min(1.0)` con GAIN=5.0/EXPO=0.4 (raíz suave): sube la
+      señal típica de música sin mandar los picos fuertes directo al clip.
+      Medido con audio real (90210.mp3, 16 filas de alto): antes 12.5%-62%
+      (promedio ~21%), ahora 19%-81% (promedio ~33%), sin ninguna barra
+      pegada al tope en la muestra — hay margen para que los picos se sigan
+      notando.
+      Evidencia (T11+T12 juntas): `cargo build`/`cargo clippy --all-targets
+      -- -D warnings` en 0/0, `cargo test` 69/69 (2 nuevos: `shape` clipea en
+      escala completa y levanta la energía baja de forma monótona; un seno
+      de prueba llena su propia banda sin iluminar el resto — más los 2
+      tests de hex del gradiente actualizados a los valores Dragon). Harness
+      E2E 15/15 PASS (los asserts de color de D/E se hicieron
+      paleta-agnósticos, comparando índices ANSI relativos en vez de
+      "verde"/"rojo" literal, ya que el mapeo de conhost cambia con la
+      paleta nueva). Orquestador verificó de forma independiente: re-corrida
+      completa de `cargo test` (69/69), lectura línea por línea del diff de
+      `src/visualizer/mod.rs` (el fix de energía de banda y la curva de
+      compresión, con test de un seno real confirmando que solo su banda se
+      ilumina), arranque limpio con audio real sin stderr ni zombie.
 - [ ] T13 — Explorador de archivos como panel lateral togglable con
       Ctrl+Tab (en vez del cambio de pantalla completa actual de T3/T5):
       el reproductor (con visualizador) queda visible de fondo, y Ctrl+Tab

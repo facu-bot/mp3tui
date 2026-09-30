@@ -26,6 +26,14 @@ const ATTACK: f32 = 0.55;
 const DECAY: f32 = 0.16;
 /// Tamaño del staging de lectura (igual al ring del tap: 8192 muestras).
 const TAP_READ_MAX: usize = 1 << 13;
+/// Ganancia previa a la compensación de potencia: la energía real de una
+/// banda de música queda muy por debajo del máximo teórico (un seno a
+/// escala completa), y sin esto las barras casi nunca se movían (T12).
+const GAIN: f32 = 5.0;
+/// Exponente de la compensación (< 1 aplana: sube lo bajo sin mandar lo
+/// alto directo al clip). 0.4 ≈ raíz suave; con GAIN=5 el clip cae en
+/// energy≈0.2 (picos fuertes), y lo típico (0.008–0.05) cae en 28–60%.
+const EXPO: f32 = 0.4;
 
 pub struct SpectrumAnalyzer {
     fft: Arc<dyn Fft<f32>>,
@@ -122,14 +130,18 @@ impl SpectrumAnalyzer {
             self.magnitudes[index] = complex.norm();
         }
 
-        // Un seno puro de amplitud A produce |X| = A * N/2 * media(Hann) = A * N/4.
+        // Un seno puro de amplitud A concentra |X| = A * N/2 * media(Hann)
+        // = A * N/4 en un bin. La SUMA de la banda sobre ese factor devuelve
+        // A sin importar cuántos bins tenga la banda; con la media anterior,
+        // cada banda se diluía en 1/k y las bandas anchas (agudos) quedaban
+        // casi muertas — el problema de «las barras se ven chicas» (T12).
         let norm = FFT_SIZE as f32 / 4.0;
         for (band, &(low, high)) in self.band_ranges.iter().enumerate() {
             let low = low.min(n_bins - 1);
             let high = high.max(low + 1).min(n_bins);
             let slice = &self.magnitudes[low..high];
-            let mean = slice.iter().sum::<f32>() / slice.len() as f32;
-            let target = (mean / norm).min(1.0);
+            let energy = slice.iter().sum::<f32>() / norm;
+            let target = shape(energy);
 
             let current = self.bands[band];
             self.bands[band] = if target > current {
@@ -189,6 +201,15 @@ impl Default for SpectrumAnalyzer {
     }
 }
 
+/// Energía de banda → altura 0..=1: ganancia fija + compresión de potencia,
+/// con clip en 1.0. Objetivo de T12: con música real a volumen normal las
+/// barras usan un rango amplio de la altura disponible y los picos siguen
+/// notándose (llegan al tope, no todo el tiempo).
+fn shape(energy: f32) -> f32 {
+    (energy * GAIN).powf(EXPO).min(1.0)
+}
+
+
 
 #[cfg(test)]
 mod tests {
@@ -226,5 +247,64 @@ mod tests {
         analyzer.analyze();
         let after = analyzer.bands()[0];
         assert!(after > 0.0 && after < 0.8, "debe decaer lentamente, obtenido {after}");
+    }
+
+    #[test]
+    fn shape_clips_full_scale_and_lifts_quiet_energy() {
+        assert_eq!(shape(0.0), 0.0, "silencio = barra en cero");
+        assert!(
+            (shape(1.0) - 1.0).abs() < 1e-6,
+            "un seno a escala completa llega al tope"
+        );
+
+        // El objetivo de T12: música real (energías bajas) se ve.
+        let quiet = shape(0.05);
+        assert!(quiet >= 0.3, "señal débil visible, obtenido {quiet}");
+
+        // Sin clipear en seguida: todavía hay margen sobre música típica.
+        let typical = shape(0.1);
+        assert!(typical > quiet && typical < 1.0, "obtenido {typical}");
+
+        // Monótono creciente en todo el rango.
+        let mut previous = 0.0;
+        for step in 0..=40 {
+            let value = shape(step as f32 * 0.05);
+            assert!(value >= previous, "no monótono en {step}");
+            previous = value;
+        }
+    }
+
+    #[test]
+    fn sine_full_scale_fills_its_band_but_not_the_rest() {
+        let mut analyzer = SpectrumAnalyzer::new();
+        analyzer.sample_rate = 44_100;
+        analyzer.band_ranges = SpectrumAnalyzer::compute_ranges(44_100);
+        for i in 0..FFT_SIZE {
+            let t = i as f32 / 44_100.0;
+            analyzer.ring[i] = (std::f32::consts::TAU * 1_000.0 * t).sin();
+        }
+        analyzer.filled = FFT_SIZE;
+
+        // Varias corridas: el attack (0.55) converge al objetivo en ~4 frames.
+        for _ in 0..6 {
+            analyzer.pending = 1;
+            analyzer.analyze();
+        }
+
+        let max = analyzer.bands.iter().cloned().fold(0.0_f32, f32::max);
+        assert!(max >= 0.9, "la banda del seno llena la altura: {max}");
+
+        // Las bandas lejanas de 1 kHz solo ven fuga de la ventana Hann.
+        let elsewhere: f32 = analyzer
+            .bands
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !(*index >= 16 && *index <= 20))
+            .map(|(_, value)| *value)
+            .sum();
+        assert!(
+            elsewhere < 1.0,
+            "el resto no se ilumina con el seno: {elsewhere}"
+        );
     }
 }

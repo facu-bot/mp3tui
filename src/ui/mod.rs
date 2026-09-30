@@ -1323,23 +1323,23 @@ mod tests {
         let theme = Theme::default();
         assert_eq!(
             spectrum_color(0.0, &theme),
-            (0x22, 0xC5, 0x5E),
+            (0x89, 0x92, 0xA7),
             "base del gradiente = spectrum_low"
         );
         assert_eq!(
             spectrum_color(0.5, &theme),
-            (0xEA, 0xB3, 0x08),
+            (0x7F, 0xB4, 0xCA),
             "mitad = spectrum_mid"
         );
         assert_eq!(
             spectrum_color(1.0, &theme),
-            (0xEF, 0x44, 0x44),
+            (0xC4, 0x74, 0x6E),
             "pico = spectrum_high"
         );
     }
 
     #[test]
-    fn paint_bands_full_bar_is_green_at_bottom_and_red_at_top() {
+    fn paint_bands_full_bar_is_violet_at_bottom_and_red_at_top() {
         let theme = Theme::default();
         let area = Rect::new(0, 0, 8, 10);
         let mut buffer = Buffer::empty(area);
@@ -1349,11 +1349,15 @@ mod tests {
 
         let bottom = &buffer[(0u16, 9u16)];
         assert_eq!(bottom.symbol(), "\u{2588}");
-        assert_eq!(bottom.fg, Color::Rgb(0x22, 0xC5, 0x5E), "verde de la base");
+        assert_eq!(
+            bottom.fg,
+            Color::Rgb(0x89, 0x92, 0xA7),
+            "violeta de la base"
+        );
 
         let top = &buffer[(0u16, 0u16)];
         assert_eq!(top.symbol(), "\u{2588}");
-        assert_eq!(top.fg, Color::Rgb(0xEF, 0x44, 0x44), "rojo del pico");
+        assert_eq!(top.fg, Color::Rgb(0xC4, 0x74, 0x6E), "rojo del pico");
 
         let mid = &buffer[(0u16, 5u16)];
         assert_eq!(mid.symbol(), "\u{2588}");
