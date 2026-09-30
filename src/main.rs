@@ -1,4 +1,5 @@
 mod audio;
+mod config;
 mod playback;
 mod playlist;
 mod ui;
@@ -19,6 +20,13 @@ struct Cli {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+
+    // Config (T9): se carga una vez acá para que los avisos salgan a stderr
+    // antes de que la TUI tome la pantalla; cada campo inválido cayó a su
+    // default en config::parse.
+    for warning in &config::init().warnings {
+        eprintln!("mp3tui: config: {warning}");
+    }
 
     // Sin path: explorador en el directorio actual.
     // Con carpeta: explorador en esa carpeta.

@@ -283,10 +283,41 @@ Engram esté disponible.
       vez" (`consent: declined`) — sin registro de revisión nativa para este
       commit. Cobertura de calidad ya obtenida vía build/clippy/test + harness
       E2E + fork de concurrencia (arriba), sin findings.
-- [ ] T9 — Config y temas vía TOML (colores del visualizador, keybindings, incluyendo
+- [x] T9 — Config y temas vía TOML (colores del visualizador, keybindings, incluyendo
       los nuevos de T7/T8). Reforzado por pedido del usuario: el tema por defecto
       debe verse pulido y atractivo (paleta coherente, no colores por defecto sin
       cuidar), no solo ser funcional. Ruta: delegada.
+      Implementación: nuevo módulo `src/config.rs` (~684 líneas). TOML en
+      `%APPDATA%\mp3tui\config.toml` (override vía `MP3TUI_CONFIG`), secciones
+      `[theme]` (acento, gradiente del visualizador, selección) y `[keybindings]`
+      (todos los atajos existentes, remapeables, colores/teclas aceptados en
+      inglés y español). Merge campo por campo: un campo inválido cae a su
+      default individual con warning (stderr + primera pantalla), sin tirar el
+      resto del archivo ni crashear. Sin archivo de config, arranca igual que
+      antes. `ui/mod.rs` se refactorizó para leer atajos y colores desde
+      `config` en vez de tener todo hardcodeado; el pie de atajos se genera a
+      partir del binding real, no de un texto fijo.
+      Hallazgo real detectado en revisión de código (fork) antes de comitear:
+      `parse_keybindings` validaba cada campo individualmente pero nunca
+      chequeaba si dos ACCIONES distintas quedaban mapeadas a la misma tecla
+      (ej. el usuario pone `quit = "q"` y `play_pause = "q"`: ambos parsean
+      bien, pero en el dispatch por orden fijo `quit` se evalúa primero y
+      `play_pause` queda silenciosamente sin efecto, sin ningún aviso).
+      **Corregido**: se agregó detección de colisiones que solo avisa cuando
+      la colisión la causa la config del usuario (no las colisiones de diseño
+      que ya existen en los defaults, como Esc sirviendo para "volver" y
+      "salir" a la vez, o Tab para biblioteca/volver — evita falsos positivos
+      en la config por defecto). La acción perdedora (por orden de prioridad
+      del dispatch) recupera sus teclas por defecto si están libres, o queda
+      sin bindear si no, con un warning explícito indicando quién ganó y
+      quién perdió.
+      Evidencia: `cargo build`/`cargo clippy --all-targets` en 0/0, `cargo
+      test` 66/66 (63 + 3 nuevos de colisión: con recuperación de default, sin
+      default libre, y colisiones heredadas sin warning). Harness E2E 14/14
+      PASS (nuevo escenario M: config válido remapea play_pause a 'x' y
+      funciona; N: TOML roto muestra warning sin crashear). Orquestador
+      verificó de forma independiente: binario recompilado, arranque limpio
+      sin archivo de config (default) sin stderr ni zombie.
 - [ ] T10 — Pulido: manejo de errores (archivos corruptos/formatos no soportados),
       README con instrucciones de build/run. Ruta: delegada.
 

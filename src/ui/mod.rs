@@ -17,6 +17,7 @@ use ratatui::widgets::{Block, Gauge, Paragraph};
 use ratatui::Frame;
 
 use crate::audio::{AudioEngine, SPEED_STEP};
+use crate::config::{self, key_labels, Theme};
 use crate::playback::{filter_tracks, next_track, seek_target, shuffle_order, RepeatMode};
 use crate::playlist::{move_selection, scroll_offset, Playlist, Track};
 use crate::visualizer::{SpectrumAnalyzer, NUM_BANDS};
@@ -25,13 +26,12 @@ const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const VOLUME_STEP: f32 = 0.05;
 const PAGE_STEP: isize = 10;
 
-// Paleta compartida por todo el programa: un acento (cian) para títulos y
-// selección, texto claro para valores, apagado para etiquetas. Los colores de
-// estado (verde/amarillo/rojo) solo se usan donde expresan estado.
-const ACCENT: Color = Color::Cyan;
-const TEXT: Color = Color::White;
-const DIM: Color = Color::DarkGray;
-const SELECT_BG: Color = Color::Rgb(13, 27, 42);
+// Paleta compartida por todo el programa (T9): viene de la config, con
+// defaults pulidos en `config::Theme::default()`. Se lee en cada estilizado
+// (es un par de loads atómicos por frame, nada relevante).
+fn theme() -> &'static Theme {
+    &config::config().theme
+}
 
 const CURSOR: &str = "\u{258c}"; // ▌ fila seleccionada
 const PLAYING: &str = "\u{25b6}"; // ▶ pista en reproducción
@@ -159,7 +159,10 @@ pub fn run(engine: &mut AudioEngine, start: StartMode) -> io::Result<()> {
         has_player,
         track_label,
         status: status_of(engine),
-        error: None,
+        // Avisos de la config (T9): en la primera pantalla, además del
+        // stderr que ya imprimió main. Con config limpia queda `None`.
+        error: (!config::config().warnings.is_empty())
+            .then(|| config::config().warnings.join(" · ")),
         should_quit: false,
         analyzer: SpectrumAnalyzer::new(),
     };
@@ -253,60 +256,88 @@ fn handle_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine) {
 }
 
 fn handle_player_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine) {
-    match key.code {
-        KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => app.should_quit = true,
-        KeyCode::Char(' ') => toggle_play(app, engine),
-        KeyCode::Up => engine.set_volume((engine.volume() + VOLUME_STEP).clamp(0.0, 1.0)),
-        KeyCode::Down => engine.set_volume((engine.volume() - VOLUME_STEP).clamp(0.0, 1.0)),
-        KeyCode::Left => seek_by(app, engine, -1),
-        KeyCode::Right => seek_by(app, engine, 1),
-        KeyCode::Char('[') => step_speed(app, engine, -1.0),
-        KeyCode::Char(']') => step_speed(app, engine, 1.0),
-        KeyCode::Char('b') | KeyCode::Char('B') | KeyCode::Tab => enter_browser(app),
-        KeyCode::Char('n') | KeyCode::Char('N') => play_step(app, engine, 1),
-        KeyCode::Char('p') | KeyCode::Char('P') => play_step(app, engine, -1),
-        KeyCode::Char('s') | KeyCode::Char('S') => toggle_shuffle(app),
-        KeyCode::Char('r') | KeyCode::Char('R') => app.repeat = app.repeat.cycle(),
-        KeyCode::Char('/') => {
-            enter_browser(app);
-            open_search(app);
-        }
-        _ => {}
+    let keys = &config::config().keys;
+    let code = key.code;
+    if config::pressed(&keys.quit, code) {
+        app.should_quit = true;
+    } else if config::pressed(&keys.play_pause, code) {
+        toggle_play(app, engine);
+    } else if config::pressed(&keys.volume_up, code) {
+        engine.set_volume((engine.volume() + VOLUME_STEP).clamp(0.0, 1.0));
+    } else if config::pressed(&keys.volume_down, code) {
+        engine.set_volume((engine.volume() - VOLUME_STEP).clamp(0.0, 1.0));
+    } else if config::pressed(&keys.seek_back, code) {
+        seek_by(app, engine, -1);
+    } else if config::pressed(&keys.seek_fwd, code) {
+        seek_by(app, engine, 1);
+    } else if config::pressed(&keys.speed_down, code) {
+        step_speed(app, engine, -1.0);
+    } else if config::pressed(&keys.speed_up, code) {
+        step_speed(app, engine, 1.0);
+    } else if config::pressed(&keys.explorer, code) {
+        enter_browser(app);
+    } else if config::pressed(&keys.next_track, code) {
+        play_step(app, engine, 1);
+    } else if config::pressed(&keys.prev_track, code) {
+        play_step(app, engine, -1);
+    } else if config::pressed(&keys.shuffle, code) {
+        toggle_shuffle(app);
+    } else if config::pressed(&keys.repeat, code) {
+        app.repeat = app.repeat.cycle();
+    } else if config::pressed(&keys.search, code) {
+        enter_browser(app);
+        open_search(app);
     }
 }
 
 fn handle_browser_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine) {
+    let keys = &config::config().keys;
     let view_len = app.view.len();
-    match key.code {
-        KeyCode::Char('q') | KeyCode::Char('Q') => app.should_quit = true,
-        KeyCode::Esc | KeyCode::Tab => {
-            if app.has_player {
-                app.mode = Mode::Player;
-            } else {
-                app.should_quit = true;
-            }
+    let code = key.code;
+    // El orden importa: «back» antes que «quit» — Esc/Tab vuelven al player
+    // aunque Esc también esté en «quit» (para salir desde el modo player).
+    if config::pressed(&keys.back, code) {
+        if app.has_player {
+            app.mode = Mode::Player;
+        } else {
+            app.should_quit = true;
         }
-        KeyCode::Char('b') | KeyCode::Char('B') => {
-            // 'b' = biblioteca: ya estamos en la biblioteca.
-        }
-        KeyCode::Enter => play_selected(app, engine),
-        KeyCode::Char(' ') => toggle_play(app, engine),
-        KeyCode::Char('n') | KeyCode::Char('N') => play_step(app, engine, 1),
-        KeyCode::Char('p') | KeyCode::Char('P') => play_step(app, engine, -1),
-        KeyCode::Char('s') | KeyCode::Char('S') => toggle_shuffle(app),
-        KeyCode::Char('r') | KeyCode::Char('R') => app.repeat = app.repeat.cycle(),
-        KeyCode::Char('/') => open_search(app),
-        KeyCode::Up => app.selected = move_selection(app.selected, -1, view_len),
-        KeyCode::Down => app.selected = move_selection(app.selected, 1, view_len),
-        KeyCode::Left => seek_by(app, engine, -1),
-        KeyCode::Right => seek_by(app, engine, 1),
-        KeyCode::Char('[') => step_speed(app, engine, -1.0),
-        KeyCode::Char(']') => step_speed(app, engine, 1.0),
-        KeyCode::PageUp => app.selected = move_selection(app.selected, -PAGE_STEP, view_len),
-        KeyCode::PageDown => app.selected = move_selection(app.selected, PAGE_STEP, view_len),
-        KeyCode::Home => app.selected = move_selection(app.selected, isize::MIN, view_len),
-        KeyCode::End => app.selected = move_selection(app.selected, isize::MAX, view_len),
-        _ => {}
+    } else if config::pressed(&keys.quit, code) {
+        app.should_quit = true;
+    } else if config::pressed(&keys.select, code) {
+        play_selected(app, engine);
+    } else if config::pressed(&keys.play_pause, code) {
+        toggle_play(app, engine);
+    } else if config::pressed(&keys.next_track, code) {
+        play_step(app, engine, 1);
+    } else if config::pressed(&keys.prev_track, code) {
+        play_step(app, engine, -1);
+    } else if config::pressed(&keys.shuffle, code) {
+        toggle_shuffle(app);
+    } else if config::pressed(&keys.repeat, code) {
+        app.repeat = app.repeat.cycle();
+    } else if config::pressed(&keys.search, code) {
+        open_search(app);
+    } else if config::pressed(&keys.move_up, code) {
+        app.selected = move_selection(app.selected, -1, view_len);
+    } else if config::pressed(&keys.move_down, code) {
+        app.selected = move_selection(app.selected, 1, view_len);
+    } else if config::pressed(&keys.seek_back, code) {
+        seek_by(app, engine, -1);
+    } else if config::pressed(&keys.seek_fwd, code) {
+        seek_by(app, engine, 1);
+    } else if config::pressed(&keys.speed_down, code) {
+        step_speed(app, engine, -1.0);
+    } else if config::pressed(&keys.speed_up, code) {
+        step_speed(app, engine, 1.0);
+    } else if config::pressed(&keys.page_up, code) {
+        app.selected = move_selection(app.selected, -PAGE_STEP, view_len);
+    } else if config::pressed(&keys.page_down, code) {
+        app.selected = move_selection(app.selected, PAGE_STEP, view_len);
+    } else if config::pressed(&keys.home, code) {
+        app.selected = move_selection(app.selected, isize::MIN, view_len);
+    } else if config::pressed(&keys.end, code) {
+        app.selected = move_selection(app.selected, isize::MAX, view_len);
     }
 }
 
@@ -605,29 +636,29 @@ fn render(frame: &mut Frame<'_>, app: &App, engine: &AudioEngine) {
 /// Bloque con borde apagado y título acentuado: el patrón de todo el programa.
 fn themed_block<'a>(title: Span<'a>) -> Block<'a> {
     Block::bordered()
-        .border_style(Style::default().fg(DIM))
+        .border_style(Style::default().fg(theme().dim))
         .title(title)
 }
 
 fn accent_title(text: &str) -> Span<'static> {
     Span::styled(
         format!(" {text} "),
-        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        Style::default().fg(theme().accent).add_modifier(Modifier::BOLD),
     )
 }
 
 fn status_parts(status: Status) -> (&'static str, Color) {
     match status {
-        Status::Playing => ("Reproduciendo", Color::Green),
-        Status::Paused => ("Pausado", Color::Yellow),
-        Status::Ended => ("Fin de la pista", Color::DarkGray),
+        Status::Playing => ("Reproduciendo", theme().ok),
+        Status::Paused => ("Pausado", theme().warn),
+        Status::Ended => ("Fin de la pista", theme().dim),
     }
 }
 
 fn status_line(status: Status, repeat: RepeatMode, shuffle: bool) -> Line<'static> {
     let (text, color) = status_parts(status);
     let mut spans = vec![
-        Span::styled("Estado:  ", Style::default().fg(DIM)),
+        Span::styled("Estado:  ", Style::default().fg(theme().dim)),
         Span::styled(
             text,
             Style::default().fg(color).add_modifier(Modifier::BOLD),
@@ -642,17 +673,17 @@ fn status_line(status: Status, repeat: RepeatMode, shuffle: bool) -> Line<'stati
 fn repeat_shuffle_spans(repeat: RepeatMode, shuffle: bool) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     if let Some(label) = repeat.label() {
-        spans.push(Span::styled("  ·  ", Style::default().fg(DIM)));
+        spans.push(Span::styled("  ·  ", Style::default().fg(theme().dim)));
         spans.push(Span::styled(
             format!("repeat: {label}"),
-            Style::default().fg(ACCENT),
+            Style::default().fg(theme().accent),
         ));
     }
     if shuffle {
-        spans.push(Span::styled("  ·  ", Style::default().fg(DIM)));
+        spans.push(Span::styled("  ·  ", Style::default().fg(theme().dim)));
         spans.push(Span::styled(
             "shuffle: sí",
-            Style::default().fg(ACCENT),
+            Style::default().fg(theme().accent),
         ));
     }
     spans
@@ -662,7 +693,7 @@ fn error_line(app: &App) -> Line<'static> {
     match &app.error {
         Some(err) => Line::from(Span::styled(
             format!("Error:  {err}"),
-            Style::default().fg(Color::Red),
+            Style::default().fg(theme().error),
         )),
         None => Line::raw(""),
     }
@@ -706,8 +737,8 @@ fn render_player_info(frame: &mut Frame<'_>, area: Rect, app: &App, engine: &Aud
         .split(inner);
 
     let file_line = Line::from(vec![
-        Span::styled("Archivo: ", Style::default().fg(DIM)),
-        Span::styled(app.track_label.as_str(), Style::default().fg(TEXT)),
+        Span::styled("Archivo: ", Style::default().fg(theme().dim)),
+        Span::styled(app.track_label.as_str(), Style::default().fg(theme().text)),
     ]);
 
     frame.render_widget(
@@ -729,7 +760,7 @@ fn render_player_info(frame: &mut Frame<'_>, area: Rect, app: &App, engine: &Aud
     let percent = (volume * 100.0).round() as u16;
     frame.render_widget(
         Gauge::default()
-            .gauge_style(Style::default().fg(ACCENT))
+            .gauge_style(Style::default().fg(theme().accent))
             .ratio(f64::from(volume))
             .label(format!("Volumen {percent}%")),
         rows[row],
@@ -741,8 +772,8 @@ fn render_player_info(frame: &mut Frame<'_>, area: Rect, app: &App, engine: &Aud
 /// Fila "Velocidad: 1.25x" del panel de info (solo se renderiza si != 1.0x).
 fn speed_line(engine: &AudioEngine) -> Line<'static> {
     Line::from(vec![
-        Span::styled("Velocidad: ", Style::default().fg(DIM)),
-        Span::styled(speed_label(engine.speed()), Style::default().fg(ACCENT)),
+        Span::styled("Velocidad: ", Style::default().fg(theme().dim)),
+        Span::styled(speed_label(engine.speed()), Style::default().fg(theme().accent)),
     ])
 }
 
@@ -769,10 +800,10 @@ fn progress_gauge(app: &App, engine: &AudioEngine) -> Gauge<'static> {
     match duration.filter(|total| !total.is_zero()) {
         Some(total) => {
             let ratio = position.as_secs_f64() / total.as_secs_f64();
-            gauge = gauge.gauge_style(Style::default().fg(ACCENT)).ratio(ratio.clamp(0.0, 1.0));
+            gauge = gauge.gauge_style(Style::default().fg(theme().accent)).ratio(ratio.clamp(0.0, 1.0));
         }
         None => {
-            gauge = gauge.gauge_style(Style::default().fg(DIM)).ratio(0.0);
+            gauge = gauge.gauge_style(Style::default().fg(theme().dim)).ratio(0.0);
         }
     }
     gauge
@@ -825,14 +856,14 @@ fn render_browser_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let now_line = match &now_playing {
         Some(name) => Line::from(vec![
-            Span::styled("Sonando: ", Style::default().fg(DIM)),
-            Span::styled(PLAYING, Style::default().fg(Color::Green)),
+            Span::styled("Sonando: ", Style::default().fg(theme().dim)),
+            Span::styled(PLAYING, Style::default().fg(theme().ok)),
             Span::raw(" "),
-            Span::styled(name, Style::default().fg(TEXT)),
+            Span::styled(name, Style::default().fg(theme().text)),
         ]),
         None => Line::from(vec![
-            Span::styled("Sonando: ", Style::default().fg(DIM)),
-            Span::styled("—", Style::default().fg(DIM)),
+            Span::styled("Sonando: ", Style::default().fg(theme().dim)),
+            Span::styled("—", Style::default().fg(theme().dim)),
         ]),
     };
 
@@ -840,8 +871,8 @@ fn render_browser_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
         status_line(app.status, app.repeat, app.shuffle)
     } else {
         let mut spans = vec![
-            Span::styled("Estado:  ", Style::default().fg(DIM)),
-            Span::styled("Explorando", Style::default().fg(DIM)),
+            Span::styled("Estado:  ", Style::default().fg(theme().dim)),
+            Span::styled("Explorando", Style::default().fg(theme().dim)),
         ];
         spans.extend(repeat_shuffle_spans(app.repeat, app.shuffle));
         Line::from(spans)
@@ -854,7 +885,7 @@ fn render_library(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let folder = folder_label(&app.root);
     let block = themed_block(Span::styled(
         library_title(app, &folder),
-        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        Style::default().fg(theme().accent).add_modifier(Modifier::BOLD),
     ));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -864,7 +895,7 @@ fn render_library(frame: &mut Frame<'_>, area: Rect, app: &App) {
         frame.render_widget(
             Paragraph::new(Line::styled(
                 " Escaneando biblioteca… ",
-                Style::default().fg(ACCENT),
+                Style::default().fg(theme().accent),
             ))
             .alignment(Alignment::Center),
             inner,
@@ -876,12 +907,12 @@ fn render_library(frame: &mut Frame<'_>, area: Rect, app: &App) {
         let (message, style) = if library.is_empty() {
             (
                 " Sin archivos de audio (mp3, flac, ogg, wav) en esta carpeta ",
-                Style::default().fg(DIM),
+                Style::default().fg(theme().dim),
             )
         } else {
             (
                 " Sin coincidencias para la búsqueda ",
-                Style::default().fg(ACCENT),
+                Style::default().fg(theme().accent),
             )
         };
         frame.render_widget(Paragraph::new(Line::styled(message, style)), inner);
@@ -990,19 +1021,19 @@ fn row_line(
     mid.push_str(&" ".repeat(budget.saturating_sub(mid.chars().count())));
 
     let (cursor_style, marker_style, title_style, duration_style) = if selected {
-        let bg = SELECT_BG;
+        let bg = theme().select_bg;
         (
-            Style::default().bg(bg).fg(ACCENT).add_modifier(Modifier::BOLD),
-            Style::default().bg(bg).fg(Color::Green),
-            Style::default().bg(bg).fg(TEXT).add_modifier(Modifier::BOLD),
-            Style::default().bg(bg).fg(DIM),
+            Style::default().bg(bg).fg(theme().accent).add_modifier(Modifier::BOLD),
+            Style::default().bg(bg).fg(theme().ok),
+            Style::default().bg(bg).fg(theme().text).add_modifier(Modifier::BOLD),
+            Style::default().bg(bg).fg(theme().dim),
         )
     } else {
         (
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-            Style::default().fg(Color::Green),
-            Style::default().fg(TEXT),
-            Style::default().fg(DIM),
+            Style::default().fg(theme().accent).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme().ok),
+            Style::default().fg(theme().text),
+            Style::default().fg(theme().dim),
         )
     };
 
@@ -1042,12 +1073,17 @@ fn render_visualizer(frame: &mut Frame<'_>, area: Rect, bands: &[f32; NUM_BANDS]
     let block = themed_block(accent_title("Visualizador"));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    paint_bands(frame.buffer_mut(), inner, bands);
+    paint_bands(frame.buffer_mut(), inner, bands, theme());
 }
 
 /// Pinta las 32 barras dentro del área interior del bloque, sin widgets:
 /// cada celda recibe el simbolo y el color de su altura en el gradiente.
-fn paint_bands(buffer: &mut ratatui::buffer::Buffer, inner: Rect, bands: &[f32; NUM_BANDS]) {
+fn paint_bands(
+    buffer: &mut ratatui::buffer::Buffer,
+    inner: Rect,
+    bands: &[f32; NUM_BANDS],
+    theme: &Theme,
+) {
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -1074,7 +1110,7 @@ fn paint_bands(buffer: &mut ratatui::buffer::Buffer, inner: Rect, bands: &[f32; 
                 } else {
                     1.0
                 };
-                let (red, green, blue) = spectrum_color(t);
+                let (red, green, blue) = spectrum_color(t, theme);
                 ('█', Color::Rgb(red, green, blue))
             } else {
                 (' ', Color::Reset)
@@ -1088,20 +1124,36 @@ fn paint_bands(buffer: &mut ratatui::buffer::Buffer, inner: Rect, bands: &[f32; 
     }
 }
 
-/// Verde (abajo) → amarillo (medio) → rojo (arriba), estilo cava.
-fn spectrum_color(t: f32) -> (u8, u8, u8) {
+/// Verde (abajo) → amarillo (medio) → rojo (arriba), estilo cava: interpola
+/// linealmente entre los tres colores del tema.
+fn spectrum_color(t: f32, theme: &Theme) -> (u8, u8, u8) {
+    fn channel(from: u8, to: u8, u: f32) -> u8 {
+        (f64::from(from) + (f64::from(to) - f64::from(from)) * f64::from(u)).round() as u8
+    }
+
+    fn mix(from: Color, to: Color, u: f32) -> (u8, u8, u8) {
+        let (Color::Rgb(r0, g0, b0), Color::Rgb(r1, g1, b1)) = (from, to) else {
+            return (0, 0, 0);
+        };
+        (
+            channel(r0, r1, u),
+            channel(g0, g1, u),
+            channel(b0, b1, u),
+        )
+    }
+
     let t = t.clamp(0.0, 1.0);
     if t < 0.5 {
-        let u = t * 2.0;
-        ((u * 255.0) as u8, 255, 0)
+        mix(theme.spectrum_low, theme.spectrum_mid, t * 2.0)
     } else {
-        let u = (t - 0.5) * 2.0;
-        (255, ((1.0 - u) * 255.0) as u8, 0)
+        mix(theme.spectrum_mid, theme.spectrum_high, (t - 0.5) * 2.0)
     }
 }
 
 /// El pie de atajos creció a dos líneas (T6): shuffle/repeat/n-p/buscar no
 /// entraban en una. Con la búsqueda abierta muestra su propio contexto.
+/// Pie de atajos: se arma desde la config para que muestre siempre las
+/// teclas reales aunque el usuario las remapee.
 fn footer_lines(app: &App) -> Vec<Line<'static>> {
     if app.search.is_some() {
         return vec![
@@ -1111,23 +1163,60 @@ fn footer_lines(app: &App) -> Vec<Line<'static>> {
             ),
         ];
     }
+
+    let keys = &config::config().keys;
     match app.mode {
         Mode::Player => vec![
-            Line::from(
-                " espacio: play/pausa   ↑↓: volumen   ←/→: ±5s   n/p: pista sig/ant   /: buscar",
-            ),
-            Line::from(
-                " s: shuffle   r: repeat   [ ]: vel   b/Tab: biblioteca   q/Esc: salir ",
-            ),
+            Line::from(format!(
+                " {}: pausa   {}/{}: volumen   {}/{}: ±5s   \
+                 {}/{}: pista sig/ant   {}: buscar",
+                key_labels(&keys.play_pause),
+                key_labels(&keys.volume_up),
+                key_labels(&keys.volume_down),
+                key_labels(&keys.seek_back),
+                key_labels(&keys.seek_fwd),
+                key_labels(&keys.next_track),
+                key_labels(&keys.prev_track),
+                key_labels(&keys.search),
+            )),
+            Line::from(format!(
+                " {}: shuffle   {}: repeat   {}/{}: vel   {}: biblioteca   {}: salir",
+                key_labels(&keys.shuffle),
+                key_labels(&keys.repeat),
+                key_labels(&keys.speed_down),
+                key_labels(&keys.speed_up),
+                key_labels(&keys.explorer),
+                key_labels(&keys.quit),
+            )),
         ],
         Mode::Browser => vec![
-            Line::from(
-                " ↑/↓ PgUp/PgDn: mover   Enter: reproducir   n/p: pista sig/ant   /: buscar ",
-            ),
-            Line::from(
-                " espacio: pausa   ←/→: ±5s   [ ]: vel   s: shuffle   r: repeat ",
-            ),
-            Line::from(" Esc/Tab: volver   q/Esc: salir "),
+            Line::from(format!(
+                " {}/{} {}/{}: mover   {}: reproducir   {}/{}: pista sig/ant   \
+                 {}: buscar",
+                key_labels(&keys.move_up),
+                key_labels(&keys.move_down),
+                key_labels(&keys.page_up),
+                key_labels(&keys.page_down),
+                key_labels(&keys.select),
+                key_labels(&keys.next_track),
+                key_labels(&keys.prev_track),
+                key_labels(&keys.search),
+            )),
+            Line::from(format!(
+                " {}: pausa   {}/{}: ±5s   {}/{}: vel   {}: shuffle   {}: repeat",
+                key_labels(&keys.play_pause),
+                key_labels(&keys.seek_back),
+                key_labels(&keys.seek_fwd),
+                key_labels(&keys.speed_down),
+                key_labels(&keys.speed_up),
+                key_labels(&keys.shuffle),
+                key_labels(&keys.repeat),
+            )),
+            Line::from(format!(
+                " {}: volver   {}: salir",
+                key_labels(&keys.back),
+                key_labels(&keys.quit),
+            )),
         ],
     }
 }
@@ -1137,10 +1226,10 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Paragraph::new(footer_lines(app))
             .block(
                 Block::bordered()
-                    .border_style(Style::default().fg(DIM))
+                    .border_style(Style::default().fg(theme().dim))
                     .title(accent_title("Atajos")),
             )
-            .style(Style::default().fg(DIM))
+            .style(Style::default().fg(theme().dim))
             .alignment(Alignment::Center),
         area,
     );
@@ -1209,44 +1298,53 @@ mod tests {
 
     #[test]
     fn spectrum_color_extremes() {
-        assert_eq!(spectrum_color(0.0), (0, 255, 0));
-        assert_eq!(spectrum_color(0.5), (255, 255, 0));
-        assert_eq!(spectrum_color(1.0), (255, 0, 0));
+        let theme = Theme::default();
+        assert_eq!(
+            spectrum_color(0.0, &theme),
+            (0x22, 0xC5, 0x5E),
+            "base del gradiente = spectrum_low"
+        );
+        assert_eq!(
+            spectrum_color(0.5, &theme),
+            (0xEA, 0xB3, 0x08),
+            "mitad = spectrum_mid"
+        );
+        assert_eq!(
+            spectrum_color(1.0, &theme),
+            (0xEF, 0x44, 0x44),
+            "pico = spectrum_high"
+        );
     }
 
     #[test]
     fn paint_bands_full_bar_is_green_at_bottom_and_red_at_top() {
+        let theme = Theme::default();
         let area = Rect::new(0, 0, 8, 10);
         let mut buffer = Buffer::empty(area);
         let mut bands = [0.0f32; NUM_BANDS];
         bands[0] = 1.0;
-        paint_bands(&mut buffer, area, &bands);
+        paint_bands(&mut buffer, area, &bands, &theme);
 
         let bottom = &buffer[(0u16, 9u16)];
         assert_eq!(bottom.symbol(), "\u{2588}");
-        assert_eq!(bottom.fg, Color::Rgb(0, 255, 0));
+        assert_eq!(bottom.fg, Color::Rgb(0x22, 0xC5, 0x5E), "verde de la base");
 
         let top = &buffer[(0u16, 0u16)];
         assert_eq!(top.symbol(), "\u{2588}");
-        assert_eq!(top.fg, Color::Rgb(255, 0, 0));
+        assert_eq!(top.fg, Color::Rgb(0xEF, 0x44, 0x44), "rojo del pico");
 
         let mid = &buffer[(0u16, 5u16)];
         assert_eq!(mid.symbol(), "\u{2588}");
-        match mid.fg {
-            Color::Rgb(red, green, blue) => {
-                assert_eq!(green, 255);
-                assert_eq!(blue, 0);
-                assert!(red >= 100, "a mitad de altura debe ir hacia amarillo, red={red}");
-            }
-            other => panic!("esperaba Rgb, obtenido {other:?}"),
-        }
+        // La barra mapea t = (alto - 1 - y) / (alto - 1); fila 5 de 10 → 4/9.
+        let expected = spectrum_color(4.0 / 9.0, &theme);
+        assert_eq!(mid.fg, Color::Rgb(expected.0, expected.1, expected.2));
     }
 
     #[test]
     fn paint_bands_zero_leaves_empty_reset_cells() {
         let area = Rect::new(0, 0, 8, 10);
         let mut buffer = Buffer::empty(area);
-        paint_bands(&mut buffer, area, &[0.0f32; NUM_BANDS]);
+        paint_bands(&mut buffer, area, &[0.0f32; NUM_BANDS], &Theme::default());
 
         let cell = &buffer[(0u16, 9u16)];
         assert_eq!(cell.symbol(), " ");
@@ -1259,7 +1357,7 @@ mod tests {
         let mut buffer = Buffer::empty(area);
         let mut bands = [0.0f32; NUM_BANDS];
         bands[0] = 0.5;
-        paint_bands(&mut buffer, area, &bands);
+        paint_bands(&mut buffer, area, &bands, &Theme::default());
 
         // 5 filas de 10: y=9..5 son barra, y=4 queda vacia.
         assert_eq!(buffer[(0u16, 5u16)].symbol(), "\u{2588}");
@@ -1495,7 +1593,7 @@ mod tests {
             .map(|line| line_text(line))
             .collect::<Vec<_>>()
             .join("\n");
-        for hint in ["s: shuffle", "r: repeat", "n/p: pista", "/: buscar", "q/Esc: salir", "←/→: ±5s", "[ ]: vel"] {
+        for hint in ["s: shuffle", "r: repeat", "n/p: pista", "/: buscar", "q/Esc: salir", "←/→: ±5s", "[/]: vel"] {
             assert!(player.contains(hint), "footer del player falta '{hint}': {player}");
         }
 
@@ -1505,7 +1603,7 @@ mod tests {
             .map(|line| line_text(line))
             .collect::<Vec<_>>()
             .join("\n");
-        for hint in ["s: shuffle", "r: repeat", "n/p: pista", "/: buscar", "q/Esc: salir", "←/→: ±5s", "[ ]: vel"] {
+        for hint in ["s: shuffle", "r: repeat", "n/p: pista", "/: buscar", "q/Esc: salir", "←/→: ±5s", "[/]: vel"] {
             assert!(browser.contains(hint), "footer del explorador falta '{hint}': {browser}");
         }
 
