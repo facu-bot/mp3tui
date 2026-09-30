@@ -42,6 +42,7 @@ pub const CONFIG_ENV_OVERRIDE: &str = "MP3TUI_CONFIG";
 pub struct Config {
     pub theme: Theme,
     pub keys: Keys,
+    pub library: LibraryConfig,
     /// Avisos de la carga: campos inválidos, claves desconocidas o archivo
     /// ilegible. Vacío cuando todo (o el archivo mismo) está bien.
     pub warnings: Vec<String>,
@@ -137,7 +138,7 @@ pub fn parse(text: &str) -> Config {
 
     for section in table.keys() {
         match section.as_str() {
-            "theme" | "keybindings" => {}
+            "theme" | "keybindings" | "library" => {}
             other => warnings.push(format!(
                 "sección desconocida «[{other}]» (se ignora)"
             )),
@@ -165,6 +166,20 @@ pub fn parse(text: &str) -> Config {
             None => warnings.push(
                 "[keybindings] debe ser una tabla con claves de la forma \
                  clave = \"valor\""
+                    .to_string(),
+            ),
+        },
+    }
+
+    match table.get("library") {
+        None => {}
+        Some(value) => match value.as_table() {
+            Some(section) => {
+                parse_library(section, &mut config.library, &mut warnings)
+            }
+            None => warnings.push(
+                "[library] debe ser una tabla con claves de la forma \
+                 roots = [\"ruta\", ...]"
                     .to_string(),
             ),
         },
@@ -320,7 +335,8 @@ pub fn parse_color(raw: &str) -> Option<Color> {
 /// sin distinguir mayúsculas para las letras).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Keys {
-    /// Salir de la app (en el explorador, Esc/Tab tienen prioría: vuelven).
+    /// Salir de la app. En el explorador, Esc llega primero por `back` y
+    /// cierra el panel (o sale) antes de que llegue acá.
     pub quit: Vec<KeyCode>,
     /// Espacio en ambos modos.
     pub play_pause: Vec<KeyCode>,
@@ -349,7 +365,8 @@ pub struct Keys {
     /// Reproducir la pista seleccionada en el explorador.
     pub select: Vec<KeyCode>,
     /// Cerrar el panel lateral del explorador / volver al player (T13); sin
-    /// player en pantalla completa, sale de la app.
+    /// player en pantalla completa, sale de la app. Solo `Esc` por defecto
+    /// (T14): `Tab` vive en `explorer` y acá salía de la app sin player.
     pub back: Vec<KeyCode>,
 }
 
@@ -380,7 +397,7 @@ impl Default for Keys {
             home: keys(&[KeyCode::Home]),
             end: keys(&[KeyCode::End]),
             select: keys(&[KeyCode::Enter]),
-            back: keys(&[KeyCode::Esc, KeyCode::Tab]),
+            back: keys(&[KeyCode::Esc]),
         }
     }
 }
@@ -463,9 +480,9 @@ fn normalize_key(key: KeyCode) -> KeyCode {
 ///    se resuelve distinto en cada modo (seek/speed van arriba en el player y
 ///    abajo en el explorador) manda el orden del player: es el modo de
 ///    arranque y el par coexiste ahí.
-/// 2. Colisión heredada de los defaults (Esc en `back`/`quit`, Tab en
-///    `explorer`/`back`, ↑/↓ en volumen/mover): no se avisa ni se modifica
-///    nada, el dispatch la resuelve por orden como siempre.
+/// 2. Colisión heredada de los defaults (Esc en `back`/`quit`, ↑/↓ en
+///    volumen/mover): no se avisa ni se modifica nada, el dispatch la
+///    resuelve por orden como siempre.
 /// 3. Si no, gana la primera en el orden; la perdedora pierde esa tecla y,
 ///    si queda sin teclas, vuelve a sus defaults que estén libres (o queda
 ///    sin bindear si ninguno está libre). Cada pérdida genera un warning que
@@ -675,6 +692,92 @@ pub fn pressed(bindings: &[KeyCode], code: KeyCode) -> bool {
         (KeyCode::Char(a), KeyCode::Char(b)) => a.eq_ignore_ascii_case(&b),
         (binding, code) => binding == code,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Biblioteca (T14)
+// ---------------------------------------------------------------------------
+
+/// Carpetas a escanear cuando la CLI no recibe ningún path (T14). Se
+/// escanean todas y los tracks quedan agrupados por carpeta de origen en la
+/// lista del explorador.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LibraryConfig {
+    pub roots: Vec<PathBuf>,
+}
+
+impl Default for LibraryConfig {
+    fn default() -> Self {
+        Self {
+            roots: vec![default_music_dir()],
+        }
+    }
+}
+
+/// `%USERPROFILE%\Music`: la biblioteca sensible para un comando global en
+/// el PATH (T14). El `cwd` solo entra como fallback si la variable no
+/// existe; un config.toml sin `[library]` usa este default.
+fn default_music_dir() -> PathBuf {
+    env::var_os("USERPROFILE")
+        .map(PathBuf::from)
+        .map(|home| home.join("Music"))
+        .unwrap_or_else(|| {
+            env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        })
+}
+
+fn parse_library(
+    section: &toml::Table,
+    library: &mut LibraryConfig,
+    warnings: &mut Vec<String>,
+) {
+    for (key, value) in section {
+        match key.as_str() {
+            "roots" => match value.as_array() {
+                Some(items) => {
+                    let mut roots = Vec::new();
+                    for item in items {
+                        let Some(text) = item.as_str() else {
+                            warnings.push(
+                                "[library] roots: cada entrada debe ser una \
+                                 ruta entre comillas; se ignora"
+                                    .to_string(),
+                            );
+                            continue;
+                        };
+                        if text.trim().is_empty() {
+                            warnings.push(
+                                "[library] roots: ruta vacía; se ignora"
+                                    .to_string(),
+                            );
+                            continue;
+                        }
+                        let path = PathBuf::from(text);
+                        if !path.is_dir() {
+                            warnings.push(format!(
+                                "[library] «{}» no es una carpeta existente \
+                                 (se listará vacía)",
+                                path.display()
+                            ));
+                        }
+                        roots.push(path);
+                    }
+                    // Lista vacía o todo inválido: se mantiene el default.
+                    if !roots.is_empty() {
+                        library.roots = roots;
+                    }
+                }
+                None => warnings.push(
+                    "[library] roots debe ser una lista de rutas, p. ej. \
+                     roots = [\"C:/Musica\"]"
+                        .to_string(),
+                ),
+            },
+            other => warnings.push(format!(
+                "[library] clave desconocida «{other}»"
+            )),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -916,7 +1019,7 @@ mod tests {
 
     #[test]
     fn inherited_default_collisions_do_not_warn() {
-        // Esc/Tab/↑/↓ están en defaults de dos acciones por diseño (la
+        // Esc y ↑/↓ están en defaults de dos acciones por diseño (la
         // resuelve el orden del dispatch): una config default no avisa.
         let config = parse("");
         assert_eq!(config, Config::default());
@@ -925,6 +1028,78 @@ mod tests {
         assert!(config.keys.quit.contains(&KeyCode::Esc));
         assert_eq!(config.keys.volume_up, Keys::default().volume_up);
         assert_eq!(config.keys.move_up, Keys::default().move_up);
+    }
+
+    #[test]
+    fn back_is_esc_only_and_tab_stays_in_explorer() {
+        // T14: Tab en `back` hacía que Tab saliera de la app sin player
+        // (back se chequea antes que explorer). Ahora Tab solo abre/cierra
+        // el panel — que sin player no-opea.
+        let config = parse("");
+        assert_eq!(config.keys.back, vec![KeyCode::Esc]);
+        assert_eq!(
+            config.keys.explorer,
+            vec![KeyCode::Char('b'), KeyCode::Tab]
+        );
+
+        // El remapeo explícito del usuario se respeta; el choque con
+        // explorer (que por default tenía Tab) se resuelve con warning.
+        let config = parse("[keybindings]\nback = \"esc,tab\"");
+        assert_eq!(config.keys.back, vec![KeyCode::Esc, KeyCode::Tab]);
+        assert_eq!(config.keys.explorer, vec![KeyCode::Char('b')]);
+        assert_eq!(config.warnings.len(), 1, "{:?}", config.warnings);
+        assert!(
+            config.warnings[0].contains("explorer"),
+            "{:?}",
+            config.warnings
+        );
+    }
+
+    #[test]
+    fn library_roots_default_to_userprofile_music() {
+        let config = parse("");
+        assert_eq!(config.library, LibraryConfig::default());
+        if let Some(home) = env::var_os("USERPROFILE") {
+            assert_eq!(
+                config.library.roots,
+                vec![PathBuf::from(home).join("Music")]
+            );
+        }
+    }
+
+    #[test]
+    fn library_section_parses_roots_and_warns_for_missing_dirs() {
+        let present = env::temp_dir();
+        let missing = env::temp_dir().join("mp3tui_no_existe_t14");
+        // Strings literales de TOML: sin escapes, las barras de Windows
+        // entran tal cual.
+        let config = parse(&format!(
+            "[library]\nroots = ['{}', '{}']",
+            present.display(),
+            missing.display()
+        ));
+        assert_eq!(config.library.roots, vec![present, missing]);
+        assert_eq!(config.warnings.len(), 1, "{:?}", config.warnings);
+        assert!(
+            config.warnings[0].contains("no es una carpeta"),
+            "{:?}",
+            config.warnings
+        );
+    }
+
+    #[test]
+    fn empty_or_invalid_roots_fall_back_to_the_default() {
+        let config = parse("[library]\nroots = []");
+        assert_eq!(config.library, LibraryConfig::default());
+        assert!(config.warnings.is_empty(), "{:?}", config.warnings);
+
+        let config = parse("[library]\nroots = [3]");
+        assert_eq!(config.library, LibraryConfig::default());
+        assert_eq!(config.warnings.len(), 1, "{:?}", config.warnings);
+
+        let config = parse("[library]\nbiblioteca = \"x\"");
+        assert_eq!(config.library, LibraryConfig::default());
+        assert_eq!(config.warnings.len(), 1, "{:?}", config.warnings);
     }
 
     #[test]

@@ -28,15 +28,16 @@ fn main() -> ExitCode {
         eprintln!("mp3tui: config: {warning}");
     }
 
-    // Sin path: explorador en el directorio actual.
-    // Con carpeta: explorador en esa carpeta.
+    // Sin path: biblioteca de la config ([library] roots, T14; default
+    // %USERPROFILE%\Music).
+    // Con carpeta: explorador solo en esa carpeta (la CLI tiene prioría).
     // Con archivo: comportamiento original (reproducción directa a la TUI,
     // con la biblioteca de la carpeta contenedora a mano en modo explorador).
     let start = match cli.path.as_deref() {
-        None => ui::StartMode::Browse(
-            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-        ),
-        Some(path) if path.is_dir() => ui::StartMode::Browse(path.to_path_buf()),
+        None => ui::StartMode::Browse(config::config().library.roots.clone()),
+        Some(path) if path.is_dir() => {
+            ui::StartMode::Browse(vec![path.to_path_buf()])
+        }
         Some(path) if path.is_file() => ui::StartMode::PlayFile(path.to_path_buf()),
         Some(path) => {
             eprintln!("mp3tui: '{}' no existe.", path.display());

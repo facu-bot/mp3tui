@@ -22,12 +22,22 @@ pub struct Track {
     pub artist: Option<String>,
     pub album: Option<String>,
     pub duration: Option<Duration>,
+    /// Carpeta de origen a mostrar como encabezado en el explorador (T14):
+    /// relativa a la raíz escaneada (con `/`), o el nombre de la raíz si el
+    /// archivo vive en la raíz misma. Se resuelve en el escaneo, no al
+    /// renderizar.
+    pub folder: String,
 }
 
 impl Track {
     /// Lee la metadata con lofty; si el archivo no se puede parsear (o no tiene
     /// tags) usa el nombre de archivo como título.
     pub fn from_path(path: PathBuf) -> Self {
+        let folder = path
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
         let fallback_title = path
             .file_stem()
             .map(|stem| stem.to_string_lossy().into_owned())
@@ -39,6 +49,7 @@ impl Track {
             artist: None,
             album: None,
             duration: None,
+            folder,
         };
 
         if let Ok(tagged) = read_from_path(&track.path) {
@@ -93,21 +104,63 @@ impl Playlist {
     }
 
     /// Escaneo recursivo de `root` con `std::fs` (sin crates externos),
-    /// manteniendo solo archivos de audio y ordenando por nombre de archivo
-    /// sin distinguir mayúsculas.
+    /// manteniendo solo archivos de audio y agrupados por carpeta de origen
+    /// (T14); ver [`Self::from_dirs_scan`].
     pub fn from_dir_scan(root: &Path) -> Self {
-        let mut paths = Vec::new();
-        collect_audio_files(root, &mut paths);
+        Self::from_dirs_scan(&[root.to_path_buf()])
+    }
 
-        paths.sort_by_key(|path| {
-            path.file_name()
-                .map(|name| name.to_string_lossy().to_lowercase())
-                .unwrap_or_default()
-        });
-        paths.truncate(MAX_TRACKS);
+    /// Escaneo recursivo de varias raíces (T14): los tracks quedan agrupados
+    /// por carpeta de origen — en el orden de `roots` y, dentro de cada raíz,
+    /// con las carpetas en orden alfabético y las pistas por nombre de
+    /// archivo (sin distinguir mayúsculas) — para que la lista del explorador
+    /// se muestre agrupada con encabezados navegables. El tope de
+    /// [`MAX_TRACKS`] es global.
+    pub fn from_dirs_scan(roots: &[PathBuf]) -> Self {
+        let mut tracks = Vec::new();
+        'roots: for root in roots {
+            let mut paths = Vec::new();
+            collect_audio_files(root, &mut paths);
+
+            // Agrupa por carpeta contenedora (primer encuentro = orden del
+            // walk; el sort posterior lo deja alfabético).
+            let mut groups: Vec<(PathBuf, Vec<PathBuf>)> = Vec::new();
+            for path in paths {
+                let dir = path
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| root.clone());
+                match groups.iter_mut().find(|(group, _)| *group == dir) {
+                    Some((_, list)) => list.push(path),
+                    None => groups.push((dir, vec![path])),
+                }
+            }
+            groups.sort_by(|(a, _), (b, _)| {
+                a.to_string_lossy()
+                    .to_lowercase()
+                    .cmp(&b.to_string_lossy().to_lowercase())
+            });
+
+            for (dir, mut list) in groups {
+                list.sort_by_key(|path| {
+                    path.file_name()
+                        .map(|name| name.to_string_lossy().to_lowercase())
+                        .unwrap_or_default()
+                });
+                let folder = folder_header(root, &dir);
+                for path in list {
+                    if tracks.len() >= MAX_TRACKS {
+                        break 'roots;
+                    }
+                    let mut track = Track::from_path(path);
+                    track.folder = folder.clone();
+                    tracks.push(track);
+                }
+            }
+        }
 
         Self {
-            tracks: paths.into_iter().map(Track::from_path).collect(),
+            tracks,
             current: None,
         }
     }
@@ -189,6 +242,21 @@ fn collect_audio_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Encabezado a mostrar para la carpeta `dir` dentro de `root` (T14): la
+/// ruta relativa con `/` como separador, o el nombre de la raíz si el track
+/// vive en la raíz misma (o si `dir` no está debajo de `root`).
+fn folder_header(root: &Path, dir: &Path) -> String {
+    match dir.strip_prefix(root) {
+        Ok(relative) if !relative.as_os_str().is_empty() => {
+            relative.to_string_lossy().replace('\\', "/")
+        }
+        _ => root
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| root.to_string_lossy().into_owned()),
+    }
+}
+
 /// Mueve la selección con clamp a los límites de la lista (nunca sale del rango).
 pub fn move_selection(selected: usize, delta: isize, len: usize) -> usize {
     if len == 0 {
@@ -230,7 +298,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_finds_audio_recursively_and_sorts_by_name() {
+    fn scan_groups_by_folder_and_sorts_by_name() {
         let root = temp_root("scan");
         fs::create_dir_all(root.join("sub")).unwrap();
         fs::write(root.join("beta.mp3"), b"").unwrap();
@@ -253,10 +321,85 @@ mod tests {
             })
             .collect();
 
-        assert_eq!(names, vec!["Alpha.mp3", "beta.mp3", "gamma.wav", "track.FLAC"]);
+        // T14: primero el grupo de la raíz (orden alfabético), después las
+        // subcarpetas — ya no es un orden global por nombre.
+        assert_eq!(
+            names,
+            vec!["Alpha.mp3", "beta.mp3", "track.FLAC", "gamma.wav"]
+        );
         assert!(!names.iter().any(|name| name.ends_with(".txt")));
 
+        let root_name = root
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let folders: Vec<&str> = playlist
+            .tracks()
+            .iter()
+            .map(|track| track.folder.as_str())
+            .collect();
+        assert_eq!(
+            folders,
+            vec![
+                root_name.as_str(),
+                root_name.as_str(),
+                root_name.as_str(),
+                "sub"
+            ]
+        );
+
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn multi_root_scan_groups_by_folder_in_root_order() {
+        let root_a = temp_root("multi_a");
+        let root_b = temp_root("multi_b");
+        fs::create_dir_all(root_a.join("sub")).unwrap();
+        fs::write(root_a.join("beta.mp3"), b"").unwrap();
+        fs::write(root_a.join("alpha.mp3"), b"").unwrap();
+        fs::write(root_a.join("sub").join("gamma.wav"), b"").unwrap();
+        fs::write(root_b.join("delta.flac"), b"").unwrap();
+
+        let playlist =
+            Playlist::from_dirs_scan(&[root_a.clone(), root_b.clone()]);
+        let names: Vec<String> = playlist
+            .tracks()
+            .iter()
+            .map(|track| {
+                track
+                    .path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec!["alpha.mp3", "beta.mp3", "gamma.wav", "delta.flac"]
+        );
+
+        let name_a = root_a.file_name().unwrap().to_string_lossy().into_owned();
+        let name_b = root_b.file_name().unwrap().to_string_lossy().into_owned();
+        let folders: Vec<&str> = playlist
+            .tracks()
+            .iter()
+            .map(|track| track.folder.as_str())
+            .collect();
+        assert_eq!(
+            folders,
+            vec![
+                name_a.as_str(),
+                name_a.as_str(),
+                "sub",
+                name_b.as_str()
+            ]
+        );
+
+        let _ = fs::remove_dir_all(&root_a);
+        let _ = fs::remove_dir_all(&root_b);
     }
 
     #[test]

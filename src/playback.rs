@@ -215,6 +215,7 @@ mod tests {
             artist: artist.map(str::to_string),
             album: album.map(str::to_string),
             duration: None,
+            folder: String::new(),
         }
     }
 

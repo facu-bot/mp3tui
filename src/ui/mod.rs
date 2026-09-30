@@ -53,8 +53,9 @@ enum Status {
 pub enum StartMode {
     /// Archivo por CLI: reproducción directa (comportamiento original).
     PlayFile(PathBuf),
-    /// Sin argumento o con carpeta: explorador de la biblioteca.
-    Browse(PathBuf),
+    /// Sin argumento (raíces de `[library]`, T14) o con carpeta: explorador
+    /// de la biblioteca, agrupado por carpeta de origen.
+    Browse(Vec<PathBuf>),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -72,7 +73,8 @@ struct App {
     /// Panel lateral del explorador superpuesto sobre el reproductor (T13).
     /// Solo tiene efecto en `Mode::Player`.
     explorer_open: bool,
-    root: PathBuf,
+    /// Raíces escaneadas (T14): CLI o `[library]` roots de la config.
+    roots: Vec<PathBuf>,
     /// Última biblioteca conocida; `None` mientras no terminó el primer escaneo.
     library: Option<Playlist>,
     /// Resultado del escaneo en curso (thread de background). `Some` = escaneando.
@@ -141,7 +143,7 @@ impl Drop for Tui {
 
 /// Loop principal de la TUI. Sale con la terminal restaurada y el audio detenido.
 pub fn run(engine: &mut AudioEngine, start: StartMode) -> io::Result<()> {
-    let (mode, root, current_path, has_player, track_label) = match start {
+    let (mode, roots, current_path, has_player, track_label) = match start {
         StartMode::PlayFile(path) => {
             let root = path
                 .parent()
@@ -149,9 +151,9 @@ pub fn run(engine: &mut AudioEngine, start: StartMode) -> io::Result<()> {
                 .map(Path::to_path_buf)
                 .unwrap_or_else(fallback_cwd);
             let label = path.to_string_lossy().into_owned();
-            (Mode::Player, root, Some(path), true, label)
+            (Mode::Player, vec![root], Some(path), true, label)
         }
-        StartMode::Browse(root) => (Mode::Browser, root, None, false, String::new()),
+        StartMode::Browse(roots) => (Mode::Browser, roots, None, false, String::new()),
     };
 
     // La biblioteca se escanea en background: con miles de archivos el parseo
@@ -159,7 +161,7 @@ pub fn run(engine: &mut AudioEngine, start: StartMode) -> io::Result<()> {
     let mut app = App {
         mode,
         explorer_open: false,
-        root,
+        roots,
         library: None,
         scan_rx: None,
         view: Vec::new(),
@@ -333,8 +335,9 @@ fn handle_list_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine) {
     let keys = &config::config().keys;
     let view_len = app.view.len();
     let code = key.code;
-    // El orden importa: «back» antes que «quit» — Esc/Tab cierran el panel
-    // (o salen del explorador sin player) aunque Esc también esté en «quit».
+    // El orden importa: «back» antes que «quit» — Esc cierra el panel (o
+    // sale del explorador sin player) aunque Esc también esté en «quit».
+    // Tab no está en «back» (T14): cae en «explorer» y no-opea sin player.
     if config::pressed(&keys.back, code) {
         go_back(app);
     } else if config::pressed(&keys.explorer, code) {
@@ -477,16 +480,17 @@ fn resync_selection(app: &mut App) {
     }
 }
 
-/// Lanza el escaneo de `app.root` en un thread aparte. Si ya hay un escaneo en
+/// Lanza el escaneo de `app.roots` en un thread aparte (T14: una o varias
+/// carpetas, agrupadas por carpeta de origen). Si ya hay un escaneo en
 /// curso no lanza otro (el resultado viejo sigue siendo válido).
 fn start_scan(app: &mut App) {
     if app.scan_rx.is_some() {
         return;
     }
-    let root = app.root.clone();
+    let roots = app.roots.clone();
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let playlist = Playlist::from_dir_scan(&root);
+        let playlist = Playlist::from_dirs_scan(&roots);
         // Si la UI ya salió, el receiver está caído y el resultado se descarta.
         let _ = tx.send(playlist);
     });
@@ -654,7 +658,7 @@ fn handle_natural_end(app: &mut App, engine: &mut AudioEngine) {
     }
 }
 
-/// Acción de «back» (Esc/Tab) desde la lista: con el panel lateral abierto
+/// Acción de «back» (Esc, T14) desde la lista: con el panel lateral abierto
 /// (T13) lo cierra y deja el reproductor de fondo; con el explorador a
 /// pantalla completa vuelve al player si hay sesión y si no sale de la app.
 fn go_back(app: &mut App) {
@@ -668,9 +672,10 @@ fn go_back(app: &mut App) {
 }
 
 /// 'b' / Tab / Ctrl+Tab: alterna el panel lateral del explorador (T13).
-/// Al abrirlo re-sincroniza la selección con la pista sonando y reescanea la
-/// raíz en background (si ya hay un escaneo en curso, no lanza otro). Sin
-/// sesión de audio no hace nada: el explorador ya ocupa toda la pantalla.
+/// Al abrirlo re-sincroniza la selección con la pista sonando y reescanea
+/// las raíces en background (si ya hay un escaneo en curso, no lanza otro).
+/// Sin sesión de audio no hace nada: el explorador ya ocupa toda la
+/// pantalla (T14: así Tab sin player no sale de la app).
 fn toggle_explorer(app: &mut App) {
     if !app.has_player {
         return;
@@ -972,7 +977,7 @@ fn render_browser_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn render_library(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let folder = folder_label(&app.root);
+    let folder = library_folder_label(app);
     let block = themed_block(Span::styled(
         library_title(app, &folder),
         Style::default().fg(theme().accent).add_modifier(Modifier::BOLD),
@@ -1009,17 +1014,105 @@ fn render_library(frame: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     }
 
-    let view_height = inner.height as usize;
-    let first = scroll_offset(app.selected, app.view.len(), view_height);
+    let lines = library_rows(app, inner.width, inner.height);
+    frame.render_widget(Paragraph::new(lines), inner);
+}
 
-    let mut lines: Vec<Line<'static>> = Vec::with_capacity(view_height);
-    for (position, library_index) in app.view.iter().enumerate().skip(first) {
-        if lines.len() >= view_height {
+/// ¿La vista agrupa más de una carpeta (T14)? Con una sola carpeta en
+/// pantalla los encabezados solo ensucian, así que no se dibujan.
+fn view_is_grouped(app: &App) -> bool {
+    let mut first: Option<&str> = None;
+    for position in 0..app.view.len() {
+        let Some(track) = view_get(app, position) else {
+            break;
+        };
+        match first {
+            None => first = Some(track.folder.as_str()),
+            Some(folder) if folder != track.folder.as_str() => return true,
+            Some(_) => {}
+        }
+    }
+    false
+}
+
+/// Filas que ocupan `[from..=to]` (T14): una por track más un encabezado
+/// cada vez que cambia de carpeta; el grupo de `from` también cuenta si es
+/// distinto del track anterior, que queda fuera de la vista.
+fn rows_between(app: &App, from: usize, to: usize, grouped: bool) -> usize {
+    if from > to {
+        return 0;
+    }
+    let mut rows = 0;
+    let mut previous: Option<&str> = None;
+    if grouped && from > 0 {
+        previous = view_get(app, from - 1).map(|track| track.folder.as_str());
+    }
+    for position in from..=to {
+        let Some(track) = view_get(app, position) else {
+            break;
+        };
+        if grouped && previous != Some(track.folder.as_str()) {
+            rows += 1;
+        }
+        rows += 1;
+        previous = Some(track.folder.as_str());
+    }
+    rows
+}
+
+/// Primer track visible para que `selected` entre en `height` filas con los
+/// encabezados incluidos (T14): arranca del candidato centrado clásico
+/// (`scroll_offset`) y sube mientras `[start..=selected]` no entre en el
+/// alto. Nunca supera `selected`, así que el cursor siempre queda a la vista.
+fn visible_start(app: &App, height: usize, grouped: bool) -> usize {
+    let len = app.view.len();
+    if len == 0 {
+        return 0;
+    }
+    let mut start = scroll_offset(app.selected, len, height);
+    while start < app.selected
+        && rows_between(app, start, app.selected, grouped) > height
+    {
+        start += 1;
+    }
+    start
+}
+
+/// Filas visibles de la biblioteca (T14): encabezados de carpeta
+/// intercalados cuando la vista agrupa más de una carpeta. Los encabezados
+/// no son seleccionables — `selected` sigue siendo un índice sobre `view`
+/// y las flechas los saltan solas.
+fn library_rows(app: &App, width: u16, height: u16) -> Vec<Line<'static>> {
+    let Some(library) = &app.library else {
+        return Vec::new();
+    };
+    let height = height as usize;
+    if height == 0 {
+        return Vec::new();
+    }
+    let grouped = view_is_grouped(app);
+    let start = visible_start(app, height, grouped);
+
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(height);
+    let mut previous: Option<&str> = None;
+    if grouped && start > 0 {
+        previous = view_get(app, start - 1).map(|track| track.folder.as_str());
+    }
+    for (position, library_index) in app.view.iter().enumerate().skip(start) {
+        if lines.len() >= height {
             break;
         }
         let Some(track) = library.get(*library_index) else {
             break;
         };
+        if grouped && previous != Some(track.folder.as_str()) {
+            // Dejan entrar encabezado + fila; si no, se corta la vista.
+            if lines.len() + 2 > height {
+                break;
+            }
+            lines.push(folder_header_line(&track.folder, width));
+            previous = Some(track.folder.as_str());
+        }
         let is_selected = position == app.selected;
         let is_playing = app.current_path.as_deref() == Some(track.path.as_path());
         lines.push(row_line(
@@ -1027,10 +1120,29 @@ fn render_library(frame: &mut Frame<'_>, area: Rect, app: &App) {
             position + 1,
             is_selected,
             is_playing,
-            inner.width,
+            width,
         ));
     }
-    frame.render_widget(Paragraph::new(lines), inner);
+    lines
+}
+
+/// Encabezado de carpeta (T14): nombre en acento y negrita seguido de un
+/// guion fino que completa el ancho de la lista.
+fn folder_header_line(folder: &str, width: u16) -> Line<'static> {
+    let width = width as usize;
+    let label = truncate_chars(&format!(" {folder} "), width);
+    let used = label.chars().count();
+    let mut spans = vec![Span::styled(
+        label,
+        Style::default().fg(theme().accent).add_modifier(Modifier::BOLD),
+    )];
+    if width > used {
+        spans.push(Span::styled(
+            "\u{2500}".repeat(width - used),
+            Style::default().fg(theme().dim),
+        ));
+    }
+    Line::from(spans)
 }
 
 /// Título del bloque biblioteca: lista visible, filtro, búsqueda activa y
@@ -1072,6 +1184,15 @@ fn folder_label(root: &Path) -> String {
     root.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| root.to_string_lossy().into_owned())
+}
+
+/// Carpeta que nombra a la biblioteca en el título (T14): con una raíz, su
+/// nombre; con varias, cuántas hay.
+fn library_folder_label(app: &App) -> String {
+    match app.roots.as_slice() {
+        [root] => folder_label(root),
+        roots => format!("{} carpetas", roots.len()),
+    }
 }
 
 /// Una fila de la biblioteca, medida para ocupar exactamente `width`
@@ -1260,12 +1381,13 @@ fn footer_lines(app: &App) -> Vec<Line<'static>> {
         // recordatorio de que ↑/↓ son volumen solo con el panel cerrado.
         Mode::Player if app.explorer_open => vec![
             Line::from(format!(
-                " {}/{}: mover   {}: reproducir   {}: buscar   {}: cerrar",
+                " {}/{}: mover   {}: reproducir   {}: buscar   {}/{}: cerrar",
                 key_labels(&keys.move_up),
                 key_labels(&keys.move_down),
                 key_labels(&keys.select),
                 key_labels(&keys.search),
                 key_labels(&keys.back),
+                key_labels(&keys.explorer),
             )),
             Line::from(format!(
                 " {}: pausa   {}/{}: ±5s   {}/{}: vel   {}: shuffle   {}: repeat   {}: salir",
@@ -1367,6 +1489,7 @@ mod tests {
             artist: Some("Artista".to_string()),
             album: Some("Álbum".to_string()),
             duration: Some(Duration::from_secs(65)),
+            folder: "music".to_string(),
         }
     }
 
@@ -1493,7 +1616,7 @@ mod tests {
         App {
             mode: Mode::Browser,
             explorer_open: false,
-            root: PathBuf::from("."),
+            roots: vec![PathBuf::from(".")],
             library: None,
             scan_rx: None,
             view: Vec::new(),
@@ -1520,6 +1643,7 @@ mod tests {
             artist: None,
             album: None,
             duration: None,
+            folder: "x".to_string(),
         }
     }
 
@@ -1629,7 +1753,8 @@ mod tests {
 
     #[test]
     fn go_back_closes_the_panel_and_only_quits_from_the_bare_explorer() {
-        // Panel abierto: Esc/Tab cierran el panel, no salen de la app.
+        // Panel abierto: Esc cierra el panel, no sale de la app (T14: Esc
+        // es la única tecla de «back»; Tab vive en «explorer»).
         let mut app = test_app();
         app.mode = Mode::Player;
         app.has_player = true;
@@ -1642,7 +1767,7 @@ mod tests {
         // Explorador a pantalla completa sin player: sale (como antes de T13).
         let mut bare = test_app();
         go_back(&mut bare);
-        assert!(bare.should_quit, "sin player Esc/Tab salen");
+        assert!(bare.should_quit, "sin player Esc sale");
 
         // Player sin panel (estado clásico): back vuelve al modo player.
         let mut classic = test_app();
@@ -1817,7 +1942,7 @@ mod tests {
         for hint in [
             "↑/↓: mover",
             "Enter: reproducir",
-            "Esc/Tab: cerrar",
+            "Esc/b/Tab: cerrar",
             "espacio: pausa",
             "←/→: ±5s",
             "[/]: vel",
@@ -1862,6 +1987,88 @@ mod tests {
             .join("\n");
         assert!(search.contains("Backspace"));
         assert!(search.contains("Esc: cancelar"));
+    }
+
+    fn track_in(name: &str, folder: &str) -> Track {
+        Track {
+            path: PathBuf::from(format!(r"C:\lib\{folder}\{name}.mp3")),
+            title: name.to_string(),
+            artist: None,
+            album: None,
+            duration: None,
+            folder: folder.to_string(),
+        }
+    }
+
+    fn library_two_folders() -> App {
+        let mut app = test_app();
+        app.library = Some(crate::playlist::from_tracks_for_test(vec![
+            track_in("alpha", "rock"),
+            track_in("beta", "rock"),
+            track_in("gamma", "jazz"),
+            track_in("delta", "jazz"),
+        ]));
+        refresh_view(&mut app);
+        app
+    }
+
+    #[test]
+    fn library_rows_interleave_headers_and_keep_the_cursor_visible() {
+        let mut app = library_two_folders();
+        let lines = library_rows(&app, 40, 10);
+        let texts: Vec<String> = lines.iter().map(|line| line_text(line)).collect();
+        assert_eq!(texts.len(), 6, "2 encabezados + 4 pistas: {texts:?}");
+        assert!(texts[0].contains("rock"), "encabezado de grupo: {:?}", texts[0]);
+        assert!(
+            texts[0].contains('\u{2500}'),
+            "relleno de guiones: {:?}",
+            texts[0]
+        );
+        assert_eq!(line_width(&lines[0]), 40, "el encabezado ocupa el ancho");
+        assert!(!texts[0].contains('\u{258c}'), "el encabezado no selecciona");
+        assert!(texts[1].contains("alpha"), "{:?}", texts[1]);
+        assert!(texts[3].contains("jazz"), "segundo grupo: {:?}", texts[3]);
+
+        // Selección al final con alto chico: el scroll cuenta los
+        // encabezados y el cursor queda en la última fila visible.
+        app.selected = 3;
+        let lines = library_rows(&app, 40, 3);
+        let texts: Vec<String> = lines.iter().map(|line| line_text(line)).collect();
+        assert_eq!(texts.len(), 3, "{texts:?}");
+        assert!(
+            texts[2].starts_with('\u{258c}'),
+            "cursor a la vista: {texts:?}"
+        );
+        assert!(texts[2].contains("delta"), "{:?}", texts[2]);
+    }
+
+    #[test]
+    fn single_folder_library_renders_without_headers() {
+        let mut app = test_app();
+        app.library = Some(crate::playlist::from_tracks_for_test(vec![
+            track_in("alpha", "rock"),
+            track_in("beta", "rock"),
+        ]));
+        refresh_view(&mut app);
+
+        let lines = library_rows(&app, 40, 10);
+        let texts: Vec<String> = lines.iter().map(|line| line_text(line)).collect();
+        assert_eq!(texts.len(), 2, "una sola carpeta no muestra encabezados");
+        assert!(texts[0].contains("1. "), "fila normal: {:?}", texts[0]);
+        assert!(
+            texts.iter().all(|text| !text.contains('\u{2500}')),
+            "sin guiones de encabezado"
+        );
+    }
+
+    #[test]
+    fn folder_label_shows_the_single_root_or_the_root_count() {
+        let mut app = test_app();
+        app.roots = vec![PathBuf::from(r"C:\musica\rock")];
+        assert_eq!(library_folder_label(&app), "rock");
+
+        app.roots = vec![PathBuf::from(r"C:\a"), PathBuf::from(r"C:\b")];
+        assert_eq!(library_folder_label(&app), "2 carpetas");
     }
 
     #[test]

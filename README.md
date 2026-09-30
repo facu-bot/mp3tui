@@ -21,7 +21,8 @@ cargo run --release -- "C:\Users\yo\Music"
 # Archivo puntual (reproduce directo; su carpeta queda como biblioteca):
 cargo run --release -- "C:\Users\yo\Music\tema.mp3"
 
-# Sin argumentos: explorador sobre el directorio actual.
+# Sin argumentos: la biblioteca de [library] roots en config.toml
+# (default: %USERPROFILE%\Music); la lista se agrupa por carpeta.
 cargo run --release
 ```
 
@@ -80,9 +81,18 @@ El footer de atajos muestra este contexto y se actualiza al abrir/cerrar.
 
 Sin sesión de audio (arranque sin archivo) la lista ocupa toda la pantalla y
 se maneja con las mismas teclas que el panel lateral, con dos diferencias:
-`Esc` / `Tab` / `q` salen de la app (no hay panel que cerrar ni reproductor
+`Esc` / `q` salen de la app (no hay panel que cerrar ni reproductor
 al que volver) y `Enter` pasa al modo reproducción con la pista sonando.
+`Tab` no sale: solo alterna el panel, que sin sesión no hace nada.
 `Ctrl+C` sale siempre, en cualquier modo.
+
+### Biblioteca agrupada por carpeta
+
+La lista del explorador agrupa los tracks por su carpeta de origen, con un
+encabezado por grupo (la ruta relativa a la raíz escaneada). Los encabezados
+no son seleccionables: `↑`/`↓` los saltan solos. Con varias raíces
+(`[library]` roots) los grupos siguen el orden de las raíces y, dentro de
+cada una, las carpetas en orden alfabético.
 
 ### Búsqueda (cuando está abierta)
 
@@ -125,6 +135,13 @@ seek_back = "left"
 # Nombres de tecla: space, enter, esc, tab, up, down, left, right,
 #   pageup, pagedown, home, end, backspace, delete, insert, backtab,
 #   comma, minus, plus (o un carácter simple como "q" o "/")
+
+[library]
+# Carpetas a escanear sin argumento de CLI (T14). Varios roots agrupan la
+# lista por carpeta siguiendo este orden. Default: %USERPROFILE%\Music.
+# Con backslashes usá strings literales de TOML ('C:\Musica') o barras
+# normales ("C:/Musica").
+roots = ["C:/Musica"]
 ```
 
 Notas del comportamiento de la config:

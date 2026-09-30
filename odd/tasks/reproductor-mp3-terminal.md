@@ -502,7 +502,7 @@ de la app por igual cuando no hay ninguna pista cargada (arrancando con
 reproducibles de forma global (no atado al cwd desde donde se invoca el
 comando) y agrupados por la carpeta de origen.
 
-- [ ] T14 — Fix real diagnosticado por el orquestador (no por el agente):
+- [x] T14 — Fix real diagnosticado por el orquestador (no por el agente):
       en `src/config.rs`, la tecla `Tab` está en las listas de atajo tanto
       de `explorer` (abrir panel) como de `back` (volver/cerrar), y en
       `handle_list_key` (ui/mod.rs) se chequea `back` ANTES que `explorer`.
@@ -529,8 +529,51 @@ comando) y agrupados por la carpeta de origen.
       tipo `%USERPROFILE%\Music` cuando no se pasa nada por CLI, en vez de
       escanear el cwd?) y un formato de agrupación en la lista (encabezados
       de carpeta entre los tracks). Ruta: delegada.
+      Implementación: `back` default pasa a ser `[Esc]` únicamente (`explorer`
+      queda `[b, Tab]` sin tocar), así Tab ya no es interceptado por el
+      chequeo de `back` y cae en `toggle_explorer`, que ya no-opeaba
+      correctamente sin player. Nueva sección `[library] roots = [...]` en
+      config.toml, default `%USERPROFILE%\Music` cuando no hay CLI arg ni
+      config (un CLI arg explícito sigue teniendo prioridad, sin cambios).
+      `Track.folder` + `from_dirs_scan` (playlist/mod.rs) arman la vista
+      agrupada; `library_rows` (ui/mod.rs) intercala encabezados de carpeta
+      (título "N carpetas" cuando hay más de una) sin agregar los headers al
+      espacio de índices seleccionables — `app.selected`/`app.view` siguen
+      indexando solo tracks reales, así que la navegación nunca puede
+      aterrizar en un header ni engancharse. Con una sola carpeta de origen
+      sigue rindiendo la lista plana de siempre (sin headers).
+      Evidencia: `cargo build`/`cargo clippy --all-targets -- -D warnings` en
+      0/0, `cargo test` 79/79 (nuevos: colisión back/explorer con Tab dejado
+      en explorer y advertencia por remap del usuario; parseo de `[library]`
+      con roots vacíos/inválidos/inexistentes cayendo a default o
+      advirtiendo sin panic; orden agrupado). Harness E2E 18/18 PASS
+      (regresión completa + nuevo Q: sin argumentos, Tab ya no saca de la
+      app, Esc sigue saliendo — el fix probado en vivo; nuevo R: dos raíces
+      de biblioteca, headers agrupados, navegación salta encabezados hasta
+      llegar a una pista de otro grupo, Enter la reproduce, Tab abre/cierra
+      el panel correctamente sobre la vista agrupada).
+      Revisión de código vía fork (mismo criterio que T5-T7/T13): sin
+      hallazgos de correctitud. Confirmó que el fix de Tab/Esc es completo y
+      no rompe el cierre del panel (Esc y Tab lo cierran por ramas
+      distintas pero con el mismo resultado), que la navegación no puede
+      aterrizar en un header porque los headers no forman parte del espacio
+      de índices seleccionables, y que un root inexistente/vacío no rompe el
+      escaneo (se lista vacío con warning, sin panic). Un hallazgo cosmético
+      de severidad muy baja (glitch de render con una terminal de
+      exactamente 1 fila de alto, ver backlog) no se corrigió por no
+      justificar el esfuerzo frente a lo poco realista del escenario.
+      Orquestador verificó de forma independiente: diff de `config.rs`
+      confirmando `back = [Esc]` exactamente como se pidió, binario
+      recompilado.
 
 ## Backlog de hardening (no bloqueante, detectado en revisiones RDD)
+- `library_rows`/`visible_start` (T14) puede renderizar la lista vacía por
+  un frame si la altura visible del panel es de exactamente 1 fila y la
+  selección cae justo en el primer track de un grupo nuevo (el cálculo de
+  `rows_between` para header+track no entra en 1 fila). Requiere un tamaño
+  de terminal degenerado (ya inutilizable para casi todo lo demás en la
+  app); `app.selected` no se corrompe y un resize de una fila lo arregla
+  solo. No bloqueante, detectado en revisión de código de T14.
 - `AudioEngine::stop()`/`pause()` pueden tardar hasta la duración de un
   `next_packet()` en curso antes de que el hilo decodificador note el cambio de
   estado (src/audio/mod.rs, ver stop() y el chequeo al tope de run_decode). Sin
