@@ -434,6 +434,10 @@ son mejoras sobre trabajo ya aceptado, no correcciones de un defecto.
       `src/visualizer/mod.rs` (el fix de energía de banda y la curva de
       compresión, con test de un seno real confirmando que solo su banda se
       ilumina), arranque limpio con audio real sin stderr ni zombie.
+      RDD: riesgo alto (mismo motivo estructural); usuario eligió "saltear
+      esta vez" (`consent: declined`) — sin registro de revisión nativa.
+      Cobertura de calidad ya obtenida vía build/clippy/test + revisión
+      manual del orquestador línea por línea del diff de visualizer/mod.rs.
 - [ ] T13 — Explorador de archivos como panel lateral togglable con
       Ctrl+Tab (en vez del cambio de pantalla completa actual de T3/T5):
       el reproductor (con visualizador) queda visible de fondo, y Ctrl+Tab
