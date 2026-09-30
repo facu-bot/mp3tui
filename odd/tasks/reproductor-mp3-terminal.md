@@ -571,7 +571,25 @@ comando) y agrupados por la carpeta de origen.
       documentado en el backlog de arriba). Review aprobada y confirmada.
       Boundary revisado avanza a `18bb799`.
 
-## Backlog de hardening (no bloqueante, detectado en revisiones RDD)
+Reabierto de nuevo: el usuario aclaró que "global" en T14 quedó corto — solo
+escaneaba una carpeta default (`Music`), no varias. Pidió que el explorador
+busque en varias carpetas conocidas donde la gente suele guardar audio, más
+las que el usuario agregue. Eligió explícitamente la opción "varias carpetas
+conocidas + las que yo agregue" (no disco completo, no requiere editar TOML
+a mano como único mecanismo).
+
+- [ ] T15 — Biblioteca por defecto multi-carpeta: cuando no hay CLI arg ni
+      `[library] roots` configurado, escanear la UNIÓN de las carpetas
+      conocidas típicas que existan en el sistema (`%USERPROFILE%\Music`,
+      `\Downloads`, `\Desktop`, `\Documents` — saltear silenciosamente las
+      que no existan, sin warning, porque es un default automático, no una
+      config del usuario). Si el usuario SÍ configura `[library] roots`,
+      esas carpetas se agregan a las conocidas (unión, no reemplazo) — así
+      cubre el pedido de "conocidas + las que yo agregue" sin perder la
+      posibilidad de sumar carpetas custom. Un CLI arg explícito sigue
+      teniendo prioridad total sobre todo esto (comportamiento sin cambios).
+      Mantener el agrupado por carpeta de T14 (ahora con más carpetas de
+      origen típicamente, tiene más sentido todavía). Ruta: delegada.
 - `library_rows`/`visible_start` (T14) puede renderizar la lista vacía por
   un frame si la altura visible del panel es de exactamente 1 fila y la
   selección cae justo en el primer track de un grupo nuevo (el cálculo de
