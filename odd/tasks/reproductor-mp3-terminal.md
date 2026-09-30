@@ -203,13 +203,48 @@ Engram esté disponible.
       RDD: riesgo alto (mismo motivo estructural); consentimiento otorgado;
       revisión con 4 lentes, sin findings. Review aprobada y confirmada. Boundary
       revisado avanza a `b57507d`.
-- [ ] T7 — Seek (nueva, pedido del usuario: "adelantar segundos de la cancion"):
+- [x] T7 — Seek (nueva, pedido del usuario: "adelantar segundos de la cancion"):
       extender AudioEngine (T2) para exponer posición/duración de la pista actual y
       un método `seek(Duration)` que reposicione la decodificación con la API de
       seek de symphonia, reseteando el pipeline de resample/ring buffers de forma
-      consistente. En la UI: atajos ←/→ para retroceder/adelantar (propuesta: 5s por
-      paso, ajustable en T9), y una barra de progreso con tiempo transcurrido/total.
-      Ruta: delegada.
+      consistente. En la UI: atajos ←/→ para retroceder/adelantar (5s por paso), y
+      una barra de progreso con tiempo transcurrido/total. Ruta: delegada.
+      Implementación: `position()`/`duration()`/`seek()`/`take_seek_error()` en
+      AudioEngine. El `FormatReader` sigue viviendo en el hilo decodificador (no es
+      Send/Sync-safe compartirlo); la UI deja un pedido de seek en
+      `Mutex<Option<Duration>>`, el decodificador lo aplica en su propio loop
+      (`format.seek` + reset del decoder + reset del `LinearResampler` +
+      vaciado del ring de reproducción vía flag consumer-side + vaciado del tap
+      del visualizador). Barra de progreso `Progreso mm:ss / mm:ss` con fallback
+      cuando el contenedor no reporta duración.
+      Revisión de concurrencia (fork) encontró 2 hallazgos reales, ambos de
+      severidad baja:
+      (a) Ventana de carrera donde un seek pedido justo al terminar la pista podía
+      perderse silenciosamente (decoder_done se marcaba después de que el loop
+      salía sin volver a chequear el pedido). **Corregido**: `seek()` y el cierre
+      de `decode_loop` comparten el mismo lock de `shared.seek`, serializando la
+      carrera — o el pedido queda visible para que el loop lo consuma (incluso en
+      el caso de fin natural, que ahora también chequea el pendiente antes de
+      salir), o `decoder_done` ya está en true y `seek()` lo rechaza con error en
+      vez de perderlo en silencio.
+      (b) El timeout de 250ms para vaciar el ring de reproducción viejo antes de
+      un seek podría, en teoría, dejar pasar un instante de audio mezclado si el
+      callback de audio no corre en esa ventana (stall de driver, muy
+      improbable). **No corregido, documentado como backlog** (comentario en el
+      código en `apply_seek`): un fix real necesitaría un ack del consumer o
+      fallar el seek, más invasivo de lo que vale para un caso de borde que ya
+      implica audio roto por otro motivo.
+      Evidencia: `cargo build`/`cargo clippy --all-targets` en 0/0, `cargo test`
+      48/48 (1 ignorado, requiere device de audio real). Harness E2E 11/11 PASS
+      incluyendo el nuevo escenario K (seek real adelante/atrás/clamp/fin de
+      pista sobre un wav de 12.8s), y fix de D/E que estaban fallando por asserts
+      obsoletos de un log de T5. Se detectó y corrigió además un bug de encoding
+      (mojibake UTF-8/Windows-1252 en los comentarios nuevos de audio/mod.rs,
+      p.ej. "decodificaciÃ³n" en vez de "decodificación") antes de comitear.
+      Orquestador verificó de forma independiente: binario recompilado, arranque
+      limpio con audio real sin stderr ni zombie, lectura directa del código del
+      fix de concurrencia (el lock compartido cierra la ventana de carrera
+      correctamente).
 - [ ] T8 — Velocidad de reproducción variable (nueva, pedido del usuario: "poner en
       una reproducion de velocidad mas rapida o lenta"): extender AudioEngine con un
       multiplicador de velocidad (ej. 0.5x–2.0x) aplicado en el pipeline de resample
@@ -238,6 +273,14 @@ Engram esté disponible.
   pero nunca se limpia a `None` después; un error transitorio queda pegado en
   pantalla aunque luego la reproducción funcione bien. Limpiar en un próximo touch
   de ui/mod.rs (p.ej. al arrancar T4/T5), no bloqueante hoy.
+- `apply_seek` (src/audio/mod.rs, T7) tiene un timeout de 250ms esperando a que
+  el callback de audio vacíe el ring viejo antes de un seek; si el callback no
+  corre en esa ventana (stall de driver, muy improbable), el seek igual empuja
+  muestras nuevas sobre un ring que aún tiene muestras viejas, causando un
+  instante de audio mezclado en vez de un corte limpio. No se corrigió porque el
+  fix real (ack del consumer o fallar el seek) es más invasivo de lo que vale
+  para un caso de borde que ya implica audio roto por otro motivo (documentado
+  en un comentario en el código).
 
 ## Progreso
 - Documento de tareas creado. Repo git inicializado en

@@ -17,7 +17,7 @@ use ratatui::widgets::{Block, Gauge, Paragraph};
 use ratatui::Frame;
 
 use crate::audio::AudioEngine;
-use crate::playback::{filter_tracks, next_track, shuffle_order, RepeatMode};
+use crate::playback::{filter_tracks, next_track, seek_target, shuffle_order, RepeatMode};
 use crate::playlist::{move_selection, scroll_offset, Playlist, Track};
 use crate::visualizer::{SpectrumAnalyzer, NUM_BANDS};
 
@@ -186,6 +186,11 @@ fn event_loop(tui: &mut Tui, app: &mut App, engine: &mut AudioEngine) -> io::Res
         if previous_status == Status::Playing && app.status == Status::Ended {
             handle_natural_end(app, engine);
         }
+        // Un seek fallido en el decodificador se toma una sola vez para
+        // mostrarlo; no corta la reproducción.
+        if let Some(err) = engine.take_seek_error() {
+            app.error = Some(err.to_string());
+        }
         poll_scan(app);
 
         // Lock corto: solo copiar muestras del tap; la FFT corre después, sin lock.
@@ -253,6 +258,8 @@ fn handle_player_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine) {
         KeyCode::Char(' ') => toggle_play(app, engine),
         KeyCode::Up => engine.set_volume((engine.volume() + VOLUME_STEP).clamp(0.0, 1.0)),
         KeyCode::Down => engine.set_volume((engine.volume() - VOLUME_STEP).clamp(0.0, 1.0)),
+        KeyCode::Left => seek_by(app, engine, -1),
+        KeyCode::Right => seek_by(app, engine, 1),
         KeyCode::Char('b') | KeyCode::Char('B') | KeyCode::Tab => enter_browser(app),
         KeyCode::Char('n') | KeyCode::Char('N') => play_step(app, engine, 1),
         KeyCode::Char('p') | KeyCode::Char('P') => play_step(app, engine, -1),
@@ -289,6 +296,8 @@ fn handle_browser_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine) {
         KeyCode::Char('/') => open_search(app),
         KeyCode::Up => app.selected = move_selection(app.selected, -1, view_len),
         KeyCode::Down => app.selected = move_selection(app.selected, 1, view_len),
+        KeyCode::Left => seek_by(app, engine, -1),
+        KeyCode::Right => seek_by(app, engine, 1),
         KeyCode::PageUp => app.selected = move_selection(app.selected, -PAGE_STEP, view_len),
         KeyCode::PageDown => app.selected = move_selection(app.selected, PAGE_STEP, view_len),
         KeyCode::Home => app.selected = move_selection(app.selected, isize::MIN, view_len),
@@ -524,6 +533,29 @@ fn toggle_shuffle(app: &mut App) {
     }
 }
 
+/// ← / →: seek relativo (±5 s) sobre la pista que está sonando. Sin pista en
+/// reproducción no hace nada; el motor valida que haya sesión activa.
+fn seek_by(app: &mut App, engine: &mut AudioEngine, direction: i64) {
+    if !app.has_player {
+        return;
+    }
+    let duration = engine.duration().or_else(|| current_track_duration(app));
+    let target = seek_target(engine.position(), direction, duration);
+    match engine.seek(target) {
+        Ok(()) => app.error = None,
+        Err(err) => app.error = Some(err.to_string()),
+    }
+}
+
+/// Duración declarada en los metadatos de la pista actual (fallback cuando el
+/// contenedor no reporta la suya).
+fn current_track_duration(app: &App) -> Option<Duration> {
+    let path = app.current_path.as_ref()?;
+    let library = app.library.as_ref()?;
+    let index = library.index_of(path)?;
+    library.get(index)?.duration
+}
+
 /// Fin natural de la pista (transición Playing → Ended): decide el repeat
 /// sin esperar que el usuario apriete espacio.
 fn handle_natural_end(app: &mut App, engine: &mut AudioEngine) {
@@ -648,6 +680,7 @@ fn render_player_info(frame: &mut Frame<'_>, area: Rect, app: &App, engine: &Aud
         .constraints([
             Constraint::Length(3),
             Constraint::Length(1),
+            Constraint::Length(1),
             Constraint::Min(0),
         ])
         .split(inner);
@@ -675,6 +708,36 @@ fn render_player_info(frame: &mut Frame<'_>, area: Rect, app: &App, engine: &Aud
             .label(format!("Volumen {percent}%")),
         rows[1],
     );
+
+    frame.render_widget(progress_gauge(app, engine), rows[2]);
+}
+
+/// Barra de progreso de la pista: posición tomada del motor (se recalibra en
+/// cada seek) sobre la duración conocida; con duración desconocida se muestra
+/// la posición sin relleno.
+fn progress_gauge(app: &App, engine: &AudioEngine) -> Gauge<'static> {
+    let position = engine.position();
+    let duration = engine.duration().or_else(|| current_track_duration(app));
+    let label = match duration {
+        Some(total) => format!(
+            "Progreso {} / {}",
+            format_duration(position),
+            format_duration(total)
+        ),
+        None => format!("Progreso {} / —", format_duration(position)),
+    };
+
+    let mut gauge = Gauge::default().label(label);
+    match duration.filter(|total| !total.is_zero()) {
+        Some(total) => {
+            let ratio = position.as_secs_f64() / total.as_secs_f64();
+            gauge = gauge.gauge_style(Style::default().fg(ACCENT)).ratio(ratio.clamp(0.0, 1.0));
+        }
+        None => {
+            gauge = gauge.gauge_style(Style::default().fg(DIM)).ratio(0.0);
+        }
+    }
+    gauge
 }
 
 fn render_browser(frame: &mut Frame<'_>, app: &App) {
@@ -1012,7 +1075,9 @@ fn footer_lines(app: &App) -> Vec<Line<'static>> {
     }
     match app.mode {
         Mode::Player => vec![
-            Line::from(" espacio: play/pausa   flechas ↑/↓: volumen   n/p: pista sig/ant   /: buscar "),
+            Line::from(
+                " espacio: play/pausa   ↑↓: volumen   ←/→: ±5s   n/p: pista sig/ant   /: buscar ",
+            ),
             Line::from(" s: shuffle   r: repeat   b/Tab: biblioteca   q/Esc: salir "),
         ],
         Mode::Browser => vec![
@@ -1020,7 +1085,7 @@ fn footer_lines(app: &App) -> Vec<Line<'static>> {
                 " ↑/↓ PgUp/PgDn: mover   Enter: reproducir   n/p: pista sig/ant   /: buscar ",
             ),
             Line::from(
-                " s: shuffle   r: repeat   espacio: pausa   Esc/Tab: volver   q/Esc: salir ",
+                " s: shuffle   r: repeat   espacio: pausa   ←/→: ±5s   Esc/Tab: volver   q/Esc: salir ",
             ),
         ],
     }
@@ -1389,7 +1454,7 @@ mod tests {
             .map(|line| line_text(line))
             .collect::<Vec<_>>()
             .join("\n");
-        for hint in ["s: shuffle", "r: repeat", "n/p: pista", "/: buscar", "q/Esc: salir"] {
+        for hint in ["s: shuffle", "r: repeat", "n/p: pista", "/: buscar", "q/Esc: salir", "←/→: ±5s"] {
             assert!(player.contains(hint), "footer del player falta '{hint}': {player}");
         }
 
@@ -1399,7 +1464,7 @@ mod tests {
             .map(|line| line_text(line))
             .collect::<Vec<_>>()
             .join("\n");
-        for hint in ["s: shuffle", "r: repeat", "n/p: pista", "/: buscar", "q/Esc: salir"] {
+        for hint in ["s: shuffle", "r: repeat", "n/p: pista", "/: buscar", "q/Esc: salir", "←/→: ±5s"] {
             assert!(browser.contains(hint), "footer del explorador falta '{hint}': {browser}");
         }
 

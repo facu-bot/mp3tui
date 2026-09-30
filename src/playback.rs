@@ -4,7 +4,7 @@
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::playlist::Track;
 
@@ -182,6 +182,24 @@ pub fn filter_tracks(tracks: &[Track], needle: Option<&str>) -> Vec<usize> {
             .filter(|(_, track)| matches_filter(track, needle))
             .map(|(index, _)| index)
             .collect(),
+    }
+}
+
+/// Segundos que avanza o retrocede un seek con ←/→.
+pub const SEEK_STEP_SECS: u64 = 5;
+
+/// Destino de un seek relativo: `position + delta * SEEK_STEP_SECS`, con
+/// saturación en 0 y tope en `duration` cuando se conoce.
+pub fn seek_target(position: Duration, delta: i64, duration: Option<Duration>) -> Duration {
+    let step = Duration::from_secs(delta.unsigned_abs().saturating_mul(SEEK_STEP_SECS));
+    let target = if delta >= 0 {
+        position.checked_add(step).unwrap_or(position)
+    } else {
+        position.checked_sub(step).unwrap_or(Duration::ZERO)
+    };
+    match duration {
+        Some(max) => target.min(max),
+        None => target,
     }
 }
 
@@ -418,5 +436,46 @@ mod tests {
         // Substring literal: "smt" no matchea "smiths" (sin fuzzy matching).
         assert!(!matches_filter(&tracks[1], "smt"));
         assert!(matches_filter(&tracks[1], "the sm"));
+    }
+
+    #[test]
+    fn seek_target_steps_forward_and_backward() {
+        let pos = Duration::from_secs(10);
+        let some = Some(Duration::from_secs(60));
+        assert_eq!(seek_target(pos, 1, some), Duration::from_secs(15));
+        assert_eq!(seek_target(pos, -1, some), Duration::from_secs(5));
+        assert_eq!(seek_target(pos, 3, some), Duration::from_secs(25));
+    }
+
+    #[test]
+    fn seek_target_saturates_at_zero() {
+        let pos = Duration::from_secs(2);
+        assert_eq!(
+            seek_target(pos, -1, None),
+            Duration::ZERO,
+            "retroceso más allá del inicio queda en 0"
+        );
+        assert_eq!(seek_target(Duration::ZERO, -5, None), Duration::ZERO);
+    }
+
+    #[test]
+    fn seek_target_clamps_to_duration() {
+        let pos = Duration::from_secs(10);
+        let duration = Some(Duration::from_secs(12));
+        assert_eq!(
+            seek_target(pos, 1, duration),
+            Duration::from_secs(12),
+            "adelanto tope en la duración"
+        );
+        assert_eq!(
+            seek_target(Duration::from_secs(11), 1, duration),
+            Duration::from_secs(12)
+        );
+    }
+
+    #[test]
+    fn seek_target_without_duration_does_not_clamp() {
+        let pos = Duration::from_secs(10);
+        assert_eq!(seek_target(pos, 1, None), Duration::from_secs(15));
     }
 }
