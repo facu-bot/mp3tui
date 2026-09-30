@@ -16,7 +16,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Gauge, Paragraph};
 use ratatui::Frame;
 
-use crate::audio::AudioEngine;
+use crate::audio::{AudioEngine, SPEED_STEP};
 use crate::playback::{filter_tracks, next_track, seek_target, shuffle_order, RepeatMode};
 use crate::playlist::{move_selection, scroll_offset, Playlist, Track};
 use crate::visualizer::{SpectrumAnalyzer, NUM_BANDS};
@@ -260,6 +260,8 @@ fn handle_player_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine) {
         KeyCode::Down => engine.set_volume((engine.volume() - VOLUME_STEP).clamp(0.0, 1.0)),
         KeyCode::Left => seek_by(app, engine, -1),
         KeyCode::Right => seek_by(app, engine, 1),
+        KeyCode::Char('[') => step_speed(app, engine, -1.0),
+        KeyCode::Char(']') => step_speed(app, engine, 1.0),
         KeyCode::Char('b') | KeyCode::Char('B') | KeyCode::Tab => enter_browser(app),
         KeyCode::Char('n') | KeyCode::Char('N') => play_step(app, engine, 1),
         KeyCode::Char('p') | KeyCode::Char('P') => play_step(app, engine, -1),
@@ -298,6 +300,8 @@ fn handle_browser_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine) {
         KeyCode::Down => app.selected = move_selection(app.selected, 1, view_len),
         KeyCode::Left => seek_by(app, engine, -1),
         KeyCode::Right => seek_by(app, engine, 1),
+        KeyCode::Char('[') => step_speed(app, engine, -1.0),
+        KeyCode::Char(']') => step_speed(app, engine, 1.0),
         KeyCode::PageUp => app.selected = move_selection(app.selected, -PAGE_STEP, view_len),
         KeyCode::PageDown => app.selected = move_selection(app.selected, PAGE_STEP, view_len),
         KeyCode::Home => app.selected = move_selection(app.selected, isize::MIN, view_len),
@@ -547,6 +551,15 @@ fn seek_by(app: &mut App, engine: &mut AudioEngine, direction: i64) {
     }
 }
 
+/// `[` / `]`: baja o sube la velocidad en pasos de 0.25x (0.5x..2.0x). Sin
+/// pista en reproducción no hace nada, igual que el seek.
+fn step_speed(app: &App, engine: &mut AudioEngine, direction: f32) {
+    if !app.has_player {
+        return;
+    }
+    engine.set_speed(engine.speed() + direction * SPEED_STEP);
+}
+
 /// Duración declarada en los metadatos de la pista actual (fallback cuando el
 /// contenedor no reporta la suya).
 fn current_track_duration(app: &App) -> Option<Duration> {
@@ -675,14 +688,21 @@ fn render_player_info(frame: &mut Frame<'_>, area: Rect, app: &App, engine: &Aud
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    // La fila de velocidad aparece solo cuando no es 1.0x: en velocidad
+    // normal el panel conserva su forma y el espacio no muestra ruido.
+    let show_speed = (engine.speed() - 1.0).abs() > f32::EPSILON;
+    let mut constraints = vec![
+        Constraint::Length(3),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ];
+    if show_speed {
+        constraints.push(Constraint::Length(1));
+    }
+    constraints.push(Constraint::Min(0));
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Min(0),
-        ])
+        .constraints(constraints)
         .split(inner);
 
     let file_line = Line::from(vec![
@@ -699,6 +719,12 @@ fn render_player_info(frame: &mut Frame<'_>, area: Rect, app: &App, engine: &Aud
         rows[0],
     );
 
+    let mut row = 1;
+    if show_speed {
+        frame.render_widget(Paragraph::new(speed_line(engine)), rows[row]);
+        row += 1;
+    }
+
     let volume = engine.volume().clamp(0.0, 1.0);
     let percent = (volume * 100.0).round() as u16;
     frame.render_widget(
@@ -706,10 +732,22 @@ fn render_player_info(frame: &mut Frame<'_>, area: Rect, app: &App, engine: &Aud
             .gauge_style(Style::default().fg(ACCENT))
             .ratio(f64::from(volume))
             .label(format!("Volumen {percent}%")),
-        rows[1],
+        rows[row],
     );
 
-    frame.render_widget(progress_gauge(app, engine), rows[2]);
+    frame.render_widget(progress_gauge(app, engine), rows[row + 1]);
+}
+
+/// Fila "Velocidad: 1.25x" del panel de info (solo se renderiza si != 1.0x).
+fn speed_line(engine: &AudioEngine) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("Velocidad: ", Style::default().fg(DIM)),
+        Span::styled(speed_label(engine.speed()), Style::default().fg(ACCENT)),
+    ])
+}
+
+fn speed_label(speed: f32) -> String {
+    format!("{speed:.2}x")
 }
 
 /// Barra de progreso de la pista: posición tomada del motor (se recalibra en
@@ -750,7 +788,7 @@ fn render_browser(frame: &mut Frame<'_>, app: &App) {
                 Constraint::Length(5),
                 Constraint::Min(6),
                 Constraint::Length(6),
-                Constraint::Length(4),
+                Constraint::Length(5),
             ])
             .split(frame.area())
     } else {
@@ -759,7 +797,7 @@ fn render_browser(frame: &mut Frame<'_>, app: &App) {
             .constraints([
                 Constraint::Length(5),
                 Constraint::Min(6),
-                Constraint::Length(4),
+                Constraint::Length(5),
             ])
             .split(frame.area())
     };
@@ -1076,17 +1114,20 @@ fn footer_lines(app: &App) -> Vec<Line<'static>> {
     match app.mode {
         Mode::Player => vec![
             Line::from(
-                " espacio: play/pausa   ↑↓: volumen   ←/→: ±5s   n/p: pista sig/ant   /: buscar ",
+                " espacio: play/pausa   ↑↓: volumen   ←/→: ±5s   n/p: pista sig/ant   /: buscar",
             ),
-            Line::from(" s: shuffle   r: repeat   b/Tab: biblioteca   q/Esc: salir "),
+            Line::from(
+                " s: shuffle   r: repeat   [ ]: vel   b/Tab: biblioteca   q/Esc: salir ",
+            ),
         ],
         Mode::Browser => vec![
             Line::from(
                 " ↑/↓ PgUp/PgDn: mover   Enter: reproducir   n/p: pista sig/ant   /: buscar ",
             ),
             Line::from(
-                " s: shuffle   r: repeat   espacio: pausa   ←/→: ±5s   Esc/Tab: volver   q/Esc: salir ",
+                " espacio: pausa   ←/→: ±5s   [ ]: vel   s: shuffle   r: repeat ",
             ),
+            Line::from(" Esc/Tab: volver   q/Esc: salir "),
         ],
     }
 }
@@ -1454,7 +1495,7 @@ mod tests {
             .map(|line| line_text(line))
             .collect::<Vec<_>>()
             .join("\n");
-        for hint in ["s: shuffle", "r: repeat", "n/p: pista", "/: buscar", "q/Esc: salir", "←/→: ±5s"] {
+        for hint in ["s: shuffle", "r: repeat", "n/p: pista", "/: buscar", "q/Esc: salir", "←/→: ±5s", "[ ]: vel"] {
             assert!(player.contains(hint), "footer del player falta '{hint}': {player}");
         }
 
@@ -1464,8 +1505,22 @@ mod tests {
             .map(|line| line_text(line))
             .collect::<Vec<_>>()
             .join("\n");
-        for hint in ["s: shuffle", "r: repeat", "n/p: pista", "/: buscar", "q/Esc: salir", "←/→: ±5s"] {
+        for hint in ["s: shuffle", "r: repeat", "n/p: pista", "/: buscar", "q/Esc: salir", "←/→: ±5s", "[ ]: vel"] {
             assert!(browser.contains(hint), "footer del explorador falta '{hint}': {browser}");
+        }
+
+        // Ninguna línea del pie puede exceder el ancho útil (78): si no, se
+        // trunca en pantalla.
+        for mode in [Mode::Player, Mode::Browser] {
+            app.mode = mode;
+            for line in footer_lines(&app) {
+                assert!(
+                    line_width(&line) <= 78,
+                    "línea del pie demasiado ancha ({}): {}",
+                    line_width(&line),
+                    line_text(&line)
+                );
+            }
         }
 
         app.search = Some(String::new());
@@ -1476,6 +1531,13 @@ mod tests {
             .join("\n");
         assert!(search.contains("Backspace"));
         assert!(search.contains("Esc: cancelar"));
+    }
+
+    #[test]
+    fn speed_label_shows_two_decimals_with_x() {
+        assert_eq!(speed_label(1.25), "1.25x");
+        assert_eq!(speed_label(0.75), "0.75x");
+        assert_eq!(speed_label(2.0), "2.00x");
     }
 
     #[test]

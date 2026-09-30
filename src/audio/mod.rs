@@ -34,6 +34,21 @@ const TAP_BUF_SAMPLES: usize = 1 << 13;
 /// Espera máxima, al aplicar un seek, a que el callback vacíe el ring viejo.
 const SEEK_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 
+/// Velocidad de reproducción (T8): multiplicador sobre el paso del resampler,
+/// en pasos de 0.25 entre 0.5x y 2.0x.
+pub const SPEED_MIN: f32 = 0.5;
+pub const SPEED_MAX: f32 = 2.0;
+pub const SPEED_STEP: f32 = 0.25;
+
+/// Velocidad válida. Un valor no finito (NaN) volvería el paso del resampler
+/// a NaN y el loop de `process` dejaría de avanzar: se sanea a 1.0.
+fn clamp_speed(speed: f32) -> f32 {
+    if !speed.is_finite() {
+        return 1.0;
+    }
+    speed.clamp(SPEED_MIN, SPEED_MAX)
+}
+
 #[derive(Debug)]
 pub enum AudioError {
     NoOutputDevice,
@@ -120,6 +135,9 @@ struct Shared {
     decoder_done: AtomicBool,
     finished: AtomicBool,
     volume: AtomicU32,
+    /// Velocidad (f32 en bits): estado idempotente que lee el hilo
+    /// decodificador en cada ciclo, igual que `volume`.
+    speed: AtomicU32,
     error: Mutex<Option<AudioError>>,
     /// Seek pedido desde la UI, tomado por el hilo decodificador en su loop.
     seek: Mutex<Option<Duration>>,
@@ -165,6 +183,7 @@ impl AudioEngine {
                 decoder_done: AtomicBool::new(true),
                 finished: AtomicBool::new(true),
                 volume: AtomicU32::new(1.0f32.to_bits()),
+                speed: AtomicU32::new(1.0f32.to_bits()),
                 error: Mutex::new(None),
                 seek: Mutex::new(None),
                 seek_error: Mutex::new(None),
@@ -314,6 +333,24 @@ impl AudioEngine {
         self.shared
             .volume
             .store(volume.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Velocidad de reproducción vigente (1.0 = normal), en `[SPEED_MIN, SPEED_MAX]`.
+    pub fn speed(&self) -> f32 {
+        f32::from_bits(self.shared.speed.load(Ordering::Acquire))
+    }
+
+    /// Pide cambiar la velocidad: el hilo decodificador la aplica sobre su
+    /// resampler en el próximo ciclo (misma arquitectura de pedido que el
+    /// seek). A diferencia del seek, la velocidad es estado idempotente y no
+    /// un evento único, así que no necesita lock: cambiarla al mismo tiempo
+    /// que un seek no puede perderse ni dejar el pipeline inconsistente —
+    /// `apply_seek` resetea fracción/buffer del resampler y el próximo ciclo
+    /// vuelve a setear la velocidad vigente.
+    pub fn set_speed(&mut self, speed: f32) {
+        self.shared
+            .speed
+            .store(clamp_speed(speed).to_bits(), Ordering::Release);
     }
 
     /// Tiempo transcurrido de la pista actual, contado sobre los frames que ya
@@ -478,9 +515,15 @@ where
         let frames = data.len() / channels;
         // Lo que sale al device marca el tiempo transcurrido (no lo que el
         // decoder ya encoló): así position() es fiel a lo que se escucha.
+        // Con velocidad != 1 se cuenta en frames de CONTENIDO de la pista
+        // (frames * speed): a 2x, 10 s reales consumen 20 s de pista, y tanto
+        // la barra como los seeks trabajan en esa misma unidad (duration()
+        // también es contenido).
+        let speed = f64::from(f32::from_bits(shared.speed.load(Ordering::Relaxed)));
+        let counted = (frames as f64 * speed).round() as u64;
         shared
             .played_frames
-            .fetch_add(frames as u64, Ordering::Relaxed);
+            .fetch_add(counted, Ordering::Relaxed);
         mono.resize(frames, 0.0);
         for (frame_index, frame) in scratch.chunks_exact(channels).enumerate() {
             mono[frame_index] = frame.iter().sum::<f32>() / channels as f32;
@@ -719,6 +762,20 @@ fn run_decode(
             ));
         }
 
+        // Velocidad variable (T8): la UI escribe `shared.speed` y se aplica
+        // acá, en el hilo dueño del resampler. Si la velocidad es != 1 pero
+        // src == device no había resampler (rate matching era identidad), se
+        // crea con paso base 1.0 para poder aplicar el multiplicador igual.
+        let speed = f32::from_bits(shared.speed.load(Ordering::Acquire));
+        if let Some(state) = pipeline.as_mut() {
+            if state.resampler.is_none() && (speed - 1.0).abs() > f32::EPSILON {
+                state.resampler = Some(LinearResampler::new(src_rate, dev_rate, dev_channels));
+            }
+            if let Some(resampler) = state.resampler.as_mut() {
+                resampler.set_speed(speed);
+            }
+        }
+
         map_channels(&scratch, src_channels, dev_channels, &mut mapped);
 
         let output: &[f32] = match pipeline.as_mut().and_then(|p| p.resampler.as_mut()) {
@@ -765,7 +822,11 @@ impl PipelineState {
 }
 
 struct LinearResampler {
-    step: f64,
+    /// Paso base del rate matching (src_rate / dst_rate). El paso efectivo
+    /// es `step_base * speed`.
+    step_base: f64,
+    /// Multiplicador de velocidad (T8), clampeado a `[SPEED_MIN, SPEED_MAX]`.
+    speed: f32,
     frac: f64,
     channels: usize,
     buf: Vec<f32>,
@@ -774,11 +835,22 @@ struct LinearResampler {
 impl LinearResampler {
     fn new(src_rate: u32, dst_rate: u32, channels: usize) -> Self {
         Self {
-            step: src_rate as f64 / dst_rate as f64,
+            step_base: src_rate as f64 / dst_rate as f64,
+            speed: 1.0,
             frac: 0.0,
             channels,
             buf: Vec::new(),
         }
+    }
+
+    /// La velocidad multiplica el paso: a 2.0x se consumen ~2 muestras de
+    /// entrada por cada muestra de salida (reproduce más rápido sin tocar el
+    /// sample rate del device). Es resampling simple, NO time-stretching:
+    /// cambia el pitch proporcionalmente (a 2.0x suena una octava arriba) —
+    /// limitación conocida y aceptada del diseño, igual que la del drain
+    /// timeout del seek.
+    fn set_speed(&mut self, speed: f32) {
+        self.speed = clamp_speed(speed);
     }
 
     fn process(&mut self, input: &[f32], out: &mut Vec<f32>) {
@@ -786,6 +858,7 @@ impl LinearResampler {
         out.clear();
 
         let channels = self.channels;
+        let step = self.step_base * f64::from(self.speed);
         let n_frames = self.buf.len() / channels;
         let mut index = 0usize;
 
@@ -805,7 +878,7 @@ impl LinearResampler {
                 let b = s1[channel];
                 out.push(a + (b - a) * self.frac as f32);
             }
-            self.frac += self.step;
+            self.frac += step;
         }
 
         self.buf.drain(..index * channels);
@@ -1059,5 +1132,115 @@ mod tests {
         engine.stop();
         assert!(after >= Duration::from_secs(5) && after < Duration::new(5, 500_000_000));
         assert!(later >= Duration::from_secs(5) && later < Duration::new(5, 700_000_000));
+    }
+
+    #[test]
+    fn clamp_speed_bounds_and_default() {
+        assert_eq!(clamp_speed(1.0), 1.0);
+        assert_eq!(clamp_speed(1.25), 1.25);
+        assert_eq!(clamp_speed(SPEED_MIN), 0.5);
+        assert_eq!(clamp_speed(0.1), 0.5, "por debajo del mínimo se acota");
+        assert_eq!(clamp_speed(3.0), 2.0, "por encima del máximo se acota");
+        assert_eq!(clamp_speed(f32::NAN), 1.0, "NaN vuelve a la velocidad normal");
+        assert_eq!(clamp_speed(f32::INFINITY), 1.0, "no finito = velocidad normal");
+        assert_eq!(clamp_speed(f32::NEG_INFINITY), 1.0);
+    }
+
+    /// Con src == dst el paso base es 1.0: la velocidad controla cuánto
+    /// consumo de entrada por muestra de salida (y viceversa en la salida).
+    #[test]
+    fn resampler_speed_controls_input_consumption() {
+        let input: Vec<f32> = (0..2000).map(|i| i as f32).collect();
+
+        let mut at_one = LinearResampler::new(48_000, 48_000, 1);
+        let mut out_one = Vec::new();
+        at_one.process(&input, &mut out_one);
+        let base = out_one.len();
+        assert!(base >= 1990, "a 1.0x la salida ~= entrada (obtenido {base})");
+
+        // 2.0x: paso 2 -> ~2 muestras de entrada consumidas por salida:
+        // la mitad de muestras de salida para la misma entrada.
+        let mut at_two = LinearResampler::new(48_000, 48_000, 1);
+        at_two.set_speed(2.0);
+        let mut out_two = Vec::new();
+        at_two.process(&input, &mut out_two);
+        let half = base / 2;
+        assert!(
+            out_two.len() >= half - 4 && out_two.len() <= half + 4,
+            "a 2.0x la salida ~= mitad: base={base} dos={}",
+            out_two.len()
+        );
+
+        // 0.5x: paso 0.5 -> el doble de muestras de salida.
+        let mut at_half = LinearResampler::new(48_000, 48_000, 1);
+        at_half.set_speed(0.5);
+        let mut out_half = Vec::new();
+        at_half.process(&input, &mut out_half);
+        assert!(
+            out_half.len() >= base * 2 - 4 && out_half.len() <= base * 2 + 4,
+            "a 0.5x la salida ~= doble: base={base} half={}",
+            out_half.len()
+        );
+
+        // Defensa en profundidad: el clampeo llega también al resampler.
+        let mut clamped = LinearResampler::new(48_000, 48_000, 1);
+        clamped.set_speed(5.0);
+        assert_eq!(clamped.speed, SPEED_MAX);
+        clamped.set_speed(f32::NAN);
+        assert_eq!(clamped.speed, 1.0);
+    }
+
+    /// Interacción seek + velocidad: el reset del seek (fracción y buffer)
+    /// no debe tocar la velocidad, y el próximo proceso la sigue aplicando.
+    #[test]
+    fn speed_survives_seek_reset() {
+        let mut out = Vec::new();
+        let input: Vec<f32> = (0..512).map(|i| (i as f32 / 32.0).sin()).collect();
+
+        let mut resampler = LinearResampler::new(44_100, 44_100, 1);
+        resampler.set_speed(1.5);
+        resampler.process(&input, &mut out);
+        let produced_with_speed = out.len();
+
+        resampler.reset(); // lo que hace apply_seek
+        assert_eq!(resampler.speed, 1.5, "reset() no debe tocar la velocidad");
+        assert_eq!(resampler.frac, 0.0);
+        resampler.process(&input, &mut out);
+        assert_eq!(out.len(), produced_with_speed, "con la misma velocidad y entrada, igual de salida");
+    }
+
+    /// Duración real con velocidad 2.0x (requiere device): la pista de
+    /// ~12.8 s debe terminar en ~6.4 s. `cargo test speed_two -- --ignored --nocapture`
+    #[test]
+    #[ignore = "requiere device de audio y un wav de prueba"]
+    fn speed_two_x_halves_wall_clock_duration() {
+        let path = Path::new(
+            r"C:\Users\facu\AppData\Local\Temp\opencode\test_music\sub\Cancion Delta.wav",
+        );
+        if !path.exists() {
+            eprintln!("skip: no existe {}", path.display());
+            return;
+        }
+        let mut engine = AudioEngine::new().expect("device de audio");
+        engine.play(path).expect("play");
+        let total = engine.duration().expect("duración conocida");
+        engine.set_speed(2.0);
+        assert_eq!(engine.speed(), 2.0);
+
+        let started = Instant::now();
+        while engine.is_playing() && started.elapsed() < total {
+            thread::sleep(Duration::from_millis(50));
+        }
+        let elapsed = started.elapsed();
+        engine.stop();
+        println!("total={total:?} elapsed={elapsed:?} (esperado ~mitad)");
+
+        let half = total / 2;
+        // Tolerancias amplias: arranque del decoder y fin por drenaje del ring.
+        assert!(
+            elapsed >= half.saturating_sub(Duration::from_secs(1))
+                && elapsed <= half + Duration::from_secs(2),
+            "a 2.0x debería durar ~{half:?} (obtenido {elapsed:?}, total {total:?})"
+        );
     }
 }

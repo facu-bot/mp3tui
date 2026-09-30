@@ -250,13 +250,35 @@ Engram esté disponible.
       review-resilience (el mismo timeout de drain de (b), ya documentado en
       código y en el backlog de este archivo). Review aprobada y confirmada.
       Boundary revisado avanza a `4db9ac0`.
-- [ ] T8 — Velocidad de reproducción variable (nueva, pedido del usuario: "poner en
+- [x] T8 — Velocidad de reproducción variable (nueva, pedido del usuario: "poner en
       una reproducion de velocidad mas rapida o lenta"): extender AudioEngine con un
-      multiplicador de velocidad (ej. 0.5x–2.0x) aplicado en el pipeline de resample
-      ya existente (T2), sin distorsionar el pitch más de lo esperable para un
-      resampler simple (documentar la limitación si no se hace pitch-correction).
-      En la UI: atajos para subir/bajar velocidad (propuesta: `[`/`]`) y mostrar la
-      velocidad actual. Ruta: delegada.
+      multiplicador de velocidad (0.5x–2.0x, pasos de 0.25x) aplicado en el pipeline
+      de resample ya existente (T2), sin distorsionar el pitch más de lo esperable
+      para un resampler simple (documentado como limitación conocida: no es
+      time-stretching, el pitch varía proporcional a la velocidad). En la UI:
+      atajos `[`/`]` y velocidad actual en el panel de info. Ruta: delegada.
+      Implementación: `shared.speed` es un `AtomicU32` (bit-cast de f32), igual
+      patrón que `volume` — no una cola de pedidos como el seek de T7, porque la
+      velocidad es estado continuo idempotente, no un evento de una sola vez que
+      se pueda "perder". El hilo decodificador relee `shared.speed` y llama
+      `resampler.set_speed(...)` en cada iteración (paquete decodificado), así que
+      aunque un seek reconstruya el resampler con su default de 1.0x, se
+      reaplica la velocidad vigente antes del próximo resample — sin necesidad de
+      sincronizar con el mecanismo de seek. Cambiar velocidad no vacía buffers
+      (a diferencia del seek): solo cambia la tasa de consumo futura, no salta de
+      posición, así que no hay glitch que evitar ahí. `clamp_speed` sanea
+      NaN/±Infinity a 1.0 antes de cada store.
+      Evidencia: `cargo build`/`cargo clippy --all-targets` en 0/0, `cargo test`
+      52/52 (4 nuevos: clamp de velocidad, consumo de muestras del resampler a
+      2x/0.5x, que la velocidad sobrevive un reset de seek, label de velocidad).
+      Harness E2E 12/12 PASS (nuevo escenario L: fila oculta a 1.00x, `]`×3 →
+      1.75x, `[` → 1.50x, clamp en ambos extremos). Verificado con audio real:
+      un segmento de 12.84s sonó en 6.45s a 2.0x (esperado 6.42s, error 30ms).
+      Revisión de concurrencia (fork, tercera pasada del mismo tipo que T5-T7):
+      sin hallazgos — confirmó que la reaplicación por-paquete de la velocidad
+      hace la interacción con seek libre de carreras por diseño, no por
+      casualidad, y que no hay panics posibles por NaN/overflow en la conversión
+      de velocidad a frames.
 - [ ] T9 — Config y temas vía TOML (colores del visualizador, keybindings, incluyendo
       los nuevos de T7/T8). Reforzado por pedido del usuario: el tema por defecto
       debe verse pulido y atractivo (paleta coherente, no colores por defecto sin
