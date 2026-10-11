@@ -153,16 +153,15 @@ impl StreamProducer {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum ChunkStatus {
+#[derive(Clone, Debug)]
+enum ChunkSlot {
     Missing,
     Downloading,
-    Done,
+    Done(Vec<u8>),
 }
 
 struct RangedState {
-    data: Vec<u8>,
-    chunks: Vec<ChunkStatus>,
+    chunks: Vec<ChunkSlot>,
     wanted_offset: Option<u64>,
     error: Option<String>,
 }
@@ -282,21 +281,21 @@ fn read_ranged(shared: &RangedShared, pos: &mut u64, buf: &mut [u8]) -> io::Resu
             return Err(io::Error::other(err.clone()));
         }
 
-        if chunk_idx < state.chunks.len() && state.chunks[chunk_idx] == ChunkStatus::Done {
-            let chunk_end =
-                ((chunk_idx as u64 + 1) * shared.chunk_size as u64).min(shared.total_len);
-            let avail = (chunk_end - *pos) as usize;
-            let to_copy = avail.min(buf.len());
-            let start = *pos as usize;
-            buf[..to_copy].copy_from_slice(&state.data[start..start + to_copy]);
-            *pos += to_copy as u64;
+        if chunk_idx < state.chunks.len() && let ChunkSlot::Done(chunk_data) = &state.chunks[chunk_idx] {
+            let offset_in_chunk = (*pos - chunk_idx as u64 * shared.chunk_size as u64) as usize;
+            if offset_in_chunk < chunk_data.len() {
+                let avail = chunk_data.len() - offset_in_chunk;
+                let to_copy = avail.min(buf.len());
+                buf[..to_copy].copy_from_slice(&chunk_data[offset_in_chunk..offset_in_chunk + to_copy]);
+                *pos += to_copy as u64;
 
-            if *pos < shared.total_len {
-                state.wanted_offset = Some(*pos);
-                shared.condvar.notify_all();
+                if *pos < shared.total_len {
+                    state.wanted_offset = Some(*pos);
+                    shared.condvar.notify_all();
+                }
+
+                return Ok(to_copy);
             }
-
-            return Ok(to_copy);
         }
 
         state.wanted_offset = Some(*pos);
@@ -432,6 +431,7 @@ impl Default for HttpTimeouts {
 }
 
 pub const DEFAULT_CHUNK_SIZE: usize = 1024 * 1024; // 1 MiB
+pub const MAX_RANGED_TOTAL: u64 = 512 * 1024 * 1024; // 512 MiB
 
 pub(crate) fn parse_content_range_total(header: &str) -> Option<u64> {
     let s = header.trim();
@@ -492,8 +492,17 @@ fn fetch_range(
         return Err(RangeFetchError::HttpStatus(status, reason.to_string()));
     }
 
+    if let Some(cr) = response.headers().get("content-range").and_then(|v| v.to_str().ok())
+        && !cr.trim_start().to_ascii_lowercase().starts_with("bytes ")
+    {
+        return Err(RangeFetchError::Transient("Content-Range inválido".to_string()));
+    }
+
     let mut body_reader = response.into_body().into_reader();
-    let mut buf = Vec::with_capacity(expected_len);
+    let mut buf = Vec::new();
+    if buf.try_reserve(expected_len).is_err() {
+        return Err(RangeFetchError::Transient("fallo de asignación".to_string()));
+    }
     let mut chunk = [0u8; 16384];
 
     while buf.len() < expected_len {
@@ -523,7 +532,7 @@ fn fetch_range(
             "rango HTTP incompleto (EOF prematuro)".to_string(),
         ));
     }
-
+    buf.truncate(expected_len);
     Ok(buf)
 }
 
@@ -552,7 +561,7 @@ fn run_ranged_downloader(
                     return;
                 }
 
-                let all_done = state.chunks.iter().all(|c| *c == ChunkStatus::Done);
+                let all_done = state.chunks.iter().all(|c| matches!(c, ChunkSlot::Done(_)));
                 if all_done {
                     return;
                 }
@@ -560,7 +569,7 @@ fn run_ranged_downloader(
                 let candidate = if let Some(wanted_pos) = state.wanted_offset {
                     let wanted_chunk = (wanted_pos / shared.chunk_size as u64) as usize;
                     if wanted_chunk < state.chunks.len()
-                        && state.chunks[wanted_chunk] == ChunkStatus::Missing
+                        && matches!(state.chunks[wanted_chunk], ChunkSlot::Missing)
                     {
                         Some(wanted_chunk)
                     } else {
@@ -571,10 +580,10 @@ fn run_ranged_downloader(
                 };
 
                 let next_chunk = candidate
-                    .or_else(|| state.chunks.iter().position(|c| *c == ChunkStatus::Missing));
+                    .or_else(|| state.chunks.iter().position(|c| matches!(c, ChunkSlot::Missing)));
 
                 if let Some(idx) = next_chunk {
-                    state.chunks[idx] = ChunkStatus::Downloading;
+                    state.chunks[idx] = ChunkSlot::Downloading;
                     let start = idx as u64 * shared.chunk_size as u64;
                     let end =
                         ((idx as u64 + 1) * shared.chunk_size as u64).min(shared.total_len);
@@ -604,12 +613,7 @@ fn run_ranged_downloader(
                 retries_for_chunk = 0;
                 last_failed_chunk = None;
                 if let Ok(mut state) = shared.state.lock() {
-                    let start = range_start as usize;
-                    let end = start + bytes.len();
-                    if end <= state.data.len() {
-                        state.data[start..end].copy_from_slice(&bytes);
-                    }
-                    state.chunks[chunk_idx] = ChunkStatus::Done;
+                    state.chunks[chunk_idx] = ChunkSlot::Done(bytes);
                     shared.condvar.notify_all();
                 }
             }
@@ -619,7 +623,7 @@ fn run_ranged_downloader(
             Err(RangeFetchError::HttpStatus(code, msg)) => {
                 if let Ok(mut state) = shared.state.lock() {
                     state.error = Some(format!("servidor HTTP respondió {code}: {msg}"));
-                    state.chunks[chunk_idx] = ChunkStatus::Missing;
+                    state.chunks[chunk_idx] = ChunkSlot::Missing;
                     shared.condvar.notify_all();
                 }
                 break;
@@ -638,13 +642,13 @@ fn run_ranged_downloader(
                         state.error = Some(format!(
                             "error de conexión HTTP tras {retries} intentos: {msg}"
                         ));
-                        state.chunks[chunk_idx] = ChunkStatus::Missing;
+                        state.chunks[chunk_idx] = ChunkSlot::Missing;
                         shared.condvar.notify_all();
                     }
                     break;
                 } else {
                     if let Ok(mut state) = shared.state.lock() {
-                        state.chunks[chunk_idx] = ChunkStatus::Missing;
+                        state.chunks[chunk_idx] = ChunkSlot::Missing;
                         shared.condvar.notify_all();
                     }
                     thread::sleep(Duration::from_millis(50));
@@ -722,13 +726,22 @@ pub(crate) fn open_with_params(
     };
 
     if status == 206 && let Some(total_len) = range_total && total_len > 0 {
+        if total_len > MAX_RANGED_TOTAL || usize::try_from(total_len).is_err() {
+            return Err(StreamError::Io(format!(
+                "tamaño Content-Range ({total_len} bytes) excede el máximo permitido ({MAX_RANGED_TOTAL} bytes)"
+            )));
+        }
+
         let info = StreamInfo {
             content_type,
             content_length: Some(total_len),
         };
 
         let expected_first_chunk = (chunk_size as u64).min(total_len) as usize;
-        let mut initial_chunk = Vec::with_capacity(expected_first_chunk);
+        let mut initial_chunk = Vec::new();
+        if initial_chunk.try_reserve(expected_first_chunk).is_err() {
+            return Err(StreamError::Io("fallo de asignación para fragmento inicial".to_string()));
+        }
         let mut body_reader = response.into_body().into_reader();
         while initial_chunk.len() < expected_first_chunk {
             let mut buf = [0u8; 16384];
@@ -744,25 +757,21 @@ pub(crate) fn open_with_params(
             return Err(StreamError::Io("primer fragmento HTTP incompleto".to_string()));
         }
 
-        let mut data = vec![0u8; total_len as usize];
-        data[..expected_first_chunk].copy_from_slice(&initial_chunk[..expected_first_chunk]);
-
         let num_chunks = if chunk_size > 0 {
             total_len.div_ceil(chunk_size as u64) as usize
         } else {
             0
         };
 
-        let mut chunks = vec![ChunkStatus::Missing; num_chunks];
+        let mut chunks = vec![ChunkSlot::Missing; num_chunks];
         if num_chunks > 0 {
-            chunks[0] = ChunkStatus::Done;
+            chunks[0] = ChunkSlot::Done(initial_chunk);
         }
 
         let canceled = Arc::new(AtomicBool::new(false));
         let condvar = Arc::new(Condvar::new());
         let shared = Arc::new(RangedShared {
             state: Mutex::new(RangedState {
-                data,
                 chunks,
                 wanted_offset: None,
                 error: None,
@@ -1513,5 +1522,31 @@ mod tests {
             elapsed
         );
         assert_eq!(res.unwrap_err().kind(), io::ErrorKind::ConnectionAborted);
+    }
+
+    #[test]
+    fn test_huge_content_range_rejected_without_panic_or_abort() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut req_buf = [0u8; 1024];
+            let _ = socket.read(&mut req_buf);
+
+            let body = b"0123456789abcdef"; // 16 bytes
+            let response = "HTTP/1.1 206 Partial Content\r\nContent-Type: audio/mp4\r\nContent-Range: bytes 0-15/18446744073709551000\r\nContent-Length: 16\r\nConnection: close\r\n\r\n";
+            let _ = socket.write_all(response.as_bytes());
+            let _ = socket.write_all(body);
+        });
+
+        let url = format!("http://127.0.0.1:{port}/huge.mp3");
+        let res = open_with_params(&url, HttpTimeouts::default(), 16);
+        match res {
+            Err(StreamError::Io(msg)) => {
+                assert!(msg.contains("excede el máximo"), "esperaba mensaje de límite: {msg}");
+            }
+            other => panic!("esperaba Err(StreamError::Io) por tamaño excesivo, pero dio: {other:?}"),
+        }
     }
 }
