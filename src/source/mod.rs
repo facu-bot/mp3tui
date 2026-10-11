@@ -44,14 +44,28 @@ pub enum ContentKind {
     Other,
 }
 
+pub(crate) const SCHEME_HTTP: &str = "http://";
+pub(crate) const SCHEME_HTTPS: &str = "https://";
+
 /// Compara si `s` comienza con `prefix` ignorando mayúsculas/minúsculas ASCII, sin panickear en límites UTF-8.
-fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
+pub(crate) fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
     let s_bytes = s.as_bytes();
     let prefix_bytes = prefix.as_bytes();
     if s_bytes.len() < prefix_bytes.len() {
         return false;
     }
     s_bytes[..prefix_bytes.len()].eq_ignore_ascii_case(prefix_bytes)
+}
+
+/// Detecta si `s` comienza con `http://` o `https://` y retorna la longitud del prefijo derivado de literales, o `None`.
+pub(crate) fn http_scheme_len(s: &str) -> Option<usize> {
+    if starts_with_ignore_ascii_case(s, SCHEME_HTTP) {
+        Some(SCHEME_HTTP.len())
+    } else if starts_with_ignore_ascii_case(s, SCHEME_HTTPS) {
+        Some(SCHEME_HTTPS.len())
+    } else {
+        None
+    }
 }
 
 /// Helper que determina si un host corresponde a una página web de un servicio conocido.
@@ -71,13 +85,11 @@ fn is_page_host(host: &str) -> bool {
 /// Clasifica una entrada de usuario como ruta local o URL remota.
 pub fn classify(input: &str) -> Input {
     let trimmed = input.trim();
-    let scheme_len = if starts_with_ignore_ascii_case(trimmed, "http://") {
-        7
-    } else if starts_with_ignore_ascii_case(trimmed, "https://") {
-        8
-    } else {
-        return Input::Local(PathBuf::from(trimmed));
+    let scheme_len = match http_scheme_len(trimmed) {
+        Some(len) => len,
+        None => return Input::Local(PathBuf::from(trimmed)),
     };
+
 
 
     let rest = &trimmed[scheme_len..];
