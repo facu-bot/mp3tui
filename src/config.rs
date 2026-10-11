@@ -368,6 +368,8 @@ pub struct Keys {
     /// player en pantalla completa, sale de la app. Solo `Esc` por defecto
     /// (T14): `Tab` vive en `explorer` y acá salía de la app sin player.
     pub back: Vec<KeyCode>,
+    /// Abrir prompt para reproducir URL (T6): por defecto 'u'.
+    pub open_url: Vec<KeyCode>,
 }
 
 impl Default for Keys {
@@ -398,6 +400,7 @@ impl Default for Keys {
             end: keys(&[KeyCode::End]),
             select: keys(&[KeyCode::Enter]),
             back: keys(&[KeyCode::Esc]),
+            open_url: keys(&[KeyCode::Char('u')]),
         }
     }
 }
@@ -420,6 +423,7 @@ fn parse_keybindings(
             "shuffle" => &mut keys.shuffle,
             "repeat" => &mut keys.repeat,
             "search" => &mut keys.search,
+            "open_url" => &mut keys.open_url,
             "speed_up" => &mut keys.speed_up,
             "speed_down" => &mut keys.speed_down,
             "explorer" => &mut keys.explorer,
@@ -508,6 +512,7 @@ fn resolve_key_collisions(keys: &mut Keys, warnings: &mut Vec<String>) {
         ("shuffle", &mut keys.shuffle, &defaults.shuffle),
         ("repeat", &mut keys.repeat, &defaults.repeat),
         ("search", &mut keys.search, &defaults.search),
+        ("open_url", &mut keys.open_url, &defaults.open_url),
         ("move_up", &mut keys.move_up, &defaults.move_up),
         ("move_down", &mut keys.move_down, &defaults.move_down),
         ("page_up", &mut keys.page_up, &defaults.page_up),
@@ -1198,5 +1203,36 @@ mod tests {
         assert_eq!(key_labels(&[KeyCode::Char('['), KeyCode::Char(']')]), "[/]");
         assert_eq!(key_labels(&[KeyCode::Up]), "↑");
         assert_eq!(key_labels(&[KeyCode::Char('b'), KeyCode::Tab]), "b/Tab");
+    }
+
+    #[test]
+    fn test_open_url_default_and_parse() {
+        // Default debe ser 'u'
+        assert_eq!(Keys::default().open_url, vec![KeyCode::Char('u')]);
+
+        // Parseo desde TOML
+        let config = parse(
+            r#"
+            [keybindings]
+            open_url = "U"
+            "#,
+        );
+        assert_eq!(config.keys.open_url, vec![KeyCode::Char('U')]);
+        assert!(config.warnings.is_empty(), "warnings: {:?}", config.warnings);
+    }
+
+    #[test]
+    fn test_open_url_collision_resolves_predictably() {
+        let config = parse(
+            r#"
+            [keybindings]
+            shuffle = "u"
+            open_url = "u"
+            "#,
+        );
+        // shuffle va antes en dispatch de prioridad; open_url pierde 'u' y vuelve al default si está libre
+        assert_eq!(config.warnings.len(), 1, "warnings: {:?}", config.warnings);
+        assert!(config.warnings[0].contains("open_url"), "{:?}", config.warnings);
+        assert!(config.warnings[0].contains("shuffle"), "{:?}", config.warnings);
     }
 }

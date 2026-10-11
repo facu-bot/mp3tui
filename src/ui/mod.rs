@@ -16,7 +16,7 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, Ke
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph};
+use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::audio::{AudioEngine, SPEED_STEP};
@@ -43,23 +43,130 @@ const CURSOR: &str = "\u{258c}"; // ▌ fila seleccionada
 const PLAYING: &str = "\u{25b6}"; // ▶ pista en reproducción
 const SEARCH_CARET: &str = "\u{258f}"; // ▏ cursor de texto en modo búsqueda
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Status {
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Status {
     Playing,
     Paused,
     Ended,
     /// No suena y además falló (apertura, decode o device): distinto de
     /// `Ended`, que es la pista que llegó a su fin natural.
     Stopped,
+    /// Resolviendo URL de página con yt-dlp en segundo plano.
+    Resolving,
+    /// Conectando a URL de audio remota en segundo plano.
+    Connecting,
 }
 
 /// Cómo arranca la TUI según el argumento de CLI.
 pub enum StartMode {
     /// Archivo por CLI: reproducción directa (comportamiento original).
     PlayFile(PathBuf),
+    /// URL por CLI: conexión/resolución directa en background con biblioteca scan_roots.
+    PlayUrl {
+        url: String,
+        kind: crate::source::UrlKind,
+        roots: Vec<PathBuf>,
+    },
     /// Sin argumento (T15: carpetas conocidas + `[library]` roots) o con
     /// carpeta: explorador de la biblioteca, agrupado por carpeta de origen.
     Browse(Vec<PathBuf>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubmitAction {
+    Local(PathBuf),
+    DirectAudio(String),
+    Page(String),
+    Unknown(String),
+    Empty,
+}
+
+pub fn classify_submit_input(input: &str) -> SubmitAction {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return SubmitAction::Empty;
+    }
+    match crate::source::classify(trimmed) {
+        crate::source::Input::Local(path) => SubmitAction::Local(path),
+        crate::source::Input::Url { url, kind } => match kind {
+            crate::source::UrlKind::DirectAudio => SubmitAction::DirectAudio(url),
+            crate::source::UrlKind::Page => SubmitAction::Page(url),
+            crate::source::UrlKind::Unknown => SubmitAction::Unknown(url),
+        },
+    }
+}
+
+pub fn url_display_label(url: &str) -> String {
+    let trimmed = url.trim();
+    let without_scheme = if let Some(rest) = trimmed.strip_prefix("https://") {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix("http://") {
+        rest
+    } else {
+        trimmed
+    };
+
+    let before_fragment = without_scheme.split('#').next().unwrap_or(without_scheme);
+    let before_query = before_fragment.split('?').next().unwrap_or(before_fragment);
+
+    let mut parts: Vec<&str> = before_query
+        .split('/')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if parts.len() > 1 {
+        // Has host and path segments: return the last non-empty path segment
+        parts.pop().unwrap().to_string()
+    } else if let Some(host) = parts.first() {
+        host.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+pub fn handle_prompt_char(prompt: &mut String, c: char) {
+    if !c.is_control() {
+        prompt.push(c);
+    }
+}
+
+pub fn handle_prompt_backspace(prompt: &mut String) {
+    prompt.pop();
+}
+
+pub fn handle_prompt_paste(prompt: &mut String, pasted: &str) {
+    for c in pasted.chars() {
+        if c == '\r' || c == '\n' {
+            continue;
+        }
+        if !c.is_control() {
+            prompt.push(c);
+        }
+    }
+}
+
+fn handle_ytdlp_result(
+    app: &mut App,
+    request_id: u64,
+    result: Result<crate::source::ytdlp::Resolved, crate::source::ytdlp::YtDlpError>,
+) -> Option<(String, String)> {
+    if request_id != app.ytdlp_request_id {
+        return None;
+    }
+    match result {
+        Ok(resolved) => {
+            app.status = Status::Connecting;
+            app.track_label = resolved.title.clone();
+            app.error = None;
+            Some((resolved.audio_url, resolved.title))
+        }
+        Err(err) => {
+            app.status = Status::Stopped;
+            app.error = Some(err.to_string());
+            None
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -106,6 +213,10 @@ struct App {
     error: Option<String>,
     should_quit: bool,
     analyzer: SpectrumAnalyzer,
+    url_input: Option<String>,
+    ytdlp_rx: Option<Receiver<(u64, Result<crate::source::ytdlp::Resolved, crate::source::ytdlp::YtDlpError>)>>,
+    ytdlp_request_id: u64,
+    is_url: bool,
 }
 
 /// Guard de terminal: raw mode + alternate screen vía `ratatui::try_init`.
@@ -118,10 +229,13 @@ struct Tui {
 impl Tui {
     fn new() -> io::Result<Self> {
         match ratatui::try_init() {
-            Ok(terminal) => Ok(Self {
-                terminal,
-                restored: false,
-            }),
+            Ok(terminal) => {
+                let _ = crossterm::execute!(io::stdout(), crossterm::event::EnableBracketedPaste);
+                Ok(Self {
+                    terminal,
+                    restored: false,
+                })
+            }
             Err(err) => {
                 // try_init puede fallar con raw mode ya activo; revertir igualmente.
                 let _ = ratatui::try_restore();
@@ -135,6 +249,7 @@ impl Tui {
             return;
         }
         self.restored = true;
+        let _ = crossterm::execute!(io::stdout(), crossterm::event::DisableBracketedPaste);
         let _ = self.terminal.show_cursor();
         let _ = ratatui::try_restore();
     }
@@ -148,7 +263,8 @@ impl Drop for Tui {
 
 /// Loop principal de la TUI. Sale con la terminal restaurada y el audio detenido.
 pub fn run(engine: &mut AudioEngine, start: StartMode) -> io::Result<()> {
-    let (mode, roots, current_path, has_player, track_label) = match start {
+    let is_url_start = matches!(start, StartMode::PlayUrl { .. });
+    let (mode, roots, current_path, has_player, track_label, start_url_info) = match start {
         StartMode::PlayFile(path) => {
             let root = path
                 .parent()
@@ -156,9 +272,13 @@ pub fn run(engine: &mut AudioEngine, start: StartMode) -> io::Result<()> {
                 .map(Path::to_path_buf)
                 .unwrap_or_else(fallback_cwd);
             let label = path.to_string_lossy().into_owned();
-            (Mode::Player, vec![root], Some(path), true, label)
+            (Mode::Player, vec![root], Some(path), true, label, None)
         }
-        StartMode::Browse(roots) => (Mode::Browser, roots, None, false, String::new()),
+        StartMode::PlayUrl { url, kind, roots } => {
+            let label = url_display_label(&url);
+            (Mode::Player, roots, None, true, label, Some((url, kind)))
+        }
+        StartMode::Browse(roots) => (Mode::Browser, roots, None, false, String::new(), None),
     };
 
     // La biblioteca se escanea en background: con miles de archivos el parseo
@@ -186,7 +306,36 @@ pub fn run(engine: &mut AudioEngine, start: StartMode) -> io::Result<()> {
             .then(|| config::config().warnings.join(" · ")),
         should_quit: false,
         analyzer: SpectrumAnalyzer::new(),
+        url_input: None,
+        ytdlp_rx: None,
+        ytdlp_request_id: 0,
+        is_url: is_url_start,
     };
+
+    if let Some((url, kind)) = start_url_info {
+        match kind {
+            crate::source::UrlKind::DirectAudio | crate::source::UrlKind::Unknown => {
+                app.status = Status::Connecting;
+                app.error = None;
+                if let Err(err) = engine.play_url(&url) {
+                    app.status = Status::Stopped;
+                    app.error = Some(err.to_string());
+                }
+            }
+            crate::source::UrlKind::Page => {
+                app.status = Status::Resolving;
+                app.error = None;
+                app.ytdlp_request_id = 1;
+                let req_id = 1;
+                let (tx, rx) = mpsc::channel();
+                thread::spawn(move || {
+                    let result = crate::source::ytdlp::resolve(&url, &crate::source::ytdlp::ProcessCommandRunner);
+                    let _ = tx.send((req_id, result));
+                });
+                app.ytdlp_rx = Some(rx);
+            }
+        }
+    }
     start_scan(&mut app);
     let mut tui = Tui::new()?;
 
@@ -217,7 +366,10 @@ fn event_loop(tui: &mut Tui, app: &mut App, engine: &mut AudioEngine) -> io::Res
         // La transición Playing → Ended es el fin natural de la pista: ahí
         // decide repeat (uno la relanza, todo salta y envuelve).
         let previous_status = app.status;
-        app.status = status_of(engine);
+        let pending_resolution = app.ytdlp_rx.is_some();
+        let app_has_error = app.error.is_some() && !engine.is_playing() && !engine.is_paused();
+        let snapshot = EngineSnapshot::from_engine(engine, app_has_error);
+        app.status = compute_status(pending_resolution, snapshot);
         if playback_error.is_none()
             && previous_status == Status::Playing
             && app.status == Status::Ended
@@ -230,6 +382,27 @@ fn event_loop(tui: &mut Tui, app: &mut App, engine: &mut AudioEngine) -> io::Res
             app.error = Some(err.to_string());
         }
         poll_scan(app);
+
+        if let Some(rx) = &app.ytdlp_rx {
+            match rx.try_recv() {
+                Ok((req_id, result)) => {
+                    app.ytdlp_rx = None;
+                    if let Some((audio_url, _title)) = handle_ytdlp_result(app, req_id, result) {
+                        match engine.play_url(&audio_url) {
+                            Ok(_) => {}
+                            Err(err) => {
+                                app.status = Status::Stopped;
+                                app.error = Some(err.to_string());
+                            }
+                        }
+                    }
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    app.ytdlp_rx = None;
+                }
+            }
+        }
 
         // Lock corto: solo copiar muestras del tap; la FFT corre después, sin lock.
         {
@@ -252,6 +425,11 @@ fn event_loop(tui: &mut Tui, app: &mut App, engine: &mut AudioEngine) -> io::Res
                     break;
                 }
             }
+            Event::Paste(pasted) if app.url_input.is_some() => {
+                if let Some(buf) = app.url_input.as_mut() {
+                    handle_prompt_paste(buf, &pasted);
+                }
+            }
             _ => {}
         }
     }
@@ -259,18 +437,43 @@ fn event_loop(tui: &mut Tui, app: &mut App, engine: &mut AudioEngine) -> io::Res
     Ok(())
 }
 
-fn status_of(engine: &AudioEngine) -> Status {
-    if engine.is_paused() {
-        Status::Paused
-    } else if engine.is_playing() {
-        Status::Playing
-    } else if engine.had_playback_error() {
-        // No terminó: falló. «Fin de la pista» para un archivo que nunca
-        // llegó al final sería mentira (y dispararía el auto-advance).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EngineSnapshot {
+    pub is_connecting: bool,
+    pub is_playing: bool,
+    pub is_paused: bool,
+    pub had_playback_error: bool,
+}
+
+impl EngineSnapshot {
+    pub fn from_engine(engine: &AudioEngine, app_error: bool) -> Self {
+        Self {
+            is_connecting: engine.is_connecting(),
+            is_playing: engine.is_playing(),
+            is_paused: engine.is_paused(),
+            had_playback_error: engine.had_playback_error() || app_error,
+        }
+    }
+}
+
+pub fn compute_status(pending_resolution: bool, snapshot: EngineSnapshot) -> Status {
+    if pending_resolution {
+        Status::Resolving
+    } else if snapshot.had_playback_error {
         Status::Stopped
+    } else if snapshot.is_connecting {
+        Status::Connecting
+    } else if snapshot.is_paused {
+        Status::Paused
+    } else if snapshot.is_playing {
+        Status::Playing
     } else {
         Status::Ended
     }
+}
+
+fn status_of(engine: &AudioEngine) -> Status {
+    compute_status(false, EngineSnapshot::from_engine(engine, false))
 }
 
 fn handle_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine) {
@@ -278,6 +481,11 @@ fn handle_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine) {
         && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
     {
         app.should_quit = true;
+        return;
+    }
+
+    if app.url_input.is_some() {
+        handle_url_prompt_key(key, app, engine);
         return;
     }
 
@@ -326,6 +534,8 @@ fn handle_player_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine) {
         toggle_shuffle(app);
     } else if config::pressed(&keys.repeat, code) {
         app.repeat = app.repeat.cycle();
+    } else if config::pressed(&keys.open_url, code) {
+        open_url_prompt(app);
     } else if config::pressed(&keys.search, code) {
         toggle_explorer(app);
         open_search(app);
@@ -361,6 +571,8 @@ fn handle_list_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine) {
         toggle_shuffle(app);
     } else if config::pressed(&keys.repeat, code) {
         app.repeat = app.repeat.cycle();
+    } else if config::pressed(&keys.open_url, code) {
+        open_url_prompt(app);
     } else if config::pressed(&keys.search, code) {
         open_search(app);
     } else if config::pressed(&keys.move_up, code) {
@@ -482,6 +694,98 @@ fn refresh_view(app: &mut App) {
 fn resync_selection(app: &mut App) {
     if let Some(position) = current_view_position(app) {
         app.selected = position;
+    }
+}
+
+fn open_url_prompt(app: &mut App) {
+    app.url_input = Some(String::new());
+}
+
+fn handle_url_prompt_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine) {
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V'))
+    {
+        return;
+    }
+
+    match key.code {
+        KeyCode::Esc => {
+            app.url_input = None;
+        }
+        KeyCode::Enter => {
+            let input = app.url_input.take().unwrap_or_default();
+            submit_url_prompt(input, app, engine);
+        }
+        KeyCode::Backspace => {
+            if let Some(buf) = app.url_input.as_mut() {
+                handle_prompt_backspace(buf);
+            }
+        }
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(buf) = app.url_input.as_mut() {
+                handle_prompt_char(buf, c);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn submit_url_prompt(input: String, app: &mut App, engine: &mut AudioEngine) {
+    match classify_submit_input(&input) {
+        SubmitAction::Empty => {}
+        SubmitAction::Local(path) => {
+            if path.is_file() {
+                let label = path.to_string_lossy().into_owned();
+                match engine.play(&path) {
+                    Ok(()) => {
+                        app.current_path = Some(path.clone());
+                        app.track_label = label;
+                        app.has_player = true;
+                        app.is_url = false;
+                        app.mode = Mode::Player;
+                        app.error = None;
+                        if let Some(lib) = app.library.as_mut() {
+                            let idx = lib.index_of(&path);
+                            lib.set_current(idx);
+                        }
+                    }
+                    Err(err) => app.error = Some(err.to_string()),
+                }
+            } else {
+                app.error = Some(format!("'{}' no existe o no es un archivo.", path.display()));
+            }
+        }
+        SubmitAction::DirectAudio(url) | SubmitAction::Unknown(url) => {
+            app.is_url = true;
+            app.current_path = None;
+            app.track_label = url_display_label(&url);
+            app.has_player = true;
+            app.mode = Mode::Player;
+            app.status = Status::Connecting;
+            app.error = None;
+            if let Err(err) = engine.play_url(&url) {
+                app.status = Status::Stopped;
+                app.error = Some(err.to_string());
+            }
+        }
+        SubmitAction::Page(url) => {
+            app.is_url = true;
+            app.current_path = None;
+            app.track_label = url_display_label(&url);
+            app.has_player = true;
+            app.mode = Mode::Player;
+            app.status = Status::Resolving;
+            app.error = None;
+
+            app.ytdlp_request_id = app.ytdlp_request_id.wrapping_add(1);
+            let req_id = app.ytdlp_request_id;
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || {
+                let result = crate::source::ytdlp::resolve(&url, &crate::source::ytdlp::ProcessCommandRunner);
+                let _ = tx.send((req_id, result));
+            });
+            app.ytdlp_rx = Some(rx);
+        }
     }
 }
 
@@ -650,6 +954,9 @@ fn current_track_duration(app: &App) -> Option<Duration> {
 /// Fin natural de la pista (transición Playing → Ended): decide el repeat
 /// sin esperar que el usuario apriete espacio.
 fn handle_natural_end(app: &mut App, engine: &mut AudioEngine) {
+    if app.is_url {
+        return;
+    }
     match app.repeat {
         RepeatMode::Off => {}
         RepeatMode::One => {
@@ -698,6 +1005,35 @@ fn render(frame: &mut Frame<'_>, app: &App, engine: &AudioEngine) {
         Mode::Player => render_player(frame, app, engine),
         Mode::Browser => render_browser(frame, app),
     }
+
+    if let Some(buf) = &app.url_input {
+        render_url_prompt(frame, buf);
+    }
+}
+
+fn render_url_prompt(frame: &mut Frame<'_>, input: &str) {
+    let area = frame.area();
+    let prompt_width = 72.min(area.width.saturating_sub(4)).max(20);
+    let prompt_height = 5.min(area.height.saturating_sub(2)).max(3);
+
+    let x = area.x + (area.width.saturating_sub(prompt_width)) / 2;
+    let y = area.y + (area.height.saturating_sub(prompt_height)) / 2;
+    let prompt_rect = Rect::new(x, y, prompt_width, prompt_height);
+
+    frame.render_widget(Clear, prompt_rect);
+
+    let block = Block::bordered()
+        .border_style(Style::default().fg(theme().accent))
+        .title(Span::styled(
+            " Abrir URL / Archivo ",
+            Style::default().fg(theme().accent).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(prompt_rect);
+    frame.render_widget(block, prompt_rect);
+
+    let display_text = format!(" {input}▌");
+    let line = Line::from(Span::styled(display_text, Style::default().fg(theme().text)));
+    frame.render_widget(Paragraph::new(vec![line]), inner);
 }
 
 /// Bloque con borde apagado y título acentuado: el patrón de todo el programa.
@@ -721,6 +1057,8 @@ fn status_parts(status: Status) -> (&'static str, Color) {
         Status::Paused  => ("⏸  Pausado",       theme().warn),
         Status::Ended   => ("⏹  Fin de pista",  theme().dim),
         Status::Stopped => ("⏹  Detenido",      theme().error),
+        Status::Resolving => ("⏳  Resolviendo con yt-dlp…", theme().accent),
+        Status::Connecting => ("⏳  Conectando…", theme().accent),
     }
 }
 
@@ -1613,6 +1951,13 @@ fn spectrum_color(t: f32, theme: &Theme) -> (u8, u8, u8) {
 /// Mejora 6: `compact` activo cuando `area.height < 30`; muestra una sola
 /// línea con los atajos críticos.
 fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
+    if app.url_input.is_some() {
+        return vec![
+            Line::from(" Pegá o escribí una URL (directa o YouTube) o ruta local "),
+            Line::from(" Enter: reproducir   Esc: cancelar   Ctrl+V: pegar "),
+        ];
+    }
+
     if app.search.is_some() {
         return vec![
             Line::from(" Escribí para filtrar por título, artista, álbum o archivo "),
@@ -1678,11 +2023,12 @@ fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
                 key_labels(&keys.search),
             )),
             Line::from(format!(
-                " {}: shuffle   {}: repeat   {}/{}: vel   {}: biblioteca   {}: salir",
+                " {}: shuffle   {}: repeat   {}/{}: vel   {}: URL   {}: biblio   {}: salir",
                 key_labels(&keys.shuffle),
                 key_labels(&keys.repeat),
                 key_labels(&keys.speed_down),
                 key_labels(&keys.speed_up),
+                key_labels(&keys.open_url),
                 key_labels(&keys.explorer),
                 key_labels(&keys.quit),
             )),
@@ -1711,7 +2057,8 @@ fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
                 key_labels(&keys.repeat),
             )),
             Line::from(format!(
-                " {}: volver   {}: salir",
+                " {}: URL   {}: volver   {}: salir",
+                key_labels(&keys.open_url),
                 key_labels(&keys.back),
                 key_labels(&keys.quit),
             )),
@@ -1935,6 +2282,10 @@ mod tests {
             error: None,
             should_quit: false,
             analyzer: SpectrumAnalyzer::new(),
+            url_input: None,
+            ytdlp_rx: None,
+            ytdlp_request_id: 0,
+            is_url: false,
         }
     }
 
@@ -2408,5 +2759,208 @@ mod tests {
         let ended_text = line_text(&ended);
         assert!(ended_text.contains("Fin de pista"), "{ended_text}");
         assert!(!ended_text.contains("Detenido"), "{ended_text}");
+    }
+
+    #[test]
+    fn test_url_display_label() {
+        assert_eq!(
+            url_display_label("https://example.com/audio/song.mp3"),
+            "song.mp3"
+        );
+        assert_eq!(
+            url_display_label("http://audio.example.org/path/stream.m4a?token=1#part"),
+            "stream.m4a"
+        );
+        assert_eq!(
+            url_display_label("https://radio.example.com/"),
+            "radio.example.com"
+        );
+        assert_eq!(
+            url_display_label("http://localhost:8080"),
+            "localhost:8080"
+        );
+    }
+
+    #[test]
+    fn test_classify_submit_input() {
+        assert_eq!(classify_submit_input(""), SubmitAction::Empty);
+        assert_eq!(classify_submit_input("   "), SubmitAction::Empty);
+        assert_eq!(
+            classify_submit_input("https://example.com/audio.mp3"),
+            SubmitAction::DirectAudio("https://example.com/audio.mp3".to_string())
+        );
+        assert_eq!(
+            classify_submit_input("https://www.youtube.com/watch?v=dQw4w9WgXcQ"),
+            SubmitAction::Page("https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string())
+        );
+        assert_eq!(
+            classify_submit_input("https://example.com/unknown_stream"),
+            SubmitAction::Unknown("https://example.com/unknown_stream".to_string())
+        );
+    }
+
+    #[test]
+    fn test_prompt_editing_and_paste() {
+        let mut prompt = String::new();
+        handle_prompt_char(&mut prompt, 'h');
+        handle_prompt_char(&mut prompt, 't');
+        handle_prompt_char(&mut prompt, 't');
+        handle_prompt_char(&mut prompt, 'p');
+        assert_eq!(prompt, "http");
+
+        handle_prompt_backspace(&mut prompt);
+        assert_eq!(prompt, "htt");
+
+        handle_prompt_paste(&mut prompt, "p://example.com/song.mp3\r\n");
+        assert_eq!(prompt, "http://example.com/song.mp3");
+    }
+
+    #[test]
+    fn test_status_text_transitions() {
+        let (resolving_text, _) = status_parts(Status::Resolving);
+        assert!(
+            resolving_text.contains("Resolviendo con yt-dlp…"),
+            "texto: {resolving_text}"
+        );
+
+        let (connecting_text, _) = status_parts(Status::Connecting);
+        assert!(
+            connecting_text.contains("Conectando…"),
+            "texto: {connecting_text}"
+        );
+    }
+
+    #[test]
+    fn test_footer_shows_open_url_key() {
+        let app = test_app();
+        let lines = footer_lines(&app, false);
+        let joined: String = lines.iter().map(line_text).collect::<Vec<_>>().join(" ");
+        assert!(
+            joined.contains("u: URL") || joined.contains("u: url") || joined.contains("URL"),
+            "footer debe mencionar atajo de URL: {joined}"
+        );
+    }
+
+    #[test]
+    fn test_stale_resolution_ignored_by_request_id() {
+        let mut app = test_app();
+        app.ytdlp_request_id = 42;
+        app.status = Status::Resolving;
+        app.error = Some("error previo".to_string());
+
+        // Stale result (request_id 41 != 42) must be ignored
+        let stale_result = Ok(crate::source::ytdlp::Resolved {
+            title: "Stale Song".to_string(),
+            audio_url: "https://example.com/stale.m4a".to_string(),
+        });
+        let action = handle_ytdlp_result(&mut app, 41, stale_result);
+        assert_eq!(action, None, "stale result must be discarded");
+        assert_eq!(app.status, Status::Resolving);
+        assert_eq!(app.error.as_deref(), Some("error previo"));
+
+        // Matching result (request_id 42 == 42) must be accepted
+        let matching_result = Ok(crate::source::ytdlp::Resolved {
+            title: "Fresh Song".to_string(),
+            audio_url: "https://example.com/fresh.m4a".to_string(),
+        });
+        let action = handle_ytdlp_result(&mut app, 42, matching_result);
+        assert_eq!(
+            action,
+            Some(("https://example.com/fresh.m4a".to_string(), "Fresh Song".to_string()))
+        );
+        assert_eq!(app.status, Status::Connecting);
+        assert_eq!(app.track_label, "Fresh Song");
+        assert_eq!(app.error, None);
+    }
+
+    #[test]
+    fn test_compute_status_transitions() {
+        let snapshot_stopped = EngineSnapshot {
+            is_connecting: false,
+            is_playing: false,
+            is_paused: false,
+            had_playback_error: false,
+        };
+        assert_eq!(
+            compute_status(true, snapshot_stopped),
+            Status::Resolving,
+            "must stay Resolving while yt-dlp is pending even if engine is stopped"
+        );
+
+        let snapshot_connecting = EngineSnapshot {
+            is_connecting: true,
+            is_playing: true,
+            is_paused: false,
+            had_playback_error: false,
+        };
+        assert_eq!(
+            compute_status(true, snapshot_connecting),
+            Status::Resolving,
+            "must stay Resolving while yt-dlp is pending even if engine is connecting"
+        );
+
+        assert_eq!(
+            compute_status(false, snapshot_connecting),
+            Status::Connecting,
+            "must stay Connecting while engine.is_connecting is true"
+        );
+
+        let snapshot_playing = EngineSnapshot {
+            is_connecting: false,
+            is_playing: true,
+            is_paused: false,
+            had_playback_error: false,
+        };
+        assert_eq!(
+            compute_status(false, snapshot_playing),
+            Status::Playing,
+            "must transition to Playing once connection finishes"
+        );
+
+        let snapshot_failed = EngineSnapshot {
+            is_connecting: false,
+            is_playing: false,
+            is_paused: false,
+            had_playback_error: true,
+        };
+        assert_eq!(
+            compute_status(false, snapshot_failed),
+            Status::Stopped,
+            "connection or playback failure must result in Stopped"
+        );
+    }
+
+    #[test]
+    fn test_url_track_natural_end_does_not_advance_or_replay_local() {
+        let mut app = test_app();
+        app.is_url = true;
+        app.status = Status::Playing;
+        app.repeat = RepeatMode::All;
+        app.library = Some(crate::playlist::from_tracks_for_test(vec![
+            track_named("local_1"),
+            track_named("local_2"),
+        ]));
+        refresh_view(&mut app);
+        app.selected = 0;
+        app.track_label = "https://example.com/audio.mp3".to_string();
+
+        let mut engine = match AudioEngine::new() {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+
+        handle_natural_end(&mut app, &mut engine);
+
+        assert_eq!(
+            app.track_label, "https://example.com/audio.mp3",
+            "URL track must not be replaced by local track on natural end"
+        );
+        assert_eq!(app.selected, 0);
+        assert!(app.current_path.is_none());
+        assert!(
+            app.error.is_none(),
+            "must not attempt to play local tracks or set error: {:?}",
+            app.error
+        );
     }
 }

@@ -21,6 +21,12 @@ cargo run --release -- "C:\Users\yo\Music"
 # Archivo puntual (reproduce directo; su carpeta queda como biblioteca):
 cargo run --release -- "C:\Users\yo\Music\tema.mp3"
 
+# URL de audio directa (mp3, flac, ogg, wav, aac, m4a):
+cargo run --release -- "https://example.com/audio/cancion.mp3"
+
+# URL de YouTube u otros sitios soportados (requiere yt-dlp):
+cargo run --release -- "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+
 # Sin argumentos: biblioteca por defecto con las carpetas conocidas que
 # existan en %USERPROFILE% (Music, Downloads, Desktop, Documents) unidas a
 # las [library] roots de config.toml; la lista se agrupa por carpeta.
@@ -44,6 +50,7 @@ Windows.
 | `s` | Aleatorio (shuffle) |
 | `r` | Modo repetir (off → una → todas) |
 | `[` / `]` | Velocidad 0.50x – 2.00x (pasos de 0.25x) |
+| `u` | Abrir diálogo para reproducir URL o archivo |
 | `b` / `Tab` / `Ctrl+Tab` | Abrir o cerrar el panel del explorador |
 | `/` | Abrir el panel del explorador con la búsqueda |
 | `q` / `Esc` | Salir |
@@ -138,7 +145,7 @@ seek_back = "left"
 # Acciones disponibles:
 #   quit, play_pause, volume_up, volume_down, seek_back, seek_fwd,
 #   prev_track, next_track, shuffle, repeat, search, speed_up,
-#   speed_down, explorer, move_up, move_down, page_up, page_down,
+#   speed_down, explorer, open_url, move_up, move_down, page_up, page_down,
 #   home, end, select, back
 # Nombres de tecla: space, enter, esc, tab, up, down, left, right,
 #   pageup, pagedown, home, end, backspace, delete, insert, backtab,
@@ -163,6 +170,23 @@ Notas del comportamiento de la config:
   mayor prioridad en el dispatch y se genera un warning que lo explicita
   (la perdedora vuelve a sus defaults libres).
 - La config se lee una sola vez al arrancar: no hay recarga en caliente.
+
+## Reproducción desde URLs HTTP y YouTube
+
+mp3tui permite reproducir música remota directamente desde la terminal o desde la app:
+
+- **Por CLI:** pasá la URL como argumento:
+  ```sh
+  mp3tui https://example.com/audio/cancion.mp3
+  mp3tui https://www.youtube.com/watch?v=dQw4w9WgXcQ
+  ```
+- **Desde la app:** presioná `u` en cualquier momento para abrir el diálogo de entrada. Escribí o pegá la URL y presioná `Enter`.
+- **URLs directas:** soporta enlaces HTTP/HTTPS directos a archivos `mp3`, `flac`, `ogg`, `wav`, `m4a`, `aac` u `opus`.
+- **YouTube y páginas web:** delegación automática en la herramienta opcional `yt-dlp`. Si no está instalada, mp3tui muestra un aviso con instrucciones para instalarla:
+  - Windows: `winget install yt-dlp` o `pip install yt-dlp`
+  - Linux / macOS: `pip install yt-dlp` o el gestor de paquetes de tu distribución.
+- **Streaming y buffer:** el audio se reproduce en streaming directamente a memoria (nada se guarda en disco). Seek (±5 s) funciona si el servidor reporta tamaño (`Content-Length`) y soporta peticiones de rango (`Range: bytes=...`).
+- **Navegación de biblioteca:** la reproducción por URL es puntual; los atajos de pista siguiente/anterior (`n`/`p`) y aleatorio (`s`) continúan operando sobre la biblioteca local escaneada. Al terminar una URL remota de forma natural, el reproductor se detiene en «Fin de la pista» sin avanzar a la biblioteca local ni reintentar pistas locales.
 
 ## Limitaciones conocidas
 

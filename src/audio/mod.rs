@@ -195,6 +195,7 @@ struct SessionState {
     cancel_handle: Option<crate::source::http_stream::CancelHandle>,
     is_seekable: bool,
     error: Option<AudioError>,
+    is_connecting: bool,
 }
 
 #[cfg(test)]
@@ -285,6 +286,7 @@ impl AudioEngine {
                     cancel_handle: None,
                     is_seekable: true,
                     error: None,
+                    is_connecting: false,
                 }),
                 session_id: AtomicU64::new(0),
                 had_playback_error: AtomicBool::new(false),
@@ -330,6 +332,7 @@ impl AudioEngine {
             session.error = None;
             session.cancel_handle = None;
             session.is_seekable = is_seekable;
+            session.is_connecting = matches!(input, MediaInput::Url(_));
             session.id
         } else {
             0
@@ -545,6 +548,7 @@ impl AudioEngine {
             session.id = session.id.wrapping_add(1);
             self.shared.session_id.store(session.id, Ordering::Release);
             session.is_seekable = false;
+            session.is_connecting = false;
             // No se borra `session.error`: el error de una pista que falló debe
             // seguir disponible para que la UI lo drene vía `take_error()`, incluso si
             // se invoca `stop()` antes del drenaje. Se limpia recién al iniciar un nuevo play.
@@ -570,6 +574,17 @@ impl AudioEngine {
 
     pub fn is_playing(&self) -> bool {
         self.shared.state.load(Ordering::Acquire) == STATE_PLAYING
+    }
+
+    /// Indica si el motor está actualmente conectando / abriendo un stream remoto (URL).
+    pub fn is_connecting(&self) -> bool {
+        self.shared
+            .session
+            .lock()
+            .ok()
+            .map(|s| s.is_connecting)
+            .unwrap_or(false)
+            && self.shared.state.load(Ordering::Acquire) == STATE_PLAYING
     }
 
     pub fn is_paused(&self) -> bool {
@@ -985,6 +1000,7 @@ fn decode_url_pipeline(
             && shared.state.load(Ordering::Acquire) != STATE_STOPPED
         {
             session.error = Some(err);
+            session.is_connecting = false;
             shared.state.store(STATE_STOPPED, Ordering::Release);
             shared.had_playback_error.store(true, Ordering::Release);
             shared.decoder_done.store(true, Ordering::Release);
@@ -1119,6 +1135,12 @@ fn decode_url_pipeline(
     if !is_current() {
         cancel_handle.cancel();
         return;
+    }
+
+    if let Ok(mut session) = shared.session.lock()
+        && session.id == session_id
+    {
+        session.is_connecting = false;
     }
 
     decode_loop(
