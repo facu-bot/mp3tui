@@ -189,6 +189,7 @@ mp3tui permite reproducir música remota directamente desde la terminal o desde 
 - **Historial persistente:** las canciones reproducidas por URL con éxito se registran automáticamente en un historial (`history.toml` en el directorio de configuración, ej. `%APPDATA%\mp3tui\history.toml`):
   - Almacena hasta 20 entradas (las más recientes primero, sin duplicados).
   - Solo guarda título y enlace original (nunca URLs temporales expirables de YouTube ni audio en disco).
+  - Se eliminan credenciales embebidas en la URL (`user:pass@host`); los parámetros de consulta (`query`) se conservan.
   - Aparece en el explorador (`Tab`) arriba de la biblioteca local bajo el grupo `"Agregadas por URL"` con el distintivo `[URL]`.
   - Se reproducen directamente con `Enter` sin volver a pegar el enlace y se filtran con la búsqueda (`/`).
 - **Navegación de biblioteca:** la reproducción por URL es puntual; los atajos de pista siguiente/anterior (`n`/`p`) y aleatorio (`s`) continúan operando sobre la biblioteca local escaneada. Al terminar una URL remota de forma natural, el reproductor se detiene en «Fin de la pista» sin avanzar a la biblioteca local ni reintentar pistas locales.

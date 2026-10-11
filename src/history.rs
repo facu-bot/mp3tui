@@ -64,6 +64,25 @@ impl History {
     }
 }
 
+pub fn sanitize_url(url: &str) -> String {
+    let (scheme, rest) = if let Some(idx) = url.find("://") {
+        (&url[..idx + 3], &url[idx + 3..])
+    } else {
+        ("", url)
+    };
+
+    let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..auth_end];
+    let remainder = &rest[auth_end..];
+
+    if let Some(at_idx) = authority.rfind('@') {
+        let host_port = &authority[at_idx + 1..];
+        format!("{scheme}{host_port}{remainder}")
+    } else {
+        url.to_string()
+    }
+}
+
 pub fn history_path() -> Option<PathBuf> {
     crate::config::config_dir().map(|mut p| {
         p.push(HISTORY_FILE_NAME);
@@ -71,23 +90,24 @@ pub fn history_path() -> Option<PathBuf> {
     })
 }
 
-pub fn load() -> (History, Option<String>) {
-    let Some(path) = history_path() else {
-        return (History::default(), None);
-    };
+pub fn load_from(path: &std::path::Path) -> (History, Option<String>) {
     if !path.exists() {
         return (History::default(), None);
     }
-    match fs::read_to_string(&path) {
+    match fs::read_to_string(path) {
         Ok(content) => match History::from_toml(&content) {
             Ok(hist) => (hist, None),
-            Err(err) => (
-                History::default(),
-                Some(format!(
-                    "archivo de historial '{}' corrupto: {err}",
-                    path.display()
-                )),
-            ),
+            Err(err) => {
+                let bak_path = path.with_extension("toml.bak");
+                let _ = fs::copy(path, &bak_path);
+                (
+                    History::default(),
+                    Some(format!(
+                        "archivo de historial '{}' corrupto: {err}",
+                        path.display()
+                    )),
+                )
+            }
         },
         Err(err) => (
             History::default(),
@@ -99,15 +119,39 @@ pub fn load() -> (History, Option<String>) {
     }
 }
 
-pub fn save(history: &History) -> Result<(), String> {
+pub fn load() -> (History, Option<String>) {
     let Some(path) = history_path() else {
-        return Err("no se pudo determinar la ruta del historial".to_string());
+        return (History::default(), None);
     };
+    load_from(&path)
+}
+
+static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn save_to(history: &History, path: &std::path::Path) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
     let content = history.to_toml()?;
-    fs::write(&path, content).map_err(|e| e.to_string())
+    let temp_name = format!(
+        "{}.tmp.{}.{}",
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("history"),
+        std::process::id(),
+        TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let temp_path = path.with_file_name(temp_name);
+    fs::write(&temp_path, &content).map_err(|e| e.to_string())?;
+    fs::rename(&temp_path, path).map_err(|e| {
+        let _ = fs::remove_file(&temp_path);
+        e.to_string()
+    })
+}
+
+pub fn save(history: &History) -> Result<(), String> {
+    let Some(path) = history_path() else {
+        return Err("no se pudo determinar la ruta del historial".to_string());
+    };
+    save_to(history, &path)
 }
 
 #[cfg(test)]
@@ -211,6 +255,72 @@ mod tests {
         unsafe {
             std::env::remove_var(crate::config::CONFIG_ENV_OVERRIDE);
         }
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_sanitize_url_strips_userinfo_and_handles_unicode() {
+        assert_eq!(
+            sanitize_url("http://user:pass@example.com/audio.mp3"),
+            "http://example.com/audio.mp3"
+        );
+        assert_eq!(
+            sanitize_url("https://alice:s3cr3t@domain.com:8080/path?q=val&u=user@other#hash"),
+            "https://domain.com:8080/path?q=val&u=user@other#hash"
+        );
+        assert_eq!(
+            sanitize_url("http://usér:páss@example.com/música.mp3?query=val"),
+            "http://example.com/música.mp3?query=val"
+        );
+        assert_eq!(
+            sanitize_url("https://example.com/clean.mp3"),
+            "https://example.com/clean.mp3"
+        );
+    }
+
+    #[test]
+    fn test_corrupt_history_preserved_in_bak_after_save() {
+        let temp_dir = std::env::temp_dir().join(format!("mp3tui_hist_bak_{}", std::process::id()));
+        let _ = fs::create_dir_all(&temp_dir);
+        let hist_file = temp_dir.join("history.toml");
+        let corrupt_bytes = "broken toml [[[]]";
+        fs::write(&hist_file, corrupt_bytes).unwrap();
+
+        let (mut hist, warn) = load_from(&hist_file);
+        assert!(warn.is_some());
+        assert_eq!(hist.len(), 0);
+
+        hist.add("New Title".to_string(), "https://example.com/audio.mp3".to_string());
+        save_to(&hist, &hist_file).unwrap();
+
+        let bak_file = hist_file.with_extension("toml.bak");
+        assert!(bak_file.exists(), "debe crear respaldo .bak");
+        assert_eq!(fs::read_to_string(&bak_file).unwrap(), corrupt_bytes);
+
+        let (reloaded, warn2) = load_from(&hist_file);
+        assert!(warn2.is_none());
+        assert_eq!(reloaded.len(), 1);
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_save_to_uses_temp_and_rename_without_leaving_temp_files() {
+        let temp_dir = std::env::temp_dir().join(format!("mp3tui_hist_atomic_{}", std::process::id()));
+        let _ = fs::create_dir_all(&temp_dir);
+        let hist_file = temp_dir.join("history.toml");
+
+        let mut hist = History::new();
+        hist.add("Atomic Title".to_string(), "https://example.com/atomic.mp3".to_string());
+        save_to(&hist, &hist_file).unwrap();
+
+        assert!(hist_file.exists());
+        let entries = fs::read_dir(&temp_dir).unwrap();
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            assert!(!name.contains("tmp"), "no debe quedar archivo temporal: {name}");
+        }
+
         let _ = fs::remove_dir_all(&temp_dir);
     }
 }

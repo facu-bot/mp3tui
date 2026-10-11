@@ -255,6 +255,7 @@ struct App {
     ytdlp_failed: bool,
     pub history: crate::history::History,
     pub pending_history: Option<(String, String)>,
+    pub history_path: Option<PathBuf>,
 }
 
 /// Guard de terminal: raw mode + alternate screen vía `ratatui::try_init`.
@@ -360,6 +361,7 @@ pub fn run(engine: &mut AudioEngine, start: StartMode) -> io::Result<()> {
         ytdlp_failed: false,
         history,
         pending_history: None,
+        history_path: crate::history::history_path(),
     };
 
     if let Some((url, kind)) = start_url_info {
@@ -758,15 +760,23 @@ fn matches_history_filter(entry: &crate::history::HistoryEntry, needle: &str) ->
 /// existe se usa la sonando y si ninguna está en la vista se acota a rango.
 /// Con shuffle activo regenera el orden mezclado para la nueva lista.
 fn refresh_view(app: &mut App) {
+    refresh_view_with_hint(app, None);
+}
+
+fn refresh_view_with_hint(app: &mut App, preserved_history_url: Option<&str>) {
     let previous_item = app.view.get(app.selected).copied();
     let previous_path = previous_item.and_then(|item| match item {
         ViewItem::Track(library_index) => library_get(app, library_index).map(|track| track.path.clone()),
         ViewItem::History(_) => None,
     });
-    let previous_history_url = previous_item.and_then(|item| match item {
-        ViewItem::History(hist_idx) => app.history.get(hist_idx).map(|entry| entry.url.clone()),
-        ViewItem::Track(_) => None,
-    });
+    let previous_history_url = preserved_history_url
+        .map(String::from)
+        .or_else(|| {
+            previous_item.and_then(|item| match item {
+                ViewItem::History(hist_idx) => app.history.get(hist_idx).map(|entry| entry.url.clone()),
+                ViewItem::Track(_) => None,
+            })
+        });
 
     let needle = app
         .search
@@ -882,11 +892,18 @@ fn start_local_playback(app: &mut App, engine: &mut AudioEngine, path: PathBuf) 
 }
 
 fn record_history_entry(app: &mut App, original_url: &str, label: &str) {
-    app.history.add(label.to_string(), original_url.to_string());
-    if let Err(err) = crate::history::save(&app.history) {
+    let selected_history_url = match app.view.get(app.selected) {
+        Some(ViewItem::History(idx)) => app.history.get(*idx).map(|e| e.url.clone()),
+        _ => None,
+    };
+    let clean_url = crate::history::sanitize_url(original_url);
+    app.history.add(label.to_string(), clean_url);
+    if let Some(path) = &app.history_path
+        && let Err(err) = crate::history::save_to(&app.history, path)
+    {
         app.error = Some(format!("Error al guardar historial: {err}"));
     }
-    refresh_view(app);
+    refresh_view_with_hint(app, selected_history_url.as_deref());
 }
 
 fn start_url_playback(
@@ -2545,7 +2562,15 @@ mod tests {
             ytdlp_failed: false,
             history: crate::history::History::default(),
             pending_history: None,
+            history_path: Some(test_temp_history_path()),
         }
+    }
+
+    static TEST_HIST_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn test_temp_history_path() -> PathBuf {
+        let id = TEST_HIST_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!("mp3tui_test_hist_{}_{}.toml", std::process::id(), id))
     }
 
     fn track_named(name: &str) -> Track {
@@ -3568,5 +3593,49 @@ mod tests {
             !app.history.entries().iter().any(|e| e.url == "https://example.com/A.mp3"),
             "URL A must never be recorded"
         );
+    }
+
+    #[test]
+    fn test_ui_app_uses_isolated_temp_history_path() {
+        let app = test_app();
+        let hist_path = app.history_path.as_ref().expect("history_path must be set");
+        assert!(
+            hist_path.starts_with(std::env::temp_dir()),
+            "history_path must be in temp_dir, got: {}",
+            hist_path.display()
+        );
+        assert_ne!(
+            Some(hist_path.clone()),
+            crate::history::history_path(),
+            "must not be real user path"
+        );
+    }
+
+    #[test]
+    fn test_record_history_preserves_selected_history_item() {
+        let mut app = library_with_three();
+        app.history.add("Song 1".to_string(), "https://example.com/1.mp3".to_string());
+        app.history.add("Song 2".to_string(), "https://example.com/2.mp3".to_string());
+        refresh_view(&mut app);
+
+        // View has History(0) ("Song 2") and History(1) ("Song 1")
+        assert_eq!(app.view[0], ViewItem::History(0));
+        assert_eq!(app.view[1], ViewItem::History(1));
+        app.selected = 1; // User selected Song 1 (2nd row)
+
+        record_history_entry(&mut app, "https://example.com/3.mp3", "Song 3");
+
+        // Song 3 was added at top. Song 1 is now at index 2.
+        // The selection must remain on Song 1!
+        assert_eq!(app.view[app.selected], ViewItem::History(2));
+        assert_eq!(app.history.get(2).unwrap().title, "Song 1");
+    }
+
+    #[test]
+    fn test_record_history_strips_userinfo() {
+        let mut app = test_app();
+        record_history_entry(&mut app, "http://user:pass@example.com/secret.mp3", "Secret");
+        assert_eq!(app.history.len(), 1);
+        assert_eq!(app.history.get(0).unwrap().url, "http://example.com/secret.mp3");
     }
 }
