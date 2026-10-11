@@ -171,7 +171,7 @@ fn handle_ytdlp_result(
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Pantalla de fondo. Con sesión de audio siempre es `Player`; el explorador
 /// se superpone como panel lateral (`App::explorer_open`, T13) sin
 /// reemplazarlo. `Browser` a pantalla completa es el caso sin player
@@ -180,6 +180,39 @@ enum Mode {
     Player,
     Browser,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewItem {
+    History(usize),
+    Track(usize),
+}
+
+impl From<usize> for ViewItem {
+    fn from(index: usize) -> Self {
+        ViewItem::Track(index)
+    }
+}
+
+impl PartialEq<usize> for ViewItem {
+    fn eq(&self, other: &usize) -> bool {
+        match self {
+            ViewItem::Track(idx) => idx == other,
+            ViewItem::History(_) => false,
+        }
+    }
+}
+
+impl PartialEq<ViewItem> for usize {
+    fn eq(&self, other: &ViewItem) -> bool {
+        other == self
+    }
+}
+
+type YtDlpMessage = (
+    u64,
+    String,
+    Result<crate::source::ytdlp::Resolved, crate::source::ytdlp::YtDlpError>,
+);
 
 struct App {
     mode: Mode,
@@ -193,8 +226,8 @@ struct App {
     library: Option<Playlist>,
     /// Resultado del escaneo en curso (thread de background). `Some` = escaneando.
     scan_rx: Option<Receiver<Playlist>>,
-    /// Índices de la biblioteca que se muestran (filtrados por la búsqueda).
-    view: Vec<usize>,
+    /// Índices de la biblioteca y del historial que se muestran (filtrados por la búsqueda).
+    view: Vec<ViewItem>,
     /// Selección dentro de `view` (nunca un índice directo de la biblioteca).
     selected: usize,
     /// Filtro de búsqueda confirmado (Enter); la lista visible lo respeta.
@@ -216,10 +249,12 @@ struct App {
     should_quit: bool,
     analyzer: SpectrumAnalyzer,
     url_input: Option<String>,
-    ytdlp_rx: Option<Receiver<(u64, Result<crate::source::ytdlp::Resolved, crate::source::ytdlp::YtDlpError>)>>,
+    ytdlp_rx: Option<Receiver<YtDlpMessage>>,
     ytdlp_request_id: u64,
     is_url: bool,
     ytdlp_failed: bool,
+    pub history: crate::history::History,
+    pub pending_history: Option<(String, String)>,
 }
 
 /// Guard de terminal: raw mode + alternate screen vía `ratatui::try_init`.
@@ -284,6 +319,16 @@ pub fn run(engine: &mut AudioEngine, start: StartMode) -> io::Result<()> {
         StartMode::Browse(roots) => (Mode::Browser, roots, None, false, String::new(), None),
     };
 
+    let (history, history_warn) = crate::history::load();
+    let mut initial_error = (!config::config().warnings.is_empty())
+        .then(|| config::config().warnings.join(" · "));
+    if let Some(warn) = history_warn {
+        initial_error = Some(match initial_error {
+            Some(prev) => format!("{prev} · {warn}"),
+            None => warn,
+        });
+    }
+
     // La biblioteca se escanea en background: con miles de archivos el parseo
     // de tags (lofty, I/O por archivo) no puede congelar el hilo de la UI.
     let mut app = App {
@@ -303,10 +348,9 @@ pub fn run(engine: &mut AudioEngine, start: StartMode) -> io::Result<()> {
         has_player,
         track_label,
         status: status_of(engine),
-        // Avisos de la config (T9): en la primera pantalla, además del
+        // Avisos de la config (T9) e historial: en la primera pantalla, además del
         // stderr que ya imprimió main. Con config limpia queda `None`.
-        error: (!config::config().warnings.is_empty())
-            .then(|| config::config().warnings.join(" · ")),
+        error: initial_error,
         should_quit: false,
         analyzer: SpectrumAnalyzer::new(),
         url_input: None,
@@ -314,17 +358,15 @@ pub fn run(engine: &mut AudioEngine, start: StartMode) -> io::Result<()> {
         ytdlp_request_id: 0,
         is_url: is_url_start,
         ytdlp_failed: false,
+        history,
+        pending_history: None,
     };
 
     if let Some((url, kind)) = start_url_info {
         match kind {
             crate::source::UrlKind::DirectAudio | crate::source::UrlKind::Unknown => {
-                app.status = Status::Connecting;
-                app.error = None;
-                if let Err(err) = engine.play_url(&url) {
-                    app.status = Status::Stopped;
-                    app.error = Some(err.to_string());
-                }
+                let label = url_display_label(&url);
+                start_url_playback(&mut app, engine, url.clone(), url, label);
             }
             crate::source::UrlKind::Page => {
                 app.status = Status::Resolving;
@@ -332,9 +374,10 @@ pub fn run(engine: &mut AudioEngine, start: StartMode) -> io::Result<()> {
                 app.ytdlp_request_id = 1;
                 let req_id = 1;
                 let (tx, rx) = mpsc::channel();
+                let url_clone = url.clone();
                 thread::spawn(move || {
                     let result = crate::source::ytdlp::resolve(&url, &crate::source::ytdlp::ProcessCommandRunner);
-                    let _ = tx.send((req_id, result));
+                    let _ = tx.send((req_id, url_clone, result));
                 });
                 app.ytdlp_rx = Some(rx);
             }
@@ -370,7 +413,9 @@ fn event_loop(tui: &mut Tui, app: &mut App, engine: &mut AudioEngine) -> io::Res
         // La transición Playing → Ended es el fin natural de la pista: ahí
         // decide repeat (uno la relanza, todo salta y envuelve).
         let previous_status = app.status;
-        app.status = compute_frame_status(app, engine, playback_error.is_some());
+        let playback_failed = engine.had_playback_error() || playback_error.is_some() || app.ytdlp_failed;
+        let snapshot = EngineSnapshot::from_engine(engine, playback_failed);
+        app.status = apply_engine_snapshot(app, snapshot);
         if playback_error.is_none()
             && previous_status == Status::Playing
             && app.status == Status::Ended
@@ -386,10 +431,10 @@ fn event_loop(tui: &mut Tui, app: &mut App, engine: &mut AudioEngine) -> io::Res
 
         if let Some(rx) = &app.ytdlp_rx {
             match rx.try_recv() {
-                Ok((req_id, result)) => {
+                Ok((req_id, orig_url, result)) => {
                     app.ytdlp_rx = None;
                     if let Some((audio_url, title)) = handle_ytdlp_result(app, req_id, result) {
-                        start_url_playback(app, engine, audio_url, title);
+                        start_url_playback(app, engine, audio_url, orig_url, title);
                     }
                 }
                 Err(TryRecvError::Empty) => {}
@@ -465,6 +510,36 @@ pub fn compute_status(pending_resolution: bool, snapshot: EngineSnapshot) -> Sta
     } else {
         Status::Ended
     }
+}
+
+fn init_url_playback(app: &mut App, original_url: String, label: String) {
+    cancel_pending_ytdlp(app);
+    app.is_url = true;
+    app.current_path = None;
+    app.track_label = label.clone();
+    app.has_player = true;
+    app.status = Status::Connecting;
+    app.error = None;
+    app.pending_history = Some((original_url, label));
+}
+
+fn apply_engine_snapshot(app: &mut App, snapshot: EngineSnapshot) -> Status {
+    let pending_resolution = app.ytdlp_rx.is_some();
+    let new_status = compute_status(pending_resolution, snapshot);
+    let previous_status = app.status;
+    app.status = new_status;
+
+    if snapshot.had_playback_error || new_status == Status::Stopped {
+        app.pending_history = None;
+    } else if previous_status == Status::Connecting
+        && new_status == Status::Playing
+        && app.is_url
+        && !snapshot.had_playback_error
+        && let Some((original_url, label)) = app.pending_history.take()
+    {
+        record_history_entry(app, &original_url, &label);
+    }
+    new_status
 }
 
 fn compute_frame_status(
@@ -643,15 +718,19 @@ fn library_get(app: &App, index: usize) -> Option<&Track> {
 }
 
 fn view_get(app: &App, index: usize) -> Option<&Track> {
-    app.view
-        .get(index)
-        .and_then(|&library_index| library_get(app, library_index))
+    match app.view.get(index)? {
+        ViewItem::Track(library_index) => library_get(app, *library_index),
+        ViewItem::History(_) => None,
+    }
 }
 
 /// Posición de un path dentro de la lista visible.
 fn position_in_view(app: &App, path: &Path) -> Option<usize> {
     let library_index = app.library.as_ref()?.index_of(path)?;
-    app.view.iter().position(|&index| index == library_index)
+    app.view.iter().position(|item| match item {
+        ViewItem::Track(index) => *index == library_index,
+        ViewItem::History(_) => false,
+    })
 }
 
 /// Posición de la pista sonando dentro de la lista visible (la que recorren
@@ -661,38 +740,75 @@ fn current_view_position(app: &App) -> Option<usize> {
     position_in_view(app, path)
 }
 
+fn matches_history_filter(entry: &crate::history::HistoryEntry, needle: &str) -> bool {
+    let trimmed = needle.trim().to_lowercase();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let title = if entry.title.is_empty() {
+        &entry.url
+    } else {
+        &entry.title
+    };
+    title.to_lowercase().contains(&trimmed)
+}
+
 /// Recalcula la lista visible (biblioteca filtrada por búsqueda/filtro) sin
 /// perder la selección: se preserva la pista seleccionada por path, si ya no
 /// existe se usa la sonando y si ninguna está en la vista se acota a rango.
 /// Con shuffle activo regenera el orden mezclado para la nueva lista.
 fn refresh_view(app: &mut App) {
-    let previous_path = app
-        .view
-        .get(app.selected)
-        .and_then(|&library_index| library_get(app, library_index))
-        .map(|track| track.path.clone());
+    let previous_item = app.view.get(app.selected).copied();
+    let previous_path = previous_item.and_then(|item| match item {
+        ViewItem::Track(library_index) => library_get(app, library_index).map(|track| track.path.clone()),
+        ViewItem::History(_) => None,
+    });
+    let previous_history_url = previous_item.and_then(|item| match item {
+        ViewItem::History(hist_idx) => app.history.get(hist_idx).map(|entry| entry.url.clone()),
+        ViewItem::Track(_) => None,
+    });
 
     let needle = app
         .search
         .as_ref()
         .or(app.filter.as_ref())
         .map(String::as_str);
-    app.view = app
-        .library
-        .as_ref()
-        .map(|library| filter_tracks(library.tracks(), needle))
-        .unwrap_or_default();
 
-    let new_selected = previous_path
-        .as_ref()
-        .and_then(|path| position_in_view(app, path))
-        .or_else(|| current_view_position(app))
-        .unwrap_or(0)
-        .min(app.view.len().saturating_sub(1));
+    let mut new_view = Vec::new();
+    for (idx, entry) in app.history.entries().iter().enumerate() {
+        if matches_history_filter(entry, needle.unwrap_or_default()) {
+            new_view.push(ViewItem::History(idx));
+        }
+    }
+    if let Some(library) = &app.library {
+        for track_idx in filter_tracks(library.tracks(), needle) {
+            new_view.push(ViewItem::Track(track_idx));
+        }
+    }
+    app.view = new_view;
+
+    let new_selected = if let Some(url) = &previous_history_url {
+        app.view.iter().position(|item| match item {
+            ViewItem::History(idx) => app.history.get(*idx).map(|entry| &entry.url) == Some(url),
+            _ => false,
+        })
+    } else if let Some(path) = &previous_path {
+        position_in_view(app, path)
+    } else {
+        None
+    }
+    .or_else(|| current_view_position(app))
+    .unwrap_or(0)
+    .min(app.view.len().saturating_sub(1));
     app.selected = new_selected;
 
     if app.shuffle {
-        app.shuffle_order = shuffle_order(app.view.len());
+        let track_count = app
+            .view
+            .iter()
+            .filter(|item| matches!(item, ViewItem::Track(_)))
+            .count();
+        app.shuffle_order = shuffle_order(track_count);
     }
 }
 
@@ -741,6 +857,7 @@ fn cancel_pending_ytdlp(app: &mut App) {
     app.ytdlp_request_id = app.ytdlp_request_id.wrapping_add(1);
     app.ytdlp_rx = None;
     app.ytdlp_failed = false;
+    app.pending_history = None;
 }
 
 fn start_local_playback(app: &mut App, engine: &mut AudioEngine, path: PathBuf) -> bool {
@@ -764,17 +881,26 @@ fn start_local_playback(app: &mut App, engine: &mut AudioEngine, path: PathBuf) 
     }
 }
 
-fn start_url_playback(app: &mut App, engine: &mut AudioEngine, url: String, label: String) {
-    cancel_pending_ytdlp(app);
-    app.is_url = true;
-    app.current_path = None;
-    app.track_label = label;
-    app.has_player = true;
-    app.status = Status::Connecting;
-    app.error = None;
-    if let Err(err) = engine.play_url(&url) {
+fn record_history_entry(app: &mut App, original_url: &str, label: &str) {
+    app.history.add(label.to_string(), original_url.to_string());
+    if let Err(err) = crate::history::save(&app.history) {
+        app.error = Some(format!("Error al guardar historial: {err}"));
+    }
+    refresh_view(app);
+}
+
+fn start_url_playback(
+    app: &mut App,
+    engine: &mut AudioEngine,
+    playable_url: String,
+    original_url: String,
+    label: String,
+) {
+    init_url_playback(app, original_url, label);
+    if let Err(err) = engine.play_url(&playable_url) {
         app.status = Status::Stopped;
         app.error = Some(err.to_string());
+        app.pending_history = None;
     }
 }
 
@@ -796,7 +922,7 @@ fn submit_url_prompt(input: String, app: &mut App, engine: &mut AudioEngine) {
         }
         SubmitAction::DirectAudio(url) | SubmitAction::Unknown(url) => {
             let label = url_display_label(&url);
-            start_url_playback(app, engine, url, label);
+            start_url_playback(app, engine, url.clone(), url, label);
             app.mode = Mode::Player;
         }
         SubmitAction::Page(url) => {
@@ -811,9 +937,10 @@ fn submit_url_prompt(input: String, app: &mut App, engine: &mut AudioEngine) {
 
             let req_id = app.ytdlp_request_id;
             let (tx, rx) = mpsc::channel();
+            let url_clone = url.clone();
             thread::spawn(move || {
                 let result = crate::source::ytdlp::resolve(&url, &crate::source::ytdlp::ProcessCommandRunner);
-                let _ = tx.send((req_id, result));
+                let _ = tx.send((req_id, url_clone, result));
             });
             app.ytdlp_rx = Some(rx);
         }
@@ -876,17 +1003,27 @@ fn toggle_play(app: &mut App, engine: &mut AudioEngine) {
 /// (T13) el panel se mantiene y el reproductor de fondo arranca la pista. Si
 /// el archivo no se puede abrir, seguimos donde estábamos con el error visible.
 fn play_selected(app: &mut App, engine: &mut AudioEngine) {
-    let Some(library_index) = app.view.get(app.selected).copied() else {
+    let Some(item) = app.view.get(app.selected).copied() else {
         return;
     };
-    let Some(track) = library_get(app, library_index) else {
-        return;
-    };
-    if start_local_playback(app, engine, track.path.clone()) {
-        if let Some(library) = app.library.as_mut() {
-            library.set_current(Some(library_index));
+    match item {
+        ViewItem::History(hist_idx) => {
+            if let Some(entry) = app.history.get(hist_idx) {
+                let url = entry.url.clone();
+                submit_url_prompt(url, app, engine);
+            }
         }
-        app.mode = Mode::Player;
+        ViewItem::Track(library_index) => {
+            let Some(track) = library_get(app, library_index) else {
+                return;
+            };
+            if start_local_playback(app, engine, track.path.clone()) {
+                if let Some(library) = app.library.as_mut() {
+                    library.set_current(Some(library_index));
+                }
+                app.mode = Mode::Player;
+            }
+        }
     }
 }
 
@@ -894,13 +1031,28 @@ fn play_selected(app: &mut App, engine: &mut AudioEngine) {
 /// respetando shuffle y repeat, sin salir del modo actual (en el explorador
 /// además mueve la selección). No envuelve con repeat Off/One.
 fn play_step(app: &mut App, engine: &mut AudioEngine, step: isize) {
-    if app.shuffle && app.shuffle_order.len() != app.view.len() {
-        // La lista cambió desde que se armó el orden (filtro/rescann).
-        app.shuffle_order = shuffle_order(app.view.len());
+    let track_positions: Vec<usize> = app
+        .view
+        .iter()
+        .enumerate()
+        .filter_map(|(pos, item)| match item {
+            ViewItem::Track(_) => Some(pos),
+            ViewItem::History(_) => None,
+        })
+        .collect();
+
+    if track_positions.is_empty() {
+        return;
     }
-    let current = current_view_position(app);
-    let Some(target) = next_track(
-        app.view.len(),
+
+    if app.shuffle && app.shuffle_order.len() != track_positions.len() {
+        // La lista cambió desde que se armó el orden (filtro/rescann).
+        app.shuffle_order = shuffle_order(track_positions.len());
+    }
+    let current = current_view_position(app)
+        .and_then(|view_pos| track_positions.iter().position(|&p| p == view_pos));
+    let Some(target_idx) = next_track(
+        track_positions.len(),
         current,
         app.repeat,
         app.shuffle,
@@ -909,7 +1061,8 @@ fn play_step(app: &mut App, engine: &mut AudioEngine, step: isize) {
     ) else {
         return;
     };
-    let Some(library_index) = app.view.get(target).copied() else {
+    let target = track_positions[target_idx];
+    let Some(ViewItem::Track(library_index)) = app.view.get(target).copied() else {
         return;
     };
     let Some(track) = library_get(app, library_index) else {
@@ -926,7 +1079,12 @@ fn play_step(app: &mut App, engine: &mut AudioEngine, step: isize) {
 fn toggle_shuffle(app: &mut App) {
     app.shuffle = !app.shuffle;
     if app.shuffle {
-        app.shuffle_order = shuffle_order(app.view.len());
+        let count = app
+            .view
+            .iter()
+            .filter(|item| matches!(item, ViewItem::Track(_)))
+            .count();
+        app.shuffle_order = shuffle_order(count);
     }
 }
 
@@ -1508,9 +1666,22 @@ fn render_library(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-/// ¿La vista agrupa más de una carpeta (T14)? Con una sola carpeta en
-/// pantalla los encabezados solo ensucian, así que no se dibujan.
+fn item_group<'a>(app: &'a App, item: &ViewItem) -> Option<&'a str> {
+    match item {
+        ViewItem::History(_) => Some("Agregadas por URL"),
+        ViewItem::Track(idx) => library_get(app, *idx).map(|t| t.folder.as_str()),
+    }
+}
+
+/// ¿La vista agrupa más de una carpeta o incluye historial (T14/T1)?
+/// Con una sola carpeta en pantalla (y sin historial) los encabezados solo ensucian,
+/// así que no se dibujan. Si hay historial, siempre se dibuja "Agregadas por URL"
+/// y el grupo correspondiente a las pistas locales.
 fn view_is_grouped(app: &App) -> bool {
+    let has_history = app.view.iter().any(|item| matches!(item, ViewItem::History(_)));
+    if has_history {
+        return true;
+    }
     let mut first: Option<&str> = None;
     for position in 0..app.view.len() {
         let Some(track) = view_get(app, position) else {
@@ -1525,9 +1696,9 @@ fn view_is_grouped(app: &App) -> bool {
     false
 }
 
-/// Filas que ocupan `[from..=to]` (T14): una por track más un encabezado
-/// cada vez que cambia de carpeta; el grupo de `from` también cuenta si es
-/// distinto del track anterior, que queda fuera de la vista.
+/// Filas que ocupan `[from..=to]` (T14): una por item más un encabezado
+/// cada vez que cambia de grupo; el grupo de `from` también cuenta si es
+/// distinto del item anterior, que queda fuera de la vista.
 fn rows_between(app: &App, from: usize, to: usize, grouped: bool) -> usize {
     if from > to {
         return 0;
@@ -1535,17 +1706,18 @@ fn rows_between(app: &App, from: usize, to: usize, grouped: bool) -> usize {
     let mut rows = 0;
     let mut previous: Option<&str> = None;
     if grouped && from > 0 {
-        previous = view_get(app, from - 1).map(|track| track.folder.as_str());
+        previous = app.view.get(from - 1).and_then(|item| item_group(app, item));
     }
     for position in from..=to {
-        let Some(track) = view_get(app, position) else {
+        let Some(item) = app.view.get(position) else {
             break;
         };
-        if grouped && previous != Some(track.folder.as_str()) {
+        let group = item_group(app, item);
+        if grouped && group.is_some() && previous != group {
             rows += 1;
         }
         rows += 1;
-        previous = Some(track.folder.as_str());
+        previous = group;
     }
     rows
 }
@@ -1568,14 +1740,68 @@ fn visible_start(app: &App, height: usize, grouped: bool) -> usize {
     start
 }
 
-/// Filas visibles de la biblioteca (T14): encabezados de carpeta
-/// intercalados cuando la vista agrupa más de una carpeta. Los encabezados
+fn history_row_line(
+    entry: &crate::history::HistoryEntry,
+    selected: bool,
+    playing: bool,
+    width: u16,
+) -> Line<'static> {
+    let cursor = if selected { CURSOR } else { " " };
+    let marker = if playing { PLAYING } else { " " };
+    let badge = "[URL] ";
+
+    let budget = (width as usize).saturating_sub(2 + badge.chars().count());
+
+    let title_raw = if entry.title.is_empty() {
+        &entry.url
+    } else {
+        &entry.title
+    };
+
+    let title_chars = title_raw.chars().count();
+    let (title_display, padding) = if title_chars <= budget {
+        (title_raw.to_string(), budget - title_chars)
+    } else {
+        let truncated = truncate_chars(title_raw, budget);
+        let pad = budget.saturating_sub(truncated.chars().count());
+        (truncated, pad)
+    };
+
+    let (cursor_style, marker_style, badge_style, title_style) = if selected {
+        let bg = theme().select_bg;
+        (
+            Style::default().bg(bg).fg(theme().accent).add_modifier(Modifier::BOLD),
+            Style::default().bg(bg).fg(theme().ok),
+            Style::default().bg(bg).fg(theme().accent).add_modifier(Modifier::BOLD),
+            Style::default().bg(bg).fg(theme().text).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        (
+            Style::default().fg(theme().accent).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme().ok),
+            Style::default().fg(theme().accent),
+            Style::default().fg(theme().text),
+        )
+    };
+
+    let spaces = " ".repeat(padding);
+    let title_with_pad = format!("{title_display}{spaces}");
+
+    let spans = vec![
+        Span::styled(cursor, cursor_style),
+        Span::styled(marker, marker_style),
+        Span::styled(badge, badge_style),
+        Span::styled(title_with_pad, title_style),
+    ];
+
+    Line::from(spans)
+}
+
+/// Filas visibles de la biblioteca (T14/T1): encabezados de grupo
+/// intercalados ("Agregadas por URL" y carpetas). Los encabezados
 /// no son seleccionables — `selected` sigue siendo un índice sobre `view`
 /// y las flechas los saltan solas.
 fn library_rows(app: &App, width: u16, height: u16) -> Vec<Line<'static>> {
-    let Some(library) = &app.library else {
-        return Vec::new();
-    };
     let height = height as usize;
     if height == 0 {
         return Vec::new();
@@ -1586,32 +1812,53 @@ fn library_rows(app: &App, width: u16, height: u16) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(height);
     let mut previous: Option<&str> = None;
     if grouped && start > 0 {
-        previous = view_get(app, start - 1).map(|track| track.folder.as_str());
+        previous = app.view.get(start - 1).and_then(|item| item_group(app, item));
     }
-    for (position, library_index) in app.view.iter().enumerate().skip(start) {
+    for (position, item) in app.view.iter().enumerate().skip(start) {
         if lines.len() >= height {
             break;
         }
-        let Some(track) = library.get(*library_index) else {
-            break;
-        };
-        if grouped && previous != Some(track.folder.as_str()) {
-            // Dejan entrar encabezado + fila; si no, se corta la vista.
-            if lines.len() + 2 > height {
-                break;
+        let group = item_group(app, item);
+        if grouped && previous != group {
+            if let Some(grp) = group {
+                // Dejan entrar encabezado + fila; si no, se corta la vista.
+                if lines.len() + 2 > height {
+                    break;
+                }
+                lines.push(folder_header_line(grp, width));
             }
-            lines.push(folder_header_line(&track.folder, width));
-            previous = Some(track.folder.as_str());
+            previous = group;
         }
         let is_selected = position == app.selected;
-        let is_playing = app.current_path.as_deref() == Some(track.path.as_path());
-        lines.push(row_line(
-            track,
-            position + 1,
-            is_selected,
-            is_playing,
-            width,
-        ));
+        match item {
+            ViewItem::History(hist_idx) => {
+                let Some(entry) = app.history.get(*hist_idx) else {
+                    break;
+                };
+                let is_playing = app.is_url
+                    && ((!entry.title.is_empty() && app.track_label == entry.title)
+                        || app.track_label == entry.url);
+                lines.push(history_row_line(
+                    entry,
+                    is_selected,
+                    is_playing,
+                    width,
+                ));
+            }
+            ViewItem::Track(library_index) => {
+                let Some(track) = library_get(app, *library_index) else {
+                    break;
+                };
+                let is_playing = app.current_path.as_deref() == Some(track.path.as_path());
+                lines.push(row_line(
+                    track,
+                    position + 1,
+                    is_selected,
+                    is_playing,
+                    width,
+                ));
+            }
+        }
     }
     lines
 }
@@ -2296,6 +2543,8 @@ mod tests {
             ytdlp_request_id: 0,
             is_url: false,
             ytdlp_failed: false,
+            history: crate::history::History::default(),
+            pending_history: None,
         }
     }
 
@@ -3128,5 +3377,196 @@ mod tests {
         assert_eq!(action, None, "stale ytdlp result must be rejected");
 
         let _ = std::fs::remove_file(&t1);
+    }
+
+    #[test]
+    fn test_row_building_with_history_and_local_groups() {
+        let mut app = library_with_three();
+        app.history.add("Historial Cancion 1".to_string(), "https://example.com/song1.mp3".to_string());
+        refresh_view(&mut app);
+
+        assert_eq!(app.view.len(), 4);
+        assert_eq!(app.view[0], ViewItem::History(0));
+        assert_eq!(app.view[1], ViewItem::Track(0));
+
+        let lines = library_rows(&app, 60, 10);
+        let has_history_header = lines.iter().any(|l| {
+            l.spans.iter().any(|s| s.content.contains("Agregadas por URL"))
+        });
+        assert!(has_history_header, "debe contener encabezado 'Agregadas por URL'");
+
+        let has_history_badge = lines.iter().any(|l| {
+            l.spans.iter().any(|s| s.content.contains("[URL] "))
+        });
+        assert!(has_history_badge, "fila de historial debe tener badge '[URL] '");
+
+        let has_history_title = lines.iter().any(|l| {
+            l.spans.iter().any(|s| s.content.contains("Historial Cancion 1"))
+        });
+        assert!(has_history_title, "fila de historial debe mostrar el título");
+    }
+
+    #[test]
+    fn test_navigation_crossing_boundary_between_history_and_local() {
+        let mut app = library_with_three();
+        app.history.add("Historial Cancion 1".to_string(), "https://example.com/song1.mp3".to_string());
+        refresh_view(&mut app);
+
+        assert_eq!(app.view[0], ViewItem::History(0));
+        assert_eq!(app.view[1], ViewItem::Track(0));
+
+        app.selected = 0;
+        app.selected = move_selection(app.selected, 1, app.view.len());
+        assert_eq!(app.selected, 1);
+        assert_eq!(app.view[app.selected], ViewItem::Track(0));
+
+        app.selected = move_selection(app.selected, -1, app.view.len());
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.view[app.selected], ViewItem::History(0));
+    }
+
+    #[test]
+    fn test_search_filters_history_by_title_and_local_tracks() {
+        let mut app = library_with_three();
+        app.history.add("Bohemian Rhapsody".to_string(), "https://example.com/queen.mp3".to_string());
+        app.history.add("Yesterday".to_string(), "https://example.com/beatles.mp3".to_string());
+        refresh_view(&mut app);
+
+        assert_eq!(app.view.len(), 5);
+
+        app.filter = Some("bohemian".to_string());
+        refresh_view(&mut app);
+        assert_eq!(app.view.len(), 1);
+        assert_eq!(app.view[0], ViewItem::History(1));
+
+        app.filter = Some("beta".to_string());
+        refresh_view(&mut app);
+        assert_eq!(app.view.len(), 1);
+        assert_eq!(app.view[0], ViewItem::Track(1));
+    }
+
+    #[test]
+    fn test_enter_on_history_row_dispatches_playback() {
+        let mut app = library_with_three();
+        app.history.add("Historial Cancion".to_string(), "https://example.com/stream.mp3".to_string());
+        refresh_view(&mut app);
+
+        app.selected = 0;
+        let mut engine = match AudioEngine::new() {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+
+        play_selected(&mut app, &mut engine);
+
+        assert_eq!(app.mode, Mode::Player);
+        assert!(app.is_url);
+        assert_eq!(app.track_label, "stream.mp3");
+    }
+
+    #[test]
+    fn test_history_recording_happens_only_on_successful_start() {
+        let mut app = test_app();
+        assert_eq!(app.history.len(), 0);
+
+        let mut engine = match AudioEngine::new() {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+
+        start_url_playback(
+            &mut app,
+            &mut engine,
+            "https://example.com/audio.mp3".to_string(),
+            "https://example.com/audio.mp3".to_string(),
+            "audio.mp3".to_string(),
+        );
+
+        assert_eq!(app.status, Status::Connecting);
+        assert_eq!(app.history.len(), 0);
+        assert!(app.pending_history.is_some());
+
+        let snapshot_playing = EngineSnapshot {
+            is_connecting: false,
+            is_playing: true,
+            is_paused: false,
+            had_playback_error: false,
+        };
+        apply_engine_snapshot(&mut app, snapshot_playing);
+
+        assert_eq!(app.status, Status::Playing);
+        assert_eq!(app.history.len(), 1);
+        assert_eq!(app.history.get(0).unwrap().url, "https://example.com/audio.mp3");
+        assert_eq!(app.history.get(0).unwrap().title, "audio.mp3");
+        assert!(app.pending_history.is_none());
+    }
+
+    #[test]
+    fn test_url_playback_error_keeps_history_empty() {
+        let mut app = test_app();
+        init_url_playback(&mut app, "https://youtube.com/watch?v=123".to_string(), "My Song".to_string());
+        assert_eq!(app.status, Status::Connecting);
+
+        let snapshot_error = EngineSnapshot {
+            is_connecting: false,
+            is_playing: false,
+            is_paused: false,
+            had_playback_error: true,
+        };
+        apply_engine_snapshot(&mut app, snapshot_error);
+        assert_eq!(app.status, Status::Stopped);
+        assert!(app.history.is_empty(), "history must stay empty on playback error");
+        assert!(app.pending_history.is_none());
+    }
+
+    #[test]
+    fn test_url_playback_connecting_keeps_history_empty_until_playing() {
+        let mut app = test_app();
+        init_url_playback(&mut app, "https://youtube.com/watch?v=123".to_string(), "My Song".to_string());
+
+        let snapshot_connecting = EngineSnapshot {
+            is_connecting: true,
+            is_playing: true,
+            is_paused: false,
+            had_playback_error: false,
+        };
+        apply_engine_snapshot(&mut app, snapshot_connecting);
+        assert_eq!(app.status, Status::Connecting);
+        assert!(app.history.is_empty(), "history must be empty while connecting");
+
+        let snapshot_playing = EngineSnapshot {
+            is_connecting: false,
+            is_playing: true,
+            is_paused: false,
+            had_playback_error: false,
+        };
+        apply_engine_snapshot(&mut app, snapshot_playing);
+        assert_eq!(app.status, Status::Playing);
+        assert_eq!(app.history.len(), 1, "exactly one history entry recorded on playing");
+        assert_eq!(app.history.get(0).unwrap().url, "https://youtube.com/watch?v=123");
+        assert_eq!(app.history.get(0).unwrap().title, "My Song");
+        assert!(app.pending_history.is_none());
+    }
+
+    #[test]
+    fn test_superseded_url_playback_is_never_recorded() {
+        let mut app = test_app();
+        init_url_playback(&mut app, "https://example.com/A.mp3".to_string(), "Track A".to_string());
+        init_url_playback(&mut app, "https://example.com/B.mp3".to_string(), "Track B".to_string());
+
+        let snapshot_playing = EngineSnapshot {
+            is_connecting: false,
+            is_playing: true,
+            is_paused: false,
+            had_playback_error: false,
+        };
+        apply_engine_snapshot(&mut app, snapshot_playing);
+        assert_eq!(app.status, Status::Playing);
+        assert_eq!(app.history.len(), 1);
+        assert_eq!(app.history.get(0).unwrap().url, "https://example.com/B.mp3");
+        assert!(
+            !app.history.entries().iter().any(|e| e.url == "https://example.com/A.mp3"),
+            "URL A must never be recorded"
+        );
     }
 }

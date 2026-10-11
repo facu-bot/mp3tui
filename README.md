@@ -186,6 +186,11 @@ mp3tui permite reproducir música remota directamente desde la terminal o desde 
   - Windows: `winget install yt-dlp` o `pip install yt-dlp`
   - Linux / macOS: `pip install yt-dlp` o el gestor de paquetes de tu distribución.
 - **Streaming y buffer:** el audio se reproduce en streaming directamente a memoria (nada se guarda en disco). Seek (±5 s) funciona si el servidor reporta tamaño (`Content-Length`) y soporta peticiones de rango (`Range: bytes=...`).
+- **Historial persistente:** las canciones reproducidas por URL con éxito se registran automáticamente en un historial (`history.toml` en el directorio de configuración, ej. `%APPDATA%\mp3tui\history.toml`):
+  - Almacena hasta 20 entradas (las más recientes primero, sin duplicados).
+  - Solo guarda título y enlace original (nunca URLs temporales expirables de YouTube ni audio en disco).
+  - Aparece en el explorador (`Tab`) arriba de la biblioteca local bajo el grupo `"Agregadas por URL"` con el distintivo `[URL]`.
+  - Se reproducen directamente con `Enter` sin volver a pegar el enlace y se filtran con la búsqueda (`/`).
 - **Navegación de biblioteca:** la reproducción por URL es puntual; los atajos de pista siguiente/anterior (`n`/`p`) y aleatorio (`s`) continúan operando sobre la biblioteca local escaneada. Al terminar una URL remota de forma natural, el reproductor se detiene en «Fin de la pista» sin avanzar a la biblioteca local ni reintentar pistas locales.
 
 ## Limitaciones conocidas
@@ -234,6 +239,8 @@ src/
   main.rs        CLI, carga de config, ciclo de vida
   ui/            TUI: player, explorador, búsqueda, visualizador, atajos
   audio/         Motor: decodificación, device, seek, velocidad, volumen
+  source/        Clasificación de URLs, streaming HTTP y resolución yt-dlp
+  history.rs     Historial persistente de URLs reproducidas (TOML)
   visualizer/    FFT y bandas para las barras
   playlist/      Escaneo de biblioteca, orden shuffle, siguiente/anterior
   playback.rs    Lógica pura (objetivos de seek, shuffle, repeat)

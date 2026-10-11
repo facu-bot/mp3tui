@@ -1,5 +1,6 @@
 mod audio;
 mod config;
+pub mod history;
 mod playback;
 mod playlist;
 #[allow(dead_code)]

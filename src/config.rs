@@ -70,6 +70,19 @@ fn resolve_path() -> Option<(PathBuf, bool)> {
     }
 }
 
+/// Directorio que contiene `config.toml` (o el directorio indicado por `MP3TUI_CONFIG`).
+pub fn config_dir() -> Option<PathBuf> {
+    resolve_path().and_then(|(path, _)| {
+        path.parent().map(|parent| {
+            if parent.as_os_str().is_empty() {
+                PathBuf::from(".")
+            } else {
+                parent.to_path_buf()
+            }
+        })
+    })
+}
+
 /// Lee el archivo (si existe) y lo parsea. Sin archivo: default silencioso.
 pub fn load() -> Config {
     let Some((path, from_override)) = resolve_path() else {
