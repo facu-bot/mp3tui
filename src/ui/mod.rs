@@ -16,7 +16,7 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, Ke
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Gauge, Paragraph};
+use ratatui::widgets::{Block, Paragraph};
 use ratatui::Frame;
 
 use crate::audio::{AudioEngine, SPEED_STEP};
@@ -28,6 +28,9 @@ use crate::visualizer::{SpectrumAnalyzer, NUM_BANDS};
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const VOLUME_STEP: f32 = 0.05;
 const PAGE_STEP: isize = 10;
+
+/// Bloques de octavo de celda para el visualizador sub-celda (mejora 1).
+const EIGHTH_BLOCKS: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
 
 // Paleta compartida por todo el programa (T9): viene de la config, con
 // defaults pulidos en `config::Theme::default()`. Se lee en cada estilizado
@@ -711,12 +714,13 @@ fn accent_title(text: &str) -> Span<'static> {
     )
 }
 
+/// Mejora 3: iconos Unicode en los estados de reproducción.
 fn status_parts(status: Status) -> (&'static str, Color) {
     match status {
-        Status::Playing => ("Reproduciendo", theme().ok),
-        Status::Paused => ("Pausado", theme().warn),
-        Status::Ended => ("Fin de la pista", theme().dim),
-        Status::Stopped => ("Detenido", theme().error),
+        Status::Playing => ("▶  Reproduciendo", theme().ok),
+        Status::Paused  => ("⏸  Pausado",       theme().warn),
+        Status::Ended   => ("⏹  Fin de pista",  theme().dim),
+        Status::Stopped => ("⏹  Detenido",      theme().error),
     }
 }
 
@@ -769,13 +773,26 @@ fn error_line(app: &App) -> Line<'static> {
 /// ancho y el explorador ocupa el 36% derecho superpuesto (más barras
 /// visibles pero el espectro sigue animando); el pie crece a 5 filas (3 de
 /// texto) para los atajos del panel y sigue a todo lo ancho para no cortarse.
+///
+/// Mejora 6: footer comprimible — si `area.height < 30`, el pie se reduce a
+/// 2 filas (1 de borde + 1 de contenido) independientemente del panel.
 fn player_areas(area: Rect, explorer_open: bool) -> (Rect, Rect, Rect, Option<Rect>) {
+    // Umbral de compresión: con exactamente 30 filas se usa el layout completo.
+    let compact = area.height < 30;
+    let footer_height = if compact {
+        2
+    } else if explorer_open {
+        5
+    } else {
+        4
+    };
+
     let zones = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(8),
             Constraint::Min(4),
-            Constraint::Length(if explorer_open { 5 } else { 4 }),
+            Constraint::Length(footer_height),
         ])
         .split(area);
     let footer = zones[2];
@@ -807,31 +824,53 @@ fn render_player(frame: &mut Frame<'_>, app: &App, engine: &AudioEngine) {
     let (info_area, visual_area, footer_area, panel) =
         player_areas(frame.area(), app.explorer_open);
 
-    render_player_info(frame, info_area, app, engine);
-    render_visualizer(frame, visual_area, app.analyzer.bands());
+    // Mejora 5: el foco visual va al panel cuando está abierto; info y
+    // visualizador quedan con borde apagado en ese caso.
+    let player_focused = !app.explorer_open;
+
+    render_player_info(frame, info_area, app, engine, player_focused);
+    render_visualizer(frame, visual_area, app.analyzer.bands(), player_focused);
     if let Some(panel_area) = panel {
         render_explorer_panel(frame, panel_area, app);
     }
-    render_footer(frame, footer_area, app);
+    let compact = frame.area().height < 30;
+    render_footer(frame, footer_area, app, compact);
 }
 
 /// Panel lateral del explorador (T13): la biblioteca superpuesta sobre el
 /// costado derecho, con el mismo bloque, título, scroll y marcadores de
 /// selección/reproducción que el explorador a pantalla completa.
 fn render_explorer_panel(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    render_library(frame, area, app);
+    render_library(frame, area, app, true);
 }
 
-fn render_player_info(frame: &mut Frame<'_>, area: Rect, app: &App, engine: &AudioEngine) {
-    let block = themed_block(accent_title("mp3tui"));
+fn render_player_info(frame: &mut Frame<'_>, area: Rect, app: &App, engine: &AudioEngine, focused: bool) {
+    // Mejora 5: borde acentuado cuando el player tiene el foco.
+    let border_color = if focused { theme().accent } else { theme().dim };
+    let block = Block::bordered()
+        .border_style(Style::default().fg(border_color))
+        .title(accent_title("mp3tui"));
     let inner = block.inner(area);
     frame.render_widget(block, area);
+
+    // Mejora 8: buscar metadatos del track actual en la biblioteca.
+    let track_meta: Option<(String, Option<String>)> = app.current_path.as_ref()
+        .and_then(|path| app.library.as_ref()?.index_of(path))
+        .and_then(|idx| app.library.as_ref()?.get(idx))
+        .and_then(|track| {
+            track.artist.as_ref().map(|a| (a.clone(), track.album.clone()))
+        });
 
     // La fila de velocidad aparece solo cuando no es 1.0x: en velocidad
     // normal el panel conserva su forma y el espacio no muestra ruido.
     let show_speed = (engine.speed() - 1.0).abs() > f32::EPSILON;
+    let show_meta = track_meta.is_some();
+
+    // Bloque inicial: archivo + (meta opcional) + estado + error.
+    let first_block_lines = if show_meta { 4 } else { 3 };
+
     let mut constraints = vec![
-        Constraint::Length(3),
+        Constraint::Length(first_block_lines),
         Constraint::Length(1),
         Constraint::Length(1),
     ];
@@ -849,14 +888,25 @@ fn render_player_info(frame: &mut Frame<'_>, area: Rect, app: &App, engine: &Aud
         Span::styled(app.track_label.as_str(), Style::default().fg(theme().text)),
     ]);
 
-    frame.render_widget(
-        Paragraph::new(vec![
-            file_line,
-            status_line(app.status, app.repeat, app.shuffle),
-            error_line(app),
-        ]),
-        rows[0],
-    );
+    let mut info_lines = vec![file_line];
+
+    // Mejora 8: línea de artista/álbum (solo si hay artista conocido).
+    if let Some((artist, album_opt)) = &track_meta {
+        let mut spans = vec![
+            Span::styled("Meta:    ", Style::default().fg(theme().dim)),
+            Span::styled(artist.clone(), Style::default().fg(theme().text)),
+        ];
+        if let Some(album) = album_opt {
+            spans.push(Span::styled("  ·  ", Style::default().fg(theme().dim)));
+            spans.push(Span::styled(album.clone(), Style::default().fg(theme().dim)));
+        }
+        info_lines.push(Line::from(spans));
+    }
+
+    info_lines.push(status_line(app.status, app.repeat, app.shuffle));
+    info_lines.push(error_line(app));
+
+    frame.render_widget(Paragraph::new(info_lines), rows[0]);
 
     let mut row = 1;
     if show_speed {
@@ -864,17 +914,113 @@ fn render_player_info(frame: &mut Frame<'_>, area: Rect, app: &App, engine: &Aud
         row += 1;
     }
 
+    // Mejora 4: barras de volumen y progreso con caracteres ━/╸/░.
     let volume = engine.volume().clamp(0.0, 1.0);
     let percent = (volume * 100.0).round() as u16;
+    let vol_suffix = format!("{percent}%");
     frame.render_widget(
-        Gauge::default()
-            .gauge_style(Style::default().fg(theme().accent))
-            .ratio(f64::from(volume))
-            .label(format!("Volumen {percent}%")),
+        Paragraph::new(build_bar(
+            "Volumen  ",
+            volume as f64,
+            &vol_suffix,
+            theme().accent,
+            theme().dim,
+            inner.width as usize,
+        )),
         rows[row],
     );
 
-    frame.render_widget(progress_gauge(app, engine), rows[row + 1]);
+    let position = engine.position();
+    let duration = engine.duration().or_else(|| current_track_duration(app));
+    match duration.filter(|total| !total.is_zero()) {
+        Some(total) => {
+            let ratio = (position.as_secs_f64() / total.as_secs_f64()).clamp(0.0, 1.0);
+            let prog_suffix = format!("{} / {}", format_duration(position), format_duration(total));
+            frame.render_widget(
+                Paragraph::new(build_bar(
+                    "Progreso ",
+                    ratio,
+                    &prog_suffix,
+                    theme().ok,
+                    theme().dim,
+                    inner.width as usize,
+                )),
+                rows[row + 1],
+            );
+        }
+        None => {
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled("Progreso ", Style::default().fg(theme().dim)),
+                    Span::styled(format_duration(position), Style::default().fg(theme().text)),
+                ])),
+                rows[row + 1],
+            );
+        }
+    }
+}
+
+/// Mejora 4: construye una barra de progreso visual con ━, ╸ y ░.
+///
+/// Formato: `label [━━━━╸░░░░]  suffix`
+/// `filled_ratio` en `[0.0, 1.0]`. `total_width` es el ancho disponible de
+/// la fila completa (en celdas de terminal).
+fn build_bar(
+    label: &str,
+    filled_ratio: f64,
+    suffix: &str,
+    filled_color: Color,
+    empty_color: Color,
+    total_width: usize,
+) -> Line<'static> {
+    // Ancho de la barra interna: descontar etiqueta + " [" + "] " + sufijo.
+    let overhead = label.chars().count() + 2 + 2 + suffix.chars().count();
+    let bar_chars = if total_width > overhead + 2 {
+        total_width - overhead
+    } else {
+        0
+    };
+
+    let label_span = Span::styled(label.to_string(), Style::default().fg(empty_color));
+
+    if bar_chars == 0 {
+        // Sin espacio para la barra, mostrar solo etiqueta + sufijo.
+        return Line::from(vec![
+            label_span,
+            Span::styled(suffix.to_string(), Style::default().fg(theme().text)),
+        ]);
+    }
+
+    let filled = (filled_ratio.clamp(0.0, 1.0) * bar_chars as f64).round() as usize;
+
+    let (filled_str, tip_str, empty_str) = if filled == 0 {
+        (String::new(), String::new(), "░".repeat(bar_chars))
+    } else if filled >= bar_chars {
+        ("━".repeat(bar_chars), String::new(), String::new())
+    } else {
+        // filled - 1 de ━ + 1 de ╸ + resto de ░
+        let dashes = if filled > 1 { "━".repeat(filled - 1) } else { String::new() };
+        let empty = "░".repeat(bar_chars - filled);
+        (dashes, "╸".to_string(), empty)
+    };
+
+    let mut spans = vec![
+        label_span,
+        Span::styled(" [", Style::default().fg(empty_color)),
+    ];
+    if !filled_str.is_empty() {
+        spans.push(Span::styled(filled_str, Style::default().fg(filled_color)));
+    }
+    if !tip_str.is_empty() {
+        spans.push(Span::styled(tip_str, Style::default().fg(filled_color)));
+    }
+    if !empty_str.is_empty() {
+        spans.push(Span::styled(empty_str, Style::default().fg(empty_color)));
+    }
+    spans.push(Span::styled("] ", Style::default().fg(empty_color)));
+    spans.push(Span::styled(suffix.to_string(), Style::default().fg(theme().text)));
+
+    Line::from(spans)
 }
 
 /// Fila "Velocidad: 1.25x" del panel de info (solo se renderiza si != 1.0x).
@@ -887,36 +1033,6 @@ fn speed_line(engine: &AudioEngine) -> Line<'static> {
 
 fn speed_label(speed: f32) -> String {
     format!("{speed:.2}x")
-}
-
-/// Barra de progreso de la pista: posición tomada del motor (se recalibra en
-/// cada seek) sobre la duración conocida; con duración desconocida se muestra
-/// la posición sin relleno.
-fn progress_gauge(app: &App, engine: &AudioEngine) -> Gauge<'static> {
-    let position = engine.position();
-    let duration = engine.duration().or_else(|| current_track_duration(app));
-    let label = match duration {
-        Some(total) => format!(
-            "Progreso {} / {}",
-            format_duration(position),
-            format_duration(total)
-        ),
-        None => format!("Progreso {} / —", format_duration(position)),
-    };
-
-    // Color distinto al de la barra de volumen (acento): con las dos en el
-    // mismo tono eran indistinguibles a simple vista salvo por la etiqueta.
-    let mut gauge = Gauge::default().label(label);
-    match duration.filter(|total| !total.is_zero()) {
-        Some(total) => {
-            let ratio = position.as_secs_f64() / total.as_secs_f64();
-            gauge = gauge.gauge_style(Style::default().fg(theme().ok)).ratio(ratio.clamp(0.0, 1.0));
-        }
-        None => {
-            gauge = gauge.gauge_style(Style::default().fg(theme().dim)).ratio(0.0);
-        }
-    }
-    gauge
 }
 
 /// Explorador a pantalla completa: solo cuando no hay sesión de audio (T13);
@@ -938,8 +1054,9 @@ fn render_browser(frame: &mut Frame<'_>, app: &App) {
         .split(frame.area());
 
     render_browser_header(frame, zones[0], app);
-    render_library(frame, zones[1], app);
-    render_footer(frame, zones[2], app);
+    render_library(frame, zones[1], app, false);
+    let compact = frame.area().height < 30;
+    render_footer(frame, zones[2], app, compact);
 }
 
 fn render_browser_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -980,15 +1097,30 @@ fn render_browser_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
     );
 }
 
-fn render_library(frame: &mut Frame<'_>, area: Rect, app: &App) {
+/// Mejora 5: `focused` controla el color del borde (acento cuando tiene foco,
+/// apagado cuando el panel del explorador tiene el foco).
+fn render_library(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
     let folder = library_folder_label(app);
     // Buscando: borde y título en el color de aviso (warn) en vez del acento
     // normal, para que el modo búsqueda se note de un vistazo y no sólo por
     // el texto "Buscar:" (que puede pasar desapercibido).
     let searching = app.search.is_some();
-    let highlight = if searching { theme().warn } else { theme().accent };
+    let highlight = if searching {
+        theme().warn
+    } else if focused {
+        theme().accent
+    } else {
+        theme().dim
+    };
+    let border_color = if searching {
+        theme().warn
+    } else if focused {
+        theme().accent
+    } else {
+        theme().dim
+    };
     let block = Block::bordered()
-        .border_style(Style::default().fg(if searching { theme().warn } else { theme().dim }))
+        .border_style(Style::default().fg(border_color))
         .title(Span::styled(
             library_title(app, &folder),
             Style::default().fg(highlight).add_modifier(Modifier::BOLD),
@@ -1209,8 +1341,8 @@ fn library_folder_label(app: &App) -> String {
     }
 }
 
-/// Una fila de la biblioteca, medida para ocupar exactamente `width`
-/// celdas: cursor + indicador + título/meta (recortado) + duración a la derecha.
+/// Mejora 7: una fila de la biblioteca con título en `theme().text` y
+/// artista/álbum en `theme().dim`. Ocupa exactamente `width` celdas.
 fn row_line(
     track: &Track,
     number: usize,
@@ -1236,21 +1368,48 @@ fn row_line(
     // indicador y la duración ya ocupan lo suyo.
     let budget = (width as usize).saturating_sub(2 + duration.chars().count());
 
-    let mut mid = format!("{number:>2}. ");
-    mid.push_str(&track.title);
-    if let Some(secondary) = track.secondary() {
-        mid.push_str("  \u{b7} ");
-        mid.push_str(&secondary);
-    }
-    let mut mid = truncate_chars(&mid, budget);
-    mid.push_str(&" ".repeat(budget.saturating_sub(mid.chars().count())));
+    // Parte principal: número + título.
+    let main_part = format!("{number:>2}. {}", track.title);
+    // Parte dim: separador + artista/álbum (solo si existe).
+    let dim_part_raw: String = track
+        .secondary()
+        .map(|s| format!("  \u{b7} {s}"))
+        .unwrap_or_default();
 
-    let (cursor_style, marker_style, title_style, duration_style) = if selected {
+    let main_chars = main_part.chars().count();
+    let dim_chars = dim_part_raw.chars().count();
+    let total_chars = main_chars + dim_chars;
+
+    // Calcular cuántos chars van a cada parte dentro del budget.
+    let (main_display, dim_display, padding) = if total_chars <= budget {
+        // Caben ambas; el relleno va al final del bloque dim (o al final del main si no hay dim).
+        let pad = budget - total_chars;
+        (main_part.clone(), dim_part_raw.clone(), pad)
+    } else if main_chars >= budget {
+        // El título solo ya supera el budget: truncar el título, sin dim.
+        let truncated = truncate_chars(&main_part, budget);
+        let pad = budget.saturating_sub(truncated.chars().count());
+        (truncated, String::new(), pad)
+    } else {
+        // El título cabe; el dim se trunca a lo que queda.
+        let dim_budget = budget - main_chars;
+        let truncated_dim = if dim_chars > dim_budget {
+            truncate_chars(&dim_part_raw, dim_budget)
+        } else {
+            dim_part_raw.clone()
+        };
+        let used = main_chars + truncated_dim.chars().count();
+        let pad = budget.saturating_sub(used);
+        (main_part.clone(), truncated_dim, pad)
+    };
+
+    let (cursor_style, marker_style, title_style, dim_style, duration_style) = if selected {
         let bg = theme().select_bg;
         (
             Style::default().bg(bg).fg(theme().accent).add_modifier(Modifier::BOLD),
             Style::default().bg(bg).fg(theme().ok),
             Style::default().bg(bg).fg(theme().text).add_modifier(Modifier::BOLD),
+            Style::default().bg(bg).fg(theme().dim),
             Style::default().bg(bg).fg(theme().dim),
         )
     } else {
@@ -1259,15 +1418,33 @@ fn row_line(
             Style::default().fg(theme().ok),
             Style::default().fg(theme().text),
             Style::default().fg(theme().dim),
+            Style::default().fg(theme().dim),
         )
     };
 
-    Line::from(vec![
+    // El relleno de espacios se adjunta al último span del bloque central.
+    let spaces = " ".repeat(padding);
+    let dim_with_pad = format!("{dim_display}{spaces}");
+
+    let mut spans = vec![
         Span::styled(cursor, cursor_style),
         Span::styled(marker, marker_style),
-        Span::styled(mid, title_style),
-        Span::styled(duration, duration_style),
-    ])
+        Span::styled(main_display, title_style),
+    ];
+    // Si dim_with_pad está vacío (ni dim ni padding) no agregar el span.
+    if !dim_with_pad.is_empty() {
+        spans.push(Span::styled(dim_with_pad, dim_style));
+    } else {
+        // Sin parte dim: el padding va adjunto al span del título si el
+        // presupuesto no fue exacto (esto puede ocurrir cuando dim_display
+        // está vacío y padding > 0 pero la rama anterior lo puso en dim_with_pad).
+        // La rama ya cubre esto: dim_with_pad = spaces en ese caso.
+    }
+    if !duration.is_empty() {
+        spans.push(Span::styled(duration, duration_style));
+    }
+
+    Line::from(spans)
 }
 
 fn truncate_chars(text: &str, max: usize) -> String {
@@ -1294,15 +1471,23 @@ fn format_duration(duration: Duration) -> String {
     }
 }
 
-fn render_visualizer(frame: &mut Frame<'_>, area: Rect, bands: &[f32; NUM_BANDS]) {
-    let block = themed_block(accent_title("Visualizador"));
+/// Mejora 5: `focused` controla el color del borde del visualizador.
+fn render_visualizer(frame: &mut Frame<'_>, area: Rect, bands: &[f32; NUM_BANDS], focused: bool) {
+    let border_color = if focused { theme().accent } else { theme().dim };
+    let block = Block::bordered()
+        .border_style(Style::default().fg(border_color))
+        .title(accent_title("Visualizador"));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     paint_bands(frame.buffer_mut(), inner, bands, theme());
 }
 
-/// Pinta las 32 barras dentro del área interior del bloque, sin widgets:
-/// cada celda recibe el simbolo y el color de su altura en el gradiente.
+/// Pinta las 32 barras dentro del área interior del bloque, sin widgets.
+/// Mejora 1: usa bloques de octavo de celda para la celda parcial superior.
+/// Mejora 2: el gap entre barras ya está garantizado por
+///   `bar_width = slot_width.saturating_sub(1).max(1)`:
+///   - slot_width >= 2 → bar_width = slot_width - 1 ≥ 1 (gap de 1 col)
+///   - slot_width == 1 → bar_width = 1 (sin espacio: no hay gap posible)
 fn paint_bands(
     buffer: &mut ratatui::buffer::Buffer,
     inner: Rect,
@@ -1315,6 +1500,9 @@ fn paint_bands(
 
     // 32 slots de `slot_w` columnas: 1 para la barra + 1 de separación.
     let slot_width = (inner.width / NUM_BANDS as u16).max(1);
+    // El gap entre barras está garantizado por esta fórmula:
+    // slot_width >= 2 → bar_width = slot_width - 1 (al menos 1 col de gap)
+    // slot_width == 1 → bar_width = 1 (no hay gap, el espacio no alcanza)
     let bar_width = slot_width.saturating_sub(1).max(1);
     let right = inner.x + inner.width;
     let bottom = inner.y + inner.height;
@@ -1325,24 +1513,56 @@ fn paint_bands(
             break;
         }
         let width = bar_width.min(right - x0);
-        let height = ((magnitude.clamp(0.0, 1.0)) * inner.height as f32).round() as u16;
 
-        for row in 0..inner.height {
+        // Sub-celda: altura continua → celdas completas + fracción.
+        let height_f = magnitude.clamp(0.0, 1.0) * inner.height as f32;
+        let full_cells = height_f.floor() as u16;
+        let frac = height_f - height_f.floor();
+
+        // Pintar las celdas completas (█ con gradiente de color).
+        for row in 0..full_cells {
             let y = bottom - 1 - row;
-            let (symbol, color) = if row < height {
-                let t = if inner.height > 1 {
-                    row as f32 / (inner.height - 1) as f32
-                } else {
-                    1.0
-                };
-                let (red, green, blue) = spectrum_color(t, theme);
-                ('█', Color::Rgb(red, green, blue))
+            let t = if inner.height > 1 {
+                row as f32 / (inner.height - 1) as f32
             } else {
-                (' ', Color::Reset)
+                1.0
             };
+            let (red, green, blue) = spectrum_color(t, theme);
+            let color = Color::Rgb(red, green, blue);
             for dx in 0..width {
                 if let Some(cell) = buffer.cell_mut((x0 + dx, y)) {
-                    cell.set_char(symbol).set_fg(color);
+                    cell.set_symbol("█").set_fg(color);
+                }
+            }
+        }
+
+        // Pintar la celda parcial con el bloque de octavo correspondiente.
+        if frac > 0.0 && full_cells < inner.height {
+            let y = bottom - full_cells - 1;
+            let idx = ((frac * 8.0) as usize).min(7);
+            let symbol = EIGHTH_BLOCKS[idx];
+            // Color: el mismo gradiente que tendría si fuera una celda completa.
+            let t = if inner.height > 1 {
+                full_cells as f32 / (inner.height - 1) as f32
+            } else {
+                1.0
+            };
+            let (red, green, blue) = spectrum_color(t, theme);
+            let color = Color::Rgb(red, green, blue);
+            for dx in 0..width {
+                if let Some(cell) = buffer.cell_mut((x0 + dx, y)) {
+                    cell.set_symbol(symbol).set_fg(color);
+                }
+            }
+        }
+
+        // Limpiar las celdas vacías por encima de la barra.
+        let painted_rows = full_cells + if frac > 0.0 { 1 } else { 0 };
+        for row in painted_rows..inner.height {
+            let y = bottom - 1 - row;
+            for dx in 0..width {
+                if let Some(cell) = buffer.cell_mut((x0 + dx, y)) {
+                    cell.set_symbol(" ").set_fg(Color::Reset);
                 }
             }
         }
@@ -1379,7 +1599,10 @@ fn spectrum_color(t: f32, theme: &Theme) -> (u8, u8, u8) {
 /// entraban en una. Con la búsqueda abierta muestra su propio contexto.
 /// Pie de atajos: se arma desde la config para que muestre siempre las
 /// teclas reales aunque el usuario las remapee.
-fn footer_lines(app: &App) -> Vec<Line<'static>> {
+///
+/// Mejora 6: `compact` activo cuando `area.height < 30`; muestra una sola
+/// línea con los atajos críticos.
+fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
     if app.search.is_some() {
         return vec![
             Line::from(" Escribí para filtrar por título, artista, álbum o archivo "),
@@ -1387,6 +1610,15 @@ fn footer_lines(app: &App) -> Vec<Line<'static>> {
                 " Backspace: borrar   Enter: aplicar   Esc: cancelar (lista completa) ",
             ),
         ];
+    }
+
+    if compact {
+        let keys = &config::config().keys;
+        return vec![Line::from(format!(
+            " {}: pausa   {}: salir",
+            key_labels(&keys.play_pause),
+            key_labels(&keys.quit),
+        ))];
     }
 
     let keys = &config::config().keys;
@@ -1477,9 +1709,9 @@ fn footer_lines(app: &App) -> Vec<Line<'static>> {
     }
 }
 
-fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
+fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App, compact: bool) {
     frame.render_widget(
-        Paragraph::new(footer_lines(app))
+        Paragraph::new(footer_lines(app, compact))
             .block(
                 Block::bordered()
                     .border_style(Style::default().fg(theme().dim))
@@ -1620,10 +1852,37 @@ mod tests {
         bands[0] = 0.5;
         paint_bands(&mut buffer, area, &bands, &Theme::default());
 
-        // 5 filas de 10: y=9..5 son barra, y=4 queda vacia.
+        // 0.5 * 10 = 5.0 → full_cells = 5, frac = 0.0 → no partial cell.
+        // Rows y=9..5 (bottom 5) are full █, y=4 is empty.
         assert_eq!(buffer[(0u16, 5u16)].symbol(), "\u{2588}");
         assert_eq!(buffer[(0u16, 4u16)].symbol(), " ");
         assert_eq!(buffer[(0u16, 4u16)].fg, Color::Reset);
+    }
+
+    #[test]
+    fn paint_bands_partial_cell_uses_eighth_block() {
+        // magnitude = 0.45, inner.height = 10
+        // height_f = 0.45 * 10 = 4.5
+        // full_cells = 4, frac = 0.5
+        // idx = (0.5 * 8.0) as usize = 4 → EIGHTH_BLOCKS[4] = "▅"
+        // partial cell y = bottom - full_cells - 1 = 10 - 4 - 1 = 5
+        let area = Rect::new(0, 0, 8, 10);
+        let mut buffer = Buffer::empty(area);
+        let mut bands = [0.0f32; NUM_BANDS];
+        bands[0] = 0.45;
+        paint_bands(&mut buffer, area, &bands, &Theme::default());
+
+        let bottom = area.y + area.height; // = 10
+        let partial_y = bottom - 4 - 1; // = 5
+        assert_eq!(
+            buffer[(0u16, partial_y)].symbol(),
+            "▅",
+            "frac=0.5 → EIGHTH_BLOCKS[4] = ▅"
+        );
+        // The full cells below the partial cell should be █
+        assert_eq!(buffer[(0u16, bottom - 1)].symbol(), "█", "bottom full cell");
+        // The cell above the partial cell should be empty
+        assert_eq!(buffer[(0u16, partial_y - 1)].symbol(), " ", "above partial = empty");
     }
 
     fn test_app() -> App {
@@ -1926,7 +2185,7 @@ mod tests {
     fn footer_shows_the_new_shortcuts_in_each_mode() {
         let mut app = library_with_three();
         app.mode = Mode::Player;
-        let player: String = footer_lines(&app)
+        let player: String = footer_lines(&app, false)
             .iter()
             .map(|line| line_text(line))
             .collect::<Vec<_>>()
@@ -1936,7 +2195,7 @@ mod tests {
         }
 
         app.mode = Mode::Browser;
-        let browser: String = footer_lines(&app)
+        let browser: String = footer_lines(&app, false)
             .iter()
             .map(|line| line_text(line))
             .collect::<Vec<_>>()
@@ -1948,7 +2207,7 @@ mod tests {
         // Panel lateral abierto (T13): lista + playback + aviso de volumen.
         app.mode = Mode::Player;
         app.explorer_open = true;
-        let panel: String = footer_lines(&app)
+        let panel: String = footer_lines(&app, false)
             .iter()
             .map(|line| line_text(line))
             .collect::<Vec<_>>()
@@ -1967,7 +2226,7 @@ mod tests {
             assert!(panel.contains(hint), "footer del panel falta '{hint}': {panel}");
         }
         assert_eq!(
-            footer_lines(&app).len(),
+            footer_lines(&app, false).len(),
             3,
             "el pie con panel usa sus 3 líneas"
         );
@@ -1982,7 +2241,7 @@ mod tests {
         ] {
             app.mode = mode;
             app.explorer_open = open;
-            for line in footer_lines(&app) {
+            for line in footer_lines(&app, false) {
                 assert!(
                     line_width(&line) <= 78,
                     "línea del pie demasiado ancha ({}): {}",
@@ -1994,7 +2253,7 @@ mod tests {
         app.explorer_open = false;
 
         app.search = Some(String::new());
-        let search: String = footer_lines(&app)
+        let search: String = footer_lines(&app, false)
             .iter()
             .map(|line| line_text(line))
             .collect::<Vec<_>>()
@@ -2112,13 +2371,13 @@ mod tests {
         let failed_text = line_text(&failed);
         assert!(failed_text.contains("Detenido"), "{failed_text}");
         assert!(
-            !failed_text.contains("Fin de la pista"),
-            "{failed_text}"
+            !failed_text.contains("Fin de pista"),
+            "stopped no debe mostrar fin de pista: {failed_text}"
         );
 
         let ended = status_line(Status::Ended, RepeatMode::Off, false);
         let ended_text = line_text(&ended);
-        assert!(ended_text.contains("Fin de la pista"), "{ended_text}");
+        assert!(ended_text.contains("Fin de pista"), "{ended_text}");
         assert!(!ended_text.contains("Detenido"), "{ended_text}");
     }
 }
