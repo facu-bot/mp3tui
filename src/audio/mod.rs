@@ -6,7 +6,7 @@
 use std::fmt;
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -18,9 +18,7 @@ use ringbuf::{HeapCons, HeapProd, HeapRb};
 use symphonia::core::codecs::audio::{AudioDecoder, AudioDecoderOptions};
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::probe::Hint;
-use symphonia::core::formats::{
-    FormatOptions, FormatReader, SeekMode, SeekTo, TrackType,
-};
+use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, TrackType};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::units::{Time, TimeBase};
@@ -59,6 +57,14 @@ pub enum AudioError {
     Io(String),
     Device(String),
     UnsupportedSampleFormat(String),
+    Http(String),
+}
+
+/// Entrada de audio para el motor: archivo local o URL remota.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MediaInput {
+    File(PathBuf),
+    Url(String),
 }
 
 impl fmt::Display for AudioError {
@@ -80,11 +86,62 @@ impl fmt::Display for AudioError {
             AudioError::UnsupportedSampleFormat(detail) => {
                 write!(f, "formato de muestra del device no soportado: {detail}")
             }
+            AudioError::Http(detail) => write!(f, "error HTTP: {detail}"),
         }
     }
 }
 
 impl std::error::Error for AudioError {}
+
+/// Deduce una extensión recomendada a partir del `Content-Type` de la respuesta
+/// o de la extensión en la ruta de la URL para asistir al probe de symphonia.
+pub fn extension_hint(url: &str, content_type: Option<&str>) -> Option<&'static str> {
+    if let Some(ct) = content_type {
+        let mime = ct.split(';').next().unwrap_or("").trim();
+        let mime_lower = mime.to_ascii_lowercase();
+        match mime_lower.as_str() {
+            "audio/mpeg" => return Some("mp3"),
+            "audio/mp4" | "audio/m4a" | "audio/x-m4a" | "video/mp4" => return Some("m4a"),
+            "audio/aac" => return Some("aac"),
+            "audio/ogg" | "application/ogg" => return Some("ogg"),
+            "audio/flac" | "audio/x-flac" => return Some("flac"),
+            "audio/wav" | "audio/x-wav" | "audio/wave" => return Some("wav"),
+            _ => {}
+        }
+    }
+
+    let path = match url.find(['?', '#']) {
+        Some(idx) => &url[..idx],
+        None => url,
+    };
+    let last_segment = path.rsplit('/').next().unwrap_or("");
+    if let Some((stem, ext)) = last_segment.rsplit_once('.')
+        && !stem.is_empty()
+        && !ext.is_empty()
+    {
+        let ext_lower = ext.to_ascii_lowercase();
+        return match ext_lower.as_str() {
+            "mp3" => Some("mp3"),
+            "m4a" | "mp4" => Some("m4a"),
+            "aac" => Some("aac"),
+            "ogg" | "oga" | "opus" => Some("ogg"),
+            "flac" => Some("flac"),
+            "wav" | "wave" => Some("wav"),
+            _ => None,
+        };
+    }
+
+    None
+}
+
+/// Construye un `Hint` de symphonia a partir de la URL y el Content-Type reportado.
+pub fn hint_from_url_and_content_type(url: &str, content_type: Option<&str>) -> Hint {
+    let mut hint = Hint::new();
+    if let Some(ext) = extension_hint(url, content_type) {
+        hint.with_extension(ext);
+    }
+    hint
+}
 
 /// Consumidor de muestras mono para el visualizador FFT (T4).
 pub struct VisualizerTap {
@@ -155,6 +212,12 @@ struct Shared {
     played_frames: AtomicU64,
     /// Duración total de la pista en nanosegundos; 0 = desconocida.
     duration_ns: AtomicU64,
+    /// Handle para cancelar stream HTTP activo desde stop() / drop().
+    http_cancel: Mutex<Option<crate::source::http_stream::CancelHandle>>,
+    /// Generación/sesión para aislar hilos detached de URLs previas.
+    session_id: AtomicU64,
+    /// Indica si el stream actual soporta seek (Content-Length conocido).
+    is_seekable: AtomicBool,
 }
 
 pub struct AudioEngine {
@@ -196,6 +259,9 @@ impl AudioEngine {
                 playback_clear: AtomicBool::new(false),
                 played_frames: AtomicU64::new(0),
                 duration_ns: AtomicU64::new(0),
+                http_cancel: Mutex::new(None),
+                session_id: AtomicU64::new(0),
+                is_seekable: AtomicBool::new(true),
             }),
             tap: Arc::new(Mutex::new(VisualizerTap {
                 consumer: None,
@@ -206,8 +272,21 @@ impl AudioEngine {
         })
     }
 
+    /// Inicia la reproducción desde una URL remota de audio sin bloquear el hilo actual.
+    pub fn play_url(&mut self, url: &str) -> Result<(), AudioError> {
+        self.play_input(MediaInput::Url(url.to_string()))
+    }
+
+    /// Inicia la reproducción desde una ruta de archivo local.
     pub fn play(&mut self, path: &Path) -> Result<(), AudioError> {
+        self.play_input(MediaInput::File(path.to_path_buf()))
+    }
+
+    /// Inicia la reproducción desde una entrada de audio (archivo local o URL remota).
+    pub fn play_input(&mut self, input: MediaInput) -> Result<(), AudioError> {
         self.stop();
+
+        let session_id = self.shared.session_id.fetch_add(1, Ordering::SeqCst) + 1;
 
         // Si el arranque falla en cualquier punto (archivo, device, hilo),
         // el flag queda en true y la UI muestra «Detenido» en vez de decir
@@ -217,13 +296,6 @@ impl AudioEngine {
             .had_playback_error
             .store(true, Ordering::Release);
 
-        if !path.exists() {
-            return Err(AudioError::FileNotFound(path.to_path_buf()));
-        }
-        if !path.is_file() {
-            return Err(AudioError::NotAFile(path.to_path_buf()));
-        }
-
         let dev_channels = self.config.channels as usize;
         if dev_channels == 0 {
             return Err(AudioError::Device(
@@ -232,90 +304,186 @@ impl AudioEngine {
         }
         let dev_rate = self.config.sample_rate;
 
-        let media = open_media(path)?;
-        let OpenedMedia {
-            format,
-            decoder,
-            track_id,
-            duration,
-            ..
-        } = media;
+        match input {
+            MediaInput::File(path) => {
+                if !path.exists() {
+                    return Err(AudioError::FileNotFound(path));
+                }
+                if !path.is_file() {
+                    return Err(AudioError::NotAFile(path));
+                }
 
-        let (prod, cons) = HeapRb::<f32>::new(PLAYBACK_BUF_SAMPLES).split();
-        let (tap_prod, tap_cons) = HeapRb::<f32>::new(TAP_BUF_SAMPLES).split();
-        *self.tap.lock().unwrap() = VisualizerTap::new(tap_cons, dev_rate);
-
-        *self.shared.error.lock().unwrap() = None;
-        // Pistas nuevas no heredan seeks ni errores de la anterior.
-        *self.shared.seek.lock().unwrap() = None;
-        *self.shared.seek_error.lock().unwrap() = None;
-        self.shared.playback_clear.store(false, Ordering::Release);
-        self.shared.played_frames.store(0, Ordering::Release);
-        self.shared
-            .duration_ns
-            .store(duration.map(ns_u64).unwrap_or(0), Ordering::Release);
-        self.shared.decoder_done.store(false, Ordering::Release);
-        self.shared.finished.store(false, Ordering::Release);
-        self.shared
-            .state
-            .store(STATE_PLAYING, Ordering::Release);
-
-        let stream = match self.build_stream(cons, tap_prod) {
-            Ok(stream) => stream,
-            Err(err) => {
-                self.reset_state();
-                return Err(err);
-            }
-        };
-
-        let thread_shared = Arc::clone(&self.shared);
-        // Último punto sin carrera: el hilo de decode recién va a existir,
-        // así que ningún fallo async pudo pisar este reset todavía. Los err
-        // paths posteriores (spawn, stream.play) vuelven a marcar el flag.
-        self.shared
-            .had_playback_error
-            .store(false, Ordering::Release);
-        let spawned = thread::Builder::new()
-            .name("mp3tui-decoder".to_string())
-            .spawn(move || {
-                decode_loop(
+                let media = open_media(&path)?;
+                let OpenedMedia {
                     format,
                     decoder,
                     track_id,
-                    dev_rate,
-                    dev_channels,
-                    prod,
-                    thread_shared,
-                )
-            });
-        let decoder_thread = match spawned {
-            Ok(handle) => handle,
-            Err(err) => {
-                drop(stream);
-                self.reset_state();
+                    duration,
+                    ..
+                } = media;
+
+                let (prod, cons) = HeapRb::<f32>::new(PLAYBACK_BUF_SAMPLES).split();
+                let (tap_prod, tap_cons) = HeapRb::<f32>::new(TAP_BUF_SAMPLES).split();
+                if let Ok(mut tap) = self.tap.lock() {
+                    *tap = VisualizerTap::new(tap_cons, dev_rate);
+                }
+
+                if let Ok(mut err) = self.shared.error.lock() {
+                    *err = None;
+                }
+                // Pistas nuevas no heredan seeks ni errores de la anterior.
+                if let Ok(mut seek) = self.shared.seek.lock() {
+                    *seek = None;
+                }
+                if let Ok(mut seek_err) = self.shared.seek_error.lock() {
+                    *seek_err = None;
+                }
+                self.shared.playback_clear.store(false, Ordering::Release);
+                self.shared.played_frames.store(0, Ordering::Release);
+                self.shared
+                    .duration_ns
+                    .store(duration.map(ns_u64).unwrap_or(0), Ordering::Release);
+                self.shared.is_seekable.store(true, Ordering::Release);
+                self.shared.decoder_done.store(false, Ordering::Release);
+                self.shared.finished.store(false, Ordering::Release);
+                self.shared.state.store(STATE_PLAYING, Ordering::Release);
+
+                let stream = match self.build_stream(cons, tap_prod) {
+                    Ok(stream) => stream,
+                    Err(err) => {
+                        self.reset_state();
+                        return Err(err);
+                    }
+                };
+
+                let thread_shared = Arc::clone(&self.shared);
+                // Último punto sin carrera: el hilo de decode recién va a existir.
                 self.shared
                     .had_playback_error
-                    .store(true, Ordering::Release);
-                return Err(AudioError::Device(format!(
-                    "no se pudo crear el hilo de decodificación: {err}"
-                )));
+                    .store(false, Ordering::Release);
+                let spawned = thread::Builder::new()
+                    .name("mp3tui-decoder".to_string())
+                    .spawn(move || {
+                        decode_loop(
+                            format,
+                            decoder,
+                            track_id,
+                            dev_rate,
+                            dev_channels,
+                            prod,
+                            thread_shared,
+                            session_id,
+                        )
+                    });
+                let decoder_thread = match spawned {
+                    Ok(handle) => handle,
+                    Err(err) => {
+                        drop(stream);
+                        self.reset_state();
+                        self.shared
+                            .had_playback_error
+                            .store(true, Ordering::Release);
+                        return Err(AudioError::Device(format!(
+                            "no se pudo crear el hilo de decodificación: {err}"
+                        )));
+                    }
+                };
+
+                if let Err(err) = stream.play() {
+                    self.shared.state.store(STATE_STOPPED, Ordering::Release);
+                    let _ = decoder_thread.join();
+                    drop(stream);
+                    self.reset_state();
+                    self.shared
+                        .had_playback_error
+                        .store(true, Ordering::Release);
+                    return Err(AudioError::Device(err.to_string()));
+                }
+
+                self.stream = Some(stream);
+                self.decoder = Some(decoder_thread);
+                Ok(())
             }
-        };
+            MediaInput::Url(url) => {
+                let (prod, cons) = HeapRb::<f32>::new(PLAYBACK_BUF_SAMPLES).split();
+                let (tap_prod, tap_cons) = HeapRb::<f32>::new(TAP_BUF_SAMPLES).split();
+                if let Ok(mut tap) = self.tap.lock() {
+                    *tap = VisualizerTap::new(tap_cons, dev_rate);
+                }
 
-        if let Err(err) = stream.play() {
-            self.shared.state.store(STATE_STOPPED, Ordering::Release);
-            let _ = decoder_thread.join();
-            drop(stream);
-            self.reset_state();
-            self.shared
-                .had_playback_error
-                .store(true, Ordering::Release);
-            return Err(AudioError::Device(err.to_string()));
+                if let Ok(mut err) = self.shared.error.lock() {
+                    *err = None;
+                }
+                if let Ok(mut seek) = self.shared.seek.lock() {
+                    *seek = None;
+                }
+                if let Ok(mut seek_err) = self.shared.seek_error.lock() {
+                    *seek_err = None;
+                }
+                self.shared.playback_clear.store(false, Ordering::Release);
+                self.shared.played_frames.store(0, Ordering::Release);
+                self.shared.duration_ns.store(0, Ordering::Release);
+                // Asumimos seekable por defecto hasta que open(&url) informe si hay Content-Length
+                self.shared.is_seekable.store(true, Ordering::Release);
+                self.shared.decoder_done.store(false, Ordering::Release);
+                self.shared.finished.store(false, Ordering::Release);
+                self.shared.state.store(STATE_PLAYING, Ordering::Release);
+
+                let stream = match self.build_stream(cons, tap_prod) {
+                    Ok(stream) => stream,
+                    Err(err) => {
+                        self.reset_state();
+                        return Err(err);
+                    }
+                };
+
+                let thread_shared = Arc::clone(&self.shared);
+                self.shared
+                    .had_playback_error
+                    .store(false, Ordering::Release);
+                let spawned = thread::Builder::new()
+                    .name("mp3tui-url-decoder".to_string())
+                    .spawn(move || {
+                        decode_url_pipeline(
+                            url,
+                            dev_rate,
+                            dev_channels,
+                            prod,
+                            thread_shared,
+                            session_id,
+                        );
+                    });
+                if let Err(err) = spawned {
+                    drop(stream);
+                    self.reset_state();
+                    self.shared
+                        .had_playback_error
+                        .store(true, Ordering::Release);
+                    return Err(AudioError::Device(format!(
+                        "no se pudo crear el hilo de decodificación: {err}"
+                    )));
+                }
+
+                if let Err(err) = stream.play() {
+                    self.shared.state.store(STATE_STOPPED, Ordering::Release);
+                    if let Ok(mut guard) = self.shared.http_cancel.lock()
+                        && let Some(cancel) = guard.take()
+                    {
+                        cancel.cancel();
+                    }
+                    drop(stream);
+                    self.reset_state();
+                    self.shared
+                        .had_playback_error
+                        .store(true, Ordering::Release);
+                    return Err(AudioError::Device(err.to_string()));
+                }
+
+                self.stream = Some(stream);
+                self.decoder = None;
+                Ok(())
+            }
         }
-
-        self.stream = Some(stream);
-        self.decoder = Some(decoder_thread);
-        Ok(())
     }
 
     pub fn pause(&self) {
@@ -331,9 +499,17 @@ impl AudioEngine {
     }
 
     pub fn stop(&mut self) {
+        self.shared.session_id.fetch_add(1, Ordering::SeqCst);
         self.shared.state.store(STATE_STOPPED, Ordering::Release);
+        if let Ok(mut guard) = self.shared.http_cancel.lock()
+            && let Some(cancel) = guard.take()
+        {
+            cancel.cancel();
+        }
         // Un seek pedido pero no aplicado no debe colarse en la próxima pista.
-        *self.shared.seek.lock().unwrap() = None;
+        if let Ok(mut seek) = self.shared.seek.lock() {
+            *seek = None;
+        }
         self.stream.take();
         if let Some(handle) = self.decoder.take() {
             let _ = handle.join();
@@ -407,10 +583,22 @@ impl AudioEngine {
         // en true y el seek se rechaza acá mismo (carrera del fin de pista:
         // sin esto, un seek podía escribirse justo cuando el hilo salía y se
         // perdía sin error, con position() mintiendo por un instante).
-        let mut pending = self.shared.seek.lock().unwrap();
+        let mut pending = match self.shared.seek.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                return Err(AudioError::Decode(
+                    "error bloqueando estado de seek".to_string(),
+                ));
+            }
+        };
         if self.stream.is_none() || self.shared.decoder_done.load(Ordering::Acquire) {
             return Err(AudioError::Decode(
                 "no hay una pista en reproducción".to_string(),
+            ));
+        }
+        if !self.shared.is_seekable.load(Ordering::Acquire) {
+            return Err(AudioError::Io(
+                "seek no soportado en stream HTTP sin Content-Length".to_string(),
             ));
         }
         let position = self.duration().map_or(position, |max| position.min(max));
@@ -431,7 +619,11 @@ impl AudioEngine {
 
     /// Error del último seek fallido (si lo hubo), para mostrarlo en la UI.
     pub fn take_seek_error(&self) -> Option<AudioError> {
-        self.shared.seek_error.lock().unwrap().take()
+        self.shared
+            .seek_error
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take())
     }
 
     /// Handle compartido para leer las muestras mono que suena el device (T4).
@@ -463,7 +655,11 @@ impl AudioEngine {
     /// Error del último decode/device fallido (si lo hubo), para mostrarlo
     /// en la UI. Se consume una sola vez.
     pub fn take_error(&self) -> Option<AudioError> {
-        self.shared.error.lock().unwrap().take()
+        self.shared
+            .error
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take())
     }
 
     /// ¿La última reproducción falló (o falló el arranque)? A diferencia de
@@ -491,16 +687,26 @@ impl AudioEngine {
             SampleFormat::F64 => build_stream_impl::<f64>(device, config, shared, cons, tap_prod),
             SampleFormat::I8 => build_stream_impl::<i8>(device, config, shared, cons, tap_prod),
             SampleFormat::I16 => build_stream_impl::<i16>(device, config, shared, cons, tap_prod),
-            SampleFormat::I24 => build_stream_impl::<cpal::I24>(device, config, shared, cons, tap_prod),
+            SampleFormat::I24 => {
+                build_stream_impl::<cpal::I24>(device, config, shared, cons, tap_prod)
+            }
             SampleFormat::I32 => build_stream_impl::<i32>(device, config, shared, cons, tap_prod),
             SampleFormat::I64 => build_stream_impl::<i64>(device, config, shared, cons, tap_prod),
             SampleFormat::U8 => build_stream_impl::<u8>(device, config, shared, cons, tap_prod),
             SampleFormat::U16 => build_stream_impl::<u16>(device, config, shared, cons, tap_prod),
-            SampleFormat::U24 => build_stream_impl::<cpal::U24>(device, config, shared, cons, tap_prod),
+            SampleFormat::U24 => {
+                build_stream_impl::<cpal::U24>(device, config, shared, cons, tap_prod)
+            }
             SampleFormat::U32 => build_stream_impl::<u32>(device, config, shared, cons, tap_prod),
             SampleFormat::U64 => build_stream_impl::<u64>(device, config, shared, cons, tap_prod),
             other => Err(AudioError::UnsupportedSampleFormat(other.to_string())),
         }
+    }
+}
+
+impl Drop for AudioEngine {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -555,9 +761,7 @@ where
         // también es contenido).
         let speed = f64::from(f32::from_bits(shared.speed.load(Ordering::Relaxed)));
         let counted = (frames as f64 * speed).round() as u64;
-        shared
-            .played_frames
-            .fetch_add(counted, Ordering::Relaxed);
+        shared.played_frames.fetch_add(counted, Ordering::Relaxed);
         mono.resize(frames, 0.0);
         for (frame_index, frame) in scratch.chunks_exact(channels).enumerate() {
             mono[frame_index] = frame.iter().sum::<f32>() / channels as f32;
@@ -604,8 +808,8 @@ struct OpenedMedia {
 }
 
 fn open_media(path: &Path) -> Result<OpenedMedia, AudioError> {
-    let file = File::open(path)
-        .map_err(|err| AudioError::Io(format!("{}: {err}", path.display())))?;
+    let file =
+        File::open(path).map_err(|err| AudioError::Io(format!("{}: {err}", path.display())))?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
 
     let mut hint = Hint::new();
@@ -669,6 +873,178 @@ fn ns_u64(duration: Duration) -> u64 {
     duration.as_nanos().min(u128::from(u64::MAX)) as u64
 }
 
+fn decode_url_pipeline(
+    url: String,
+    dev_rate: u32,
+    dev_channels: usize,
+    prod: HeapProd<f32>,
+    shared: Arc<Shared>,
+    session_id: u64,
+) {
+    let is_current = || {
+        shared.session_id.load(Ordering::Acquire) == session_id
+            && shared.state.load(Ordering::Acquire) != STATE_STOPPED
+    };
+
+    if !is_current() {
+        return;
+    }
+
+    let (http_stream, info) = match crate::source::http_stream::open(&url) {
+        Ok(res) => res,
+        Err(err) => {
+            if is_current() {
+                if let Ok(mut error_guard) = shared.error.lock() {
+                    *error_guard = Some(AudioError::Http(err.to_string()));
+                }
+                shared.state.store(STATE_STOPPED, Ordering::Release);
+                shared.had_playback_error.store(true, Ordering::Release);
+                shared.decoder_done.store(true, Ordering::Release);
+                shared.finished.store(true, Ordering::Release);
+            }
+            return;
+        }
+    };
+
+    let cancel_handle = http_stream.cancel_handle();
+    if !is_current() {
+        cancel_handle.cancel();
+        return;
+    }
+
+    if let Ok(mut cancel_guard) = shared.http_cancel.lock() {
+        *cancel_guard = Some(cancel_handle.clone());
+    }
+    shared
+        .is_seekable
+        .store(info.content_length.is_some(), Ordering::Release);
+
+    if !is_current() {
+        cancel_handle.cancel();
+        return;
+    }
+
+    let hint = hint_from_url_and_content_type(&url, info.content_type.as_deref());
+    let mss = MediaSourceStream::new(Box::new(http_stream), Default::default());
+
+    let format = match symphonia::default::get_probe()
+        .probe(
+            &hint,
+            mss,
+            FormatOptions::default(),
+            MetadataOptions::default(),
+        )
+        .map_err(map_symphonia_error)
+    {
+        Ok(fmt) => fmt,
+        Err(err) => {
+            cancel_handle.cancel();
+            if is_current() {
+                if let Ok(mut error_guard) = shared.error.lock() {
+                    *error_guard = Some(err);
+                }
+                shared.state.store(STATE_STOPPED, Ordering::Release);
+                shared.had_playback_error.store(true, Ordering::Release);
+                shared.decoder_done.store(true, Ordering::Release);
+                shared.finished.store(true, Ordering::Release);
+            }
+            return;
+        }
+    };
+
+    if !is_current() {
+        cancel_handle.cancel();
+        return;
+    }
+
+    let media_info = format.media_info();
+    let duration = match (media_info.time_base, media_info.duration) {
+        (Some(time_base), Some(ticks)) => time_base.calc_duration(ticks).and_then(|time| {
+            let nanos = time.as_nanos();
+            u64::try_from(nanos).ok().map(Duration::from_nanos)
+        }),
+        _ => None,
+    };
+    shared
+        .duration_ns
+        .store(duration.map(ns_u64).unwrap_or(0), Ordering::Release);
+
+    let track = match format.default_track(TrackType::Audio) {
+        Some(t) => t,
+        None => {
+            cancel_handle.cancel();
+            if is_current() {
+                if let Ok(mut error_guard) = shared.error.lock() {
+                    *error_guard = Some(AudioError::UnsupportedFormat(
+                        "sin pistas de audio".to_string(),
+                    ));
+                }
+                shared.state.store(STATE_STOPPED, Ordering::Release);
+                shared.had_playback_error.store(true, Ordering::Release);
+                shared.decoder_done.store(true, Ordering::Release);
+                shared.finished.store(true, Ordering::Release);
+            }
+            return;
+        }
+    };
+    let track_id = track.id;
+    let params = match track.codec_params.as_ref().and_then(|p| p.audio()) {
+        Some(p) => p,
+        None => {
+            cancel_handle.cancel();
+            if is_current() {
+                if let Ok(mut error_guard) = shared.error.lock() {
+                    *error_guard = Some(AudioError::UnsupportedFormat(
+                        "sin parámetros de codec de audio".to_string(),
+                    ));
+                }
+                shared.state.store(STATE_STOPPED, Ordering::Release);
+                shared.had_playback_error.store(true, Ordering::Release);
+                shared.decoder_done.store(true, Ordering::Release);
+                shared.finished.store(true, Ordering::Release);
+            }
+            return;
+        }
+    };
+
+    let decoder = match symphonia::default::get_codecs()
+        .make_audio_decoder(params, &AudioDecoderOptions::default())
+        .map_err(map_symphonia_error)
+    {
+        Ok(dec) => dec,
+        Err(err) => {
+            cancel_handle.cancel();
+            if is_current() {
+                if let Ok(mut error_guard) = shared.error.lock() {
+                    *error_guard = Some(err);
+                }
+                shared.state.store(STATE_STOPPED, Ordering::Release);
+                shared.had_playback_error.store(true, Ordering::Release);
+                shared.decoder_done.store(true, Ordering::Release);
+                shared.finished.store(true, Ordering::Release);
+            }
+            return;
+        }
+    };
+
+    if !is_current() {
+        cancel_handle.cancel();
+        return;
+    }
+
+    decode_loop(
+        format,
+        decoder,
+        track_id,
+        dev_rate,
+        dev_channels,
+        prod,
+        shared,
+        session_id,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
 fn decode_loop(
     format: Box<dyn FormatReader>,
     decoder: Box<dyn AudioDecoder>,
@@ -677,6 +1053,7 @@ fn decode_loop(
     dev_channels: usize,
     prod: HeapProd<f32>,
     shared: Arc<Shared>,
+    session_id: u64,
 ) {
     if let Err(err) = run_decode(
         format,
@@ -686,8 +1063,12 @@ fn decode_loop(
         dev_channels,
         prod,
         &shared,
-    ) {
-        *shared.error.lock().unwrap() = Some(err);
+        session_id,
+    ) && shared.session_id.load(Ordering::Acquire) == session_id
+    {
+        if let Ok(mut error_guard) = shared.error.lock() {
+            *error_guard = Some(err);
+        }
         // Estado honesto: sin esto el state queda PLAYING y la TUI mostraría
         // «Reproduciendo» para siempre mientras el device suena silencio (el
         // error nadie lo leía). El orden importa: el error se escribe ANTES
@@ -700,19 +1081,22 @@ fn decode_loop(
     // descarta, la pista terminó antes de poder aplicarlo: se fija la posición
     // en el fin para no reportar un seek que nunca se ejecutó (si el
     // contenedor no reporta duración, se conserva el último valor).
-    let mut pending = shared.seek.lock().unwrap();
-    if pending.take().is_some() {
-        let nanos = shared.duration_ns.load(Ordering::Acquire);
-        if nanos > 0 {
-            let rate = u64::from(dev_rate).max(1);
-            let frames = (u128::from(nanos) * u128::from(rate) / 1_000_000_000) as u64;
-            shared.played_frames.store(frames, Ordering::Release);
+    if shared.session_id.load(Ordering::Acquire) == session_id {
+        if let Ok(mut pending) = shared.seek.lock()
+            && pending.take().is_some()
+        {
+            let nanos = shared.duration_ns.load(Ordering::Acquire);
+            if nanos > 0 {
+                let rate = u64::from(dev_rate).max(1);
+                let frames = (u128::from(nanos) * u128::from(rate) / 1_000_000_000) as u64;
+                shared.played_frames.store(frames, Ordering::Release);
+            }
         }
+        shared.decoder_done.store(true, Ordering::Release);
     }
-    shared.decoder_done.store(true, Ordering::Release);
-    drop(pending);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_decode(
     mut format: Box<dyn FormatReader>,
     mut decoder: Box<dyn AudioDecoder>,
@@ -721,6 +1105,7 @@ fn run_decode(
     dev_channels: usize,
     mut prod: HeapProd<f32>,
     shared: &Shared,
+    session_id: u64,
 ) -> Result<(), AudioError> {
     let mut scratch: Vec<f32> = Vec::new();
     let mut mapped: Vec<f32> = Vec::new();
@@ -728,13 +1113,15 @@ fn run_decode(
     let mut pipeline: Option<PipelineState> = None;
 
     loop {
-        if shared.state.load(Ordering::Acquire) == STATE_STOPPED {
+        if shared.session_id.load(Ordering::Acquire) != session_id
+            || shared.state.load(Ordering::Acquire) == STATE_STOPPED
+        {
             return Ok(());
         }
 
         // Un seek pedido por la UI se aplica aquí (el FormatReader vive en
         // este hilo) y luego se reanuda el decode desde la nueva posición.
-        let pending_seek = shared.seek.lock().unwrap().take();
+        let pending_seek = shared.seek.lock().ok().and_then(|mut guard| guard.take());
         if let Some(target) = pending_seek {
             apply_seek(
                 target,
@@ -761,7 +1148,7 @@ fn run_decode(
                 // del loop y este punto se aplica acá (la pista reanuda desde
                 // la posición pedida). Si ese seek también cae al final, el
                 // próximo chequeo lo toma y sale limpio.
-                if let Some(target) = shared.seek.lock().unwrap().take() {
+                if let Some(target) = shared.seek.lock().ok().and_then(|mut guard| guard.take()) {
                     apply_seek(
                         target,
                         &mut format,
@@ -834,7 +1221,7 @@ fn run_decode(
             None => &mapped,
         };
 
-        if !push_wait(&mut prod, output, dev_channels, shared) {
+        if !push_wait(&mut prod, output, dev_channels, shared, session_id) {
             return Ok(());
         }
     }
@@ -1007,9 +1394,9 @@ fn apply_seek(
     let time = match Time::try_new(seconds, target.subsec_nanos()) {
         Some(time) => time,
         None => {
-            *shared.seek_error.lock().unwrap() = Some(AudioError::Decode(
-                "posición de seek inválida".to_string(),
-            ));
+            if let Ok(mut seek_err) = shared.seek_error.lock() {
+                *seek_err = Some(AudioError::Decode("posición de seek inválida".to_string()));
+            }
             return;
         }
     };
@@ -1022,11 +1409,15 @@ fn apply_seek(
     ) {
         Ok(_) => {}
         Err(SymphoniaError::IoError(io)) => {
-            *shared.seek_error.lock().unwrap() = Some(AudioError::Io(io.to_string()));
+            if let Ok(mut seek_err) = shared.seek_error.lock() {
+                *seek_err = Some(AudioError::Io(io.to_string()));
+            }
             return;
         }
         Err(err) => {
-            *shared.seek_error.lock().unwrap() = Some(AudioError::Decode(err.to_string()));
+            if let Ok(mut seek_err) = shared.seek_error.lock() {
+                *seek_err = Some(AudioError::Decode(err.to_string()));
+            }
             return;
         }
     }
@@ -1044,9 +1435,18 @@ fn apply_seek(
     shared.played_frames.store(frames, Ordering::Release);
 }
 
-fn push_wait(prod: &mut HeapProd<f32>, data: &[f32], channels: usize, shared: &Shared) -> bool {
+fn push_wait(
+    prod: &mut HeapProd<f32>,
+    data: &[f32],
+    channels: usize,
+    shared: &Shared,
+    session_id: u64,
+) -> bool {
     let mut pushed = 0usize;
     while pushed < data.len() {
+        if shared.session_id.load(Ordering::Acquire) != session_id {
+            return false;
+        }
         match shared.state.load(Ordering::Acquire) {
             STATE_STOPPED => return false,
             STATE_PAUSED => {
@@ -1072,7 +1472,6 @@ fn push_wait(prod: &mut HeapProd<f32>, data: &[f32], channels: usize, shared: &S
     }
     true
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1189,8 +1588,16 @@ mod tests {
         assert_eq!(clamp_speed(SPEED_MIN), 0.5);
         assert_eq!(clamp_speed(0.1), 0.5, "por debajo del mínimo se acota");
         assert_eq!(clamp_speed(3.0), 2.0, "por encima del máximo se acota");
-        assert_eq!(clamp_speed(f32::NAN), 1.0, "NaN vuelve a la velocidad normal");
-        assert_eq!(clamp_speed(f32::INFINITY), 1.0, "no finito = velocidad normal");
+        assert_eq!(
+            clamp_speed(f32::NAN),
+            1.0,
+            "NaN vuelve a la velocidad normal"
+        );
+        assert_eq!(
+            clamp_speed(f32::INFINITY),
+            1.0,
+            "no finito = velocidad normal"
+        );
         assert_eq!(clamp_speed(f32::NEG_INFINITY), 1.0);
     }
 
@@ -1204,7 +1611,10 @@ mod tests {
         let mut out_one = Vec::new();
         at_one.process(&input, &mut out_one);
         let base = out_one.len();
-        assert!(base >= 1990, "a 1.0x la salida ~= entrada (obtenido {base})");
+        assert!(
+            base >= 1990,
+            "a 1.0x la salida ~= entrada (obtenido {base})"
+        );
 
         // 2.0x: paso 2 -> ~2 muestras de entrada consumidas por salida:
         // la mitad de muestras de salida para la misma entrada.
@@ -1254,7 +1664,11 @@ mod tests {
         assert_eq!(resampler.speed, 1.5, "reset() no debe tocar la velocidad");
         assert_eq!(resampler.frac, 0.0);
         resampler.process(&input, &mut out);
-        assert_eq!(out.len(), produced_with_speed, "con la misma velocidad y entrada, igual de salida");
+        assert_eq!(
+            out.len(),
+            produced_with_speed,
+            "con la misma velocidad y entrada, igual de salida"
+        );
     }
 
     /// Duración real con velocidad 2.0x (requiere device): la pista de
@@ -1290,5 +1704,456 @@ mod tests {
                 && elapsed <= half + Duration::from_secs(2),
             "a 2.0x debería durar ~{half:?} (obtenido {elapsed:?}, total {total:?})"
         );
+    }
+
+    #[test]
+    fn test_hint_from_url_and_content_type() {
+        assert_eq!(
+            extension_hint("http://example.com/audio", Some("audio/mpeg")),
+            Some("mp3")
+        );
+        assert_eq!(
+            extension_hint("http://example.com/audio", Some("audio/mp4")),
+            Some("m4a")
+        );
+        assert_eq!(
+            extension_hint("http://example.com/audio", Some("audio/m4a")),
+            Some("m4a")
+        );
+        assert_eq!(
+            extension_hint("http://example.com/audio", Some("audio/x-m4a")),
+            Some("m4a")
+        );
+        assert_eq!(
+            extension_hint("http://example.com/audio", Some("video/mp4")),
+            Some("m4a")
+        );
+        assert_eq!(
+            extension_hint("http://example.com/audio", Some("audio/aac")),
+            Some("aac")
+        );
+        assert_eq!(
+            extension_hint("http://example.com/audio", Some("audio/ogg")),
+            Some("ogg")
+        );
+        assert_eq!(
+            extension_hint("http://example.com/audio", Some("application/ogg")),
+            Some("ogg")
+        );
+        assert_eq!(
+            extension_hint("http://example.com/audio", Some("audio/flac")),
+            Some("flac")
+        );
+        assert_eq!(
+            extension_hint("http://example.com/audio", Some("audio/x-flac")),
+            Some("flac")
+        );
+        assert_eq!(
+            extension_hint("http://example.com/audio", Some("audio/wav")),
+            Some("wav")
+        );
+        assert_eq!(
+            extension_hint("http://example.com/audio", Some("audio/x-wav")),
+            Some("wav")
+        );
+        assert_eq!(
+            extension_hint("http://example.com/audio", Some("audio/wave")),
+            Some("wav")
+        );
+        assert_eq!(
+            extension_hint(
+                "http://example.com/audio",
+                Some("audio/mpeg; charset=utf-8")
+            ),
+            Some("mp3")
+        );
+        // URL extension fallback when content-type is unknown
+        assert_eq!(
+            extension_hint(
+                "http://example.com/track.flac?token=123",
+                Some("application/octet-stream")
+            ),
+            Some("flac")
+        );
+        assert_eq!(
+            extension_hint("http://example.com/track.mp3", None),
+            Some("mp3")
+        );
+        assert_eq!(extension_hint("http://example.com/unknown", None), None);
+
+        let hint = hint_from_url_and_content_type("http://example.com/audio.mp3", None);
+        assert!(format!("{hint:?}").contains("mp3"));
+    }
+
+    #[test]
+    fn test_play_url_404_non_blocking_and_reports_error() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf);
+            // El servidor demora 500 ms en responder
+            thread::sleep(Duration::from_millis(500));
+            let response =
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let _ = socket.write_all(response.as_bytes());
+        });
+
+        let url = format!("http://127.0.0.1:{port}/missing.mp3");
+        let mut engine = match AudioEngine::new() {
+            Ok(engine) => engine,
+            Err(_) => {
+                eprintln!("skip: sin device de audio cpal en el entorno");
+                return;
+            }
+        };
+
+        let start = Instant::now();
+        let play_res = engine.play_url(&url);
+        let elapsed = start.elapsed();
+
+        assert!(play_res.is_ok(), "play_url debe retornar Ok inmediatamente");
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "play_url no debe bloquear al llamador, tardó {elapsed:?}"
+        );
+
+        // Esperar a que el hilo de fondo complete la conexión demorada y reporte el error
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut err_found = None;
+        while Instant::now() < deadline {
+            if let Some(err) = engine.take_error() {
+                err_found = Some(err);
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        let err = err_found.expect("el error 404 debe llegar por take_error()");
+        assert!(
+            engine.had_playback_error(),
+            "had_playback_error debe estar en true"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("404"),
+            "el mensaje de error debe mencionar 404, recibido: {msg}"
+        );
+    }
+
+    fn make_test_wav(num_samples: usize) -> Vec<u8> {
+        let sample_rate = 44100u32;
+        let channels = 1u16;
+        let bits_per_sample = 16u16;
+        let byte_rate = sample_rate * (channels as u32) * (bits_per_sample as u32 / 8);
+        let block_align = channels * (bits_per_sample / 8);
+        let data_len = (num_samples * 2) as u32;
+        let riff_len = 36 + data_len;
+
+        let mut wav = Vec::with_capacity(44 + num_samples * 2);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&riff_len.to_le_bytes());
+        wav.extend_from_slice(b"WAVE");
+        wav.extend_from_slice(b"fmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&channels.to_le_bytes());
+        wav.extend_from_slice(&sample_rate.to_le_bytes());
+        wav.extend_from_slice(&byte_rate.to_le_bytes());
+        wav.extend_from_slice(&block_align.to_le_bytes());
+        wav.extend_from_slice(&bits_per_sample.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_len.to_le_bytes());
+        for i in 0..num_samples {
+            let sample = ((i as f32 / 10.0).sin() * 10000.0) as i16;
+            wav.extend_from_slice(&sample.to_le_bytes());
+        }
+        wav
+    }
+
+    #[test]
+    fn test_url_decode_pipeline_with_generated_wav() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let wav_data = make_test_wav(4410); // 0.1 s de audio
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server_wav = wav_data.clone();
+        thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                server_wav.len()
+            );
+            let _ = socket.write_all(response.as_bytes());
+            let _ = socket.write_all(&server_wav);
+        });
+
+        let url = format!("http://127.0.0.1:{port}/test.wav");
+        let (stream, info) = crate::source::http_stream::open(&url).expect("abrir stream http");
+        assert_eq!(info.content_type.as_deref(), Some("audio/wav"));
+
+        let hint = hint_from_url_and_content_type(&url, info.content_type.as_deref());
+        let mss = MediaSourceStream::new(Box::new(stream), Default::default());
+        let mut format = symphonia::default::get_probe()
+            .probe(
+                &hint,
+                mss,
+                FormatOptions::default(),
+                MetadataOptions::default(),
+            )
+            .expect("probe sobre wav remoto");
+
+        let track = format
+            .default_track(TrackType::Audio)
+            .expect("pista de audio");
+        let params = track
+            .codec_params
+            .as_ref()
+            .and_then(|p| p.audio())
+            .expect("codec params");
+        let mut decoder = symphonia::default::get_codecs()
+            .make_audio_decoder(params, &AudioDecoderOptions::default())
+            .expect("decoder");
+
+        let packet = format.next_packet().expect("leer packet").expect("packet");
+        let decoded = decoder.decode(&packet).expect("decodificar packet");
+        assert!(decoded.frames() > 0, "debe decodificar muestras válidas");
+    }
+
+    #[test]
+    fn test_seek_unseekable_stream_fails_gracefully() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let wav_data = make_test_wav(44100 * 5); // 5 s de audio
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf);
+            // Sin Content-Length (stream no seekable)
+            let response =
+                "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nConnection: close\r\n\r\n";
+            let _ = socket.write_all(response.as_bytes());
+            let _ = socket.write_all(&wav_data[..4096]);
+            thread::sleep(Duration::from_millis(500));
+            let _ = socket.write_all(&wav_data[4096..]);
+        });
+
+        let url = format!("http://127.0.0.1:{port}/stream.wav");
+        let mut engine = match AudioEngine::new() {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+
+        engine.play_url(&url).expect("play_url");
+        // Esperar a que la conexión HTTP abra y detecte la ausencia de Content-Length
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while engine.shared.is_seekable.load(Ordering::Acquire) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        // El seek debe fallar amigablemente con error de no soportado
+        let res = engine.seek(Duration::from_secs(1));
+        assert!(
+            res.is_err(),
+            "seek en stream sin Content-Length debe retornar Err"
+        );
+        let err_msg = res.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("seek no soportado"),
+            "mensaje debe indicar seek no soportado, recibido: {err_msg}"
+        );
+        engine.stop();
+    }
+
+    #[test]
+    fn test_cancel_on_stop_promptly_terminates_decoder() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf);
+            let response =
+                "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nConnection: close\r\n\r\n";
+            let _ = socket.write_all(response.as_bytes());
+            // No envía datos adicionales, manteniendo la lectura en espera
+            thread::sleep(Duration::from_secs(5));
+        });
+
+        let url = format!("http://127.0.0.1:{port}/infinite.wav");
+        let mut engine = match AudioEngine::new() {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+
+        engine.play_url(&url).expect("play_url");
+        thread::sleep(Duration::from_millis(100));
+
+        let stop_start = Instant::now();
+        engine.stop();
+        let stop_elapsed = stop_start.elapsed();
+
+        assert!(
+            stop_elapsed < Duration::from_millis(300),
+            "stop() debe cancelar y unir el hilo prontamente, tardó {stop_elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn test_stop_while_connecting_returns_promptly() {
+        use std::io::Read;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf);
+            // El servidor no responde durante 3 segundos
+            thread::sleep(Duration::from_secs(3));
+        });
+
+        let url = format!("http://127.0.0.1:{port}/slow_connect.mp3");
+        let mut engine = match AudioEngine::new() {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+
+        engine.play_url(&url).expect("play_url");
+        thread::sleep(Duration::from_millis(50));
+
+        let stop_start = Instant::now();
+        engine.stop();
+        let stop_elapsed = stop_start.elapsed();
+
+        assert!(
+            stop_elapsed < Duration::from_millis(300),
+            "stop() mientras conecta debe retornar prontamente sin esperar a la red, tardó {stop_elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn test_drop_while_connecting_returns_promptly() {
+        use std::io::Read;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf);
+            thread::sleep(Duration::from_secs(3));
+        });
+
+        let url = format!("http://127.0.0.1:{port}/slow_drop.mp3");
+        let mut engine = match AudioEngine::new() {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+
+        engine.play_url(&url).expect("play_url");
+        thread::sleep(Duration::from_millis(50));
+
+        let drop_start = Instant::now();
+        drop(engine);
+        let drop_elapsed = drop_start.elapsed();
+
+        assert!(
+            drop_elapsed < Duration::from_millis(300),
+            "drop mientras conecta debe retornar prontamente, tardó {drop_elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn test_stale_url_thread_does_not_pollute_new_session() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener1 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port1 = listener1.local_addr().unwrap().port();
+
+        thread::spawn(move || {
+            let (mut socket, _) = listener1.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf);
+            // Demora 500 ms y luego responde con 404
+            thread::sleep(Duration::from_millis(500));
+            let response =
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let _ = socket.write_all(response.as_bytes());
+        });
+
+        let wav_data = make_test_wav(44100 * 3);
+        let listener2 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port2 = listener2.local_addr().unwrap().port();
+
+        let server_wav = wav_data.clone();
+        thread::spawn(move || {
+            let (mut socket, _) = listener2.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                server_wav.len()
+            );
+            let _ = socket.write_all(response.as_bytes());
+            let _ = socket.write_all(&server_wav);
+        });
+
+        let slow_url = format!("http://127.0.0.1:{port1}/slow_404.mp3");
+        let wav_url = format!("http://127.0.0.1:{port2}/good.wav");
+
+        let mut engine = match AudioEngine::new() {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+
+        engine.play_url(&slow_url).expect("play primer url");
+        thread::sleep(Duration::from_millis(50));
+
+        // Cambiamos a la segunda URL: debe cambiar de sesión de inmediato
+        let switch_start = Instant::now();
+        engine.play_url(&wav_url).expect("play segundo url");
+        let switch_elapsed = switch_start.elapsed();
+        assert!(
+            switch_elapsed < Duration::from_millis(300),
+            "cambiar de URL mientras la anterior conecta debe retornar prontamente, tardó {switch_elapsed:?}"
+        );
+
+        // Esperar a que la primera URL termine su demora de 500 ms y responda 404
+        thread::sleep(Duration::from_millis(600));
+
+        // El error de la primera URL no debe haber contaminado la sesión de la segunda
+        assert!(
+            engine.take_error().is_none(),
+            "el error de la sesión previa no debe aparecer en take_error()"
+        );
+        assert!(
+            !engine.had_playback_error(),
+            "had_playback_error no debe marcarse por una sesión previa"
+        );
+        engine.stop();
     }
 }
