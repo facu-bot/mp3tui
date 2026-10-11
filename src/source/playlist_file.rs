@@ -22,50 +22,23 @@ impl fmt::Display for PlaylistError {
 
 impl std::error::Error for PlaylistError {}
 
-use super::{http_scheme_len, starts_with_ignore_ascii_case, SCHEME_HTTPS};
-
-const FILE_KEY_PREFIX: &str = "file";
-
-/// Detecta si una cadena tiene un esquema explícito RFC 3986 ("letras://").
-fn has_explicit_scheme(s: &str) -> bool {
-    if let Some(idx) = s.find("://") {
-        let scheme = &s[..idx];
-        !scheme.is_empty()
-            && scheme.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
-            && scheme
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.')
-    } else {
-        false
+/// Compara si `s` comienza con `prefix` ignorando mayúsculas/minúsculas ASCII, sin panickear en límites UTF-8.
+fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
+    let s_bytes = s.as_bytes();
+    let prefix_bytes = prefix.as_bytes();
+    if s_bytes.len() < prefix_bytes.len() {
+        return false;
     }
-}
-
-/// Detecta si una cadena es una ruta absoluta de Windows ("C:\..." o "C:/...").
-fn is_windows_drive_path(s: &str) -> bool {
-    let bytes = s.as_bytes();
-    bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && (bytes[2] == b'\\' || bytes[2] == b'/')
+    s_bytes[..prefix_bytes.len()].eq_ignore_ascii_case(prefix_bytes)
 }
 
 /// Helper para resolver URLs relativas en listas de reproducción.
 fn resolve_url(entry: &str, base_url: &str) -> String {
     let entry_trimmed = entry.trim();
-
-    // Esquemas explícitos (http://, https://, icy://, rtsp://, file://, etc.) o rutas Windows absolutas se conservan sin modificar
-    if has_explicit_scheme(entry_trimmed) || is_windows_drive_path(entry_trimmed) {
+    if starts_with_ignore_ascii_case(entry_trimmed, "http://")
+        || starts_with_ignore_ascii_case(entry_trimmed, "https://")
+    {
         return entry_trimmed.to_string();
-    }
-
-    // Entradas protocol-relative ("//host/path") heredan el esquema de base_url
-    if entry_trimmed.starts_with("//") {
-        let base_scheme = if starts_with_ignore_ascii_case(base_url, SCHEME_HTTPS) {
-            "https:"
-        } else {
-            "http:"
-        };
-        return format!("{base_scheme}{entry_trimmed}");
     }
 
     let base_clean = match base_url.find(['?', '#']) {
@@ -73,7 +46,15 @@ fn resolve_url(entry: &str, base_url: &str) -> String {
         None => base_url,
     };
 
-    let scheme_len = http_scheme_len(base_clean).unwrap_or(0);
+    let scheme_len = if starts_with_ignore_ascii_case(base_clean, "http://") {
+        7
+    } else if starts_with_ignore_ascii_case(base_clean, "https://") {
+        8
+    } else {
+        0
+    };
+
+
     let rest = &base_clean[scheme_len..];
     let host_slash_offset = rest.find('/');
 
@@ -130,8 +111,8 @@ pub fn parse_m3u(text: &str, base_url: &str) -> Result<Vec<String>, PlaylistErro
     Ok(entries)
 }
 
-/// Parsea el contenido de una lista `.pls` tipo INI, resolviendo rutas relativas contra `base_url`.
-pub fn parse_pls(text: &str, base_url: &str) -> Result<Vec<String>, PlaylistError> {
+/// Parsea el contenido de una lista `.pls` tipo INI.
+pub fn parse_pls(text: &str) -> Result<Vec<String>, PlaylistError> {
     let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
     let mut entries: Vec<(usize, String)> = Vec::new();
 
@@ -147,24 +128,26 @@ pub fn parse_pls(text: &str, base_url: &str) -> Result<Vec<String>, PlaylistErro
         if let Some((key, val)) = trimmed.split_once('=') {
             let key_trimmed = key.trim();
             let val_trimmed = val.trim();
-            if starts_with_ignore_ascii_case(key_trimmed, FILE_KEY_PREFIX)
-                && key_trimmed.len() > FILE_KEY_PREFIX.len()
-                && let Ok(idx) = key_trimmed[FILE_KEY_PREFIX.len()..].parse::<usize>()
+            if starts_with_ignore_ascii_case(key_trimmed, "file")
+                && key_trimmed.len() > 4
+                && let Ok(idx) = key_trimmed[4..].parse::<usize>()
                 && !val_trimmed.is_empty()
             {
-                entries.push((idx, resolve_url(val_trimmed, base_url)));
+                entries.push((idx, val_trimmed.to_string()));
             }
         }
+
+
     }
 
     if entries.is_empty() {
         return Err(PlaylistError::Empty);
     }
 
-
     entries.sort_by_key(|(idx, _)| *idx);
     Ok(entries.into_iter().map(|(_, url)| url).collect())
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -240,38 +223,6 @@ subfolder/track.ogg
     }
 
     #[test]
-    fn test_parse_m3u_protocol_relative() {
-        let content = "//cdn.example.com/stream.mp3\n";
-        let res_https = parse_m3u(content, "https://example.com/list.m3u").unwrap();
-        assert_eq!(
-            res_https,
-            vec!["https://cdn.example.com/stream.mp3".to_string()]
-        );
-
-        let res_http = parse_m3u(content, "http://example.com/list.m3u").unwrap();
-        assert_eq!(
-            res_http,
-            vec!["http://cdn.example.com/stream.mp3".to_string()]
-        );
-    }
-
-    #[test]
-    fn test_parse_m3u_explicit_schemes_and_absolute_paths_pass_through() {
-        let content = "icy://radio.example.com:8000\nrtsp://media.example.com/live.sdp\nmms://stream.example.com/audio\nfile:///music/song.mp3\nC:\\Music\\song.mp3\n";
-        let res = parse_m3u(content, "http://example.com/dir/list.m3u").unwrap();
-        assert_eq!(
-            res,
-            vec![
-                "icy://radio.example.com:8000".to_string(),
-                "rtsp://media.example.com/live.sdp".to_string(),
-                "mms://stream.example.com/audio".to_string(),
-                "file:///music/song.mp3".to_string(),
-                r"C:\Music\song.mp3".to_string(),
-            ]
-        );
-    }
-
-    #[test]
     fn test_parse_m3u_realistic_sample() {
         let sample = "\
 #EXTM3U
@@ -293,9 +244,9 @@ http://example.com/audio/song2.flac
 
     #[test]
     fn test_parse_pls_empty() {
-        assert_eq!(parse_pls("", "http://example.com/"), Err(PlaylistError::Empty));
+        assert_eq!(parse_pls(""), Err(PlaylistError::Empty));
         assert_eq!(
-            parse_pls("[playlist]\nNumberOfEntries=0\nVersion=2", "http://example.com/"),
+            parse_pls("[playlist]\nNumberOfEntries=0\nVersion=2"),
             Err(PlaylistError::Empty)
         );
     }
@@ -312,26 +263,13 @@ File10=http://stream.example.com/ten.mp3\r\n\
 file1=http://stream.example.com/one.mp3   \r\n\
 Title1=First Stream\r\n\
 Version=2\r\n";
-        let res = parse_pls(content, "http://example.com/").unwrap();
+        let res = parse_pls(content).unwrap();
         assert_eq!(
             res,
             vec![
                 "http://stream.example.com/one.mp3".to_string(),
                 "http://stream.example.com/two.mp3".to_string(),
                 "http://stream.example.com/ten.mp3".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn test_parse_pls_resolves_relative_urls() {
-        let content = "[playlist]\nNumberOfEntries=2\nFile1=/streams/live.mp3\nFile2=sub/song.mp3\n";
-        let res = parse_pls(content, "http://radio.example.com:8000/music/list.pls").unwrap();
-        assert_eq!(
-            res,
-            vec![
-                "http://radio.example.com:8000/streams/live.mp3".to_string(),
-                "http://radio.example.com:8000/music/sub/song.mp3".to_string(),
             ]
         );
     }
@@ -344,7 +282,7 @@ File1=http://live.streamprovider.net:8000/mountpoint\r\n\
 Title1=(#1 - 500/1500) Super Radio FM\r\n\
 Length1=-1\r\n\
 Version=2\r\n";
-        let res = parse_pls(sample, "http://example.com/").unwrap();
+        let res = parse_pls(sample).unwrap();
         assert_eq!(
             res,
             vec!["http://live.streamprovider.net:8000/mountpoint".to_string()]
@@ -365,8 +303,9 @@ Version=2\r\n";
         );
 
         let pls = "[playlist]\nNúmero=1\nñññ1=ignored\nFile1=http://example.com/stream\n";
-        let res_pls = parse_pls(pls, "http://example.com/").unwrap();
+        let res_pls = parse_pls(pls).unwrap();
         assert_eq!(res_pls, vec!["http://example.com/stream".to_string()]);
     }
+
 }
 
