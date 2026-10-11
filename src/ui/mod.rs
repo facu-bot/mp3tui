@@ -1484,10 +1484,11 @@ fn render_visualizer(frame: &mut Frame<'_>, area: Rect, bands: &[f32; NUM_BANDS]
 
 /// Pinta las 32 barras dentro del área interior del bloque, sin widgets.
 /// Mejora 1: usa bloques de octavo de celda para la celda parcial superior.
-/// Mejora 2: el gap entre barras ya está garantizado por
-///   `bar_width = slot_width.saturating_sub(1).max(1)`:
-///   - slot_width >= 2 → bar_width = slot_width - 1 ≥ 1 (gap de 1 col)
-///   - slot_width == 1 → bar_width = 1 (sin espacio: no hay gap posible)
+/// Mejora 2: el gap entre barras está garantizado cuando el slot mide >= 2:
+///   - slot >= 2 → bar_width = slot - 1 ≥ 1 (gap de 1 col)
+///   - slot == 1 → bar_width = 1 (sin espacio: no hay gap posible)
+///
+/// Los slots se reparten proporcionalmente, así las barras ocupan todo el ancho.
 fn paint_bands(
     buffer: &mut ratatui::buffer::Buffer,
     inner: Rect,
@@ -1498,20 +1499,29 @@ fn paint_bands(
         return;
     }
 
-    // 32 slots de `slot_w` columnas: 1 para la barra + 1 de separación.
-    let slot_width = (inner.width / NUM_BANDS as u16).max(1);
-    // El gap entre barras está garantizado por esta fórmula:
-    // slot_width >= 2 → bar_width = slot_width - 1 (al menos 1 col de gap)
-    // slot_width == 1 → bar_width = 1 (no hay gap, el espacio no alcanza)
-    let bar_width = slot_width.saturating_sub(1).max(1);
     let right = inner.x + inner.width;
     let bottom = inner.y + inner.height;
+    let total = u32::from(inner.width);
+    let bands_count = NUM_BANDS as u32;
 
     for (band, &magnitude) in bands.iter().enumerate() {
-        let x0 = inner.x + band as u16 * slot_width;
+        // Los slots se reparten proporcionalmente para cubrir todo el ancho
+        // (sin dejar el resto de la división entera sin pintar). Si hay menos
+        // columnas que bandas, cada banda ocupa una columna y se corta al llegar.
+        let (slot_start, slot_end) = if total >= bands_count {
+            (
+                (total * band as u32 / bands_count) as u16,
+                (total * (band as u32 + 1) / bands_count) as u16,
+            )
+        } else {
+            (band as u16, band as u16 + 1)
+        };
+        let x0 = inner.x + slot_start;
         if x0 >= right {
             break;
         }
+        // slot >= 2 → barra = slot - 1 (1 col de gap); slot == 1 → sin gap posible.
+        let bar_width = (slot_end - slot_start).saturating_sub(1).max(1);
         let width = bar_width.min(right - x0);
 
         // Sub-celda: altura continua → celdas completas + fracción.
@@ -1883,6 +1893,25 @@ mod tests {
         assert_eq!(buffer[(0u16, bottom - 1)].symbol(), "█", "bottom full cell");
         // The cell above the partial cell should be empty
         assert_eq!(buffer[(0u16, partial_y - 1)].symbol(), " ", "above partial = empty");
+    }
+
+    #[test]
+    fn paint_bands_spreads_bars_across_full_width_when_not_multiple_of_bands() {
+        // 113 columnas / 32 bandas: la división entera dejaba ~17 columnas vacías.
+        let width = 113u16;
+        let area = Rect::new(0, 0, width, 3);
+        let mut buffer = Buffer::empty(area);
+        paint_bands(&mut buffer, area, &[1.0f32; NUM_BANDS], &Theme::default());
+
+        let rightmost = (0..width)
+            .rev()
+            .find(|&x| buffer[(x, 2u16)].symbol() == "\u{2588}")
+            .expect("alguna columna pintada");
+        // La última barra deja a lo sumo 1 columna de gap antes del borde.
+        assert!(
+            rightmost >= width - 2,
+            "las barras deben llegar al borde derecho, última columna pintada: {rightmost}"
+        );
     }
 
     fn test_app() -> App {
