@@ -2,3 +2,7 @@
 
 # Artefactos locales de herramientas (no son parte del proyecto).
 .atl/
+
+# Notas internas de trabajo (ODD) y de agentes: quedan solo en local.
+odd/
+.agents/
