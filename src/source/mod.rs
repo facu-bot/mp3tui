@@ -1,7 +1,5 @@
-//! Clasificación de fuentes de entrada (T1): archivos locales vs URLs remotas
+//! Clasificación de fuentes de entrada: archivos locales vs URLs remotas
 //! y detección por URL o cabecera Content-Type.
-
-pub mod playlist_file;
 
 use std::path::PathBuf;
 
@@ -19,10 +17,6 @@ pub enum Input {
 pub enum UrlKind {
     /// Archivo de audio directo soportado (mp3, flac, ogg, wav, m4a, etc.).
     DirectAudio,
-    /// Archivo de lista de reproducción (.m3u, .pls).
-    PlaylistFile,
-    /// Stream HLS (.m3u8) no soportado nativamente.
-    Hls,
     /// Página web de servicio conocido (YouTube, SoundCloud, Bandcamp, Vimeo).
     Page,
     /// URL sin extensión ni host reconocido; requiere inspeccionar Content-Type.
@@ -34,10 +28,6 @@ pub enum UrlKind {
 pub enum ContentKind {
     /// Flujo de audio directo.
     Audio,
-    /// Archivo de playlist (.m3u, .pls).
-    Playlist,
-    /// Stream HLS (.m3u8).
-    Hls,
     /// Página HTML.
     Html,
     /// Otro tipo de contenido (video, binario genérico, etc.).
@@ -108,18 +98,6 @@ pub fn classify(input: &str) -> Input {
                     kind: UrlKind::DirectAudio,
                 };
             }
-            "m3u" | "pls" => {
-                return Input::Url {
-                    url: trimmed.to_string(),
-                    kind: UrlKind::PlaylistFile,
-                };
-            }
-            "m3u8" => {
-                return Input::Url {
-                    url: trimmed.to_string(),
-                    kind: UrlKind::Hls,
-                };
-            }
             _ => {}
         }
     }
@@ -159,16 +137,14 @@ pub fn classify_content_type(header: &str) -> ContentKind {
         .to_ascii_lowercase();
 
     match mime.as_str() {
-        "audio/x-mpegurl" | "audio/mpegurl" | "audio/x-scpls" | "application/pls+xml" => {
-            ContentKind::Playlist
-        }
-        "application/vnd.apple.mpegurl" | "application/x-mpegurl" => ContentKind::Hls,
+        "audio/x-mpegurl" | "audio/mpegurl" | "audio/x-scpls" => ContentKind::Other,
         "application/ogg" => ContentKind::Audio,
         "text/html" | "application/xhtml+xml" => ContentKind::Html,
         _ if mime.starts_with("audio/") => ContentKind::Audio,
         _ => ContentKind::Other,
     }
 }
+
 
 
 #[cfg(test)]
@@ -246,29 +222,30 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_playlists_and_hls() {
+    fn test_classify_m3u_pls_and_m3u8_are_unknown() {
         assert_eq!(
             classify("http://radio.example.org/listen.m3u"),
             Input::Url {
                 url: "http://radio.example.org/listen.m3u".to_string(),
-                kind: UrlKind::PlaylistFile,
+                kind: UrlKind::Unknown,
             }
         );
         assert_eq!(
             classify("http://radio.example.org/listen.pls"),
             Input::Url {
                 url: "http://radio.example.org/listen.pls".to_string(),
-                kind: UrlKind::PlaylistFile,
+                kind: UrlKind::Unknown,
             }
         );
         assert_eq!(
             classify("https://live.example.com/stream.m3u8"),
             Input::Url {
                 url: "https://live.example.com/stream.m3u8".to_string(),
-                kind: UrlKind::Hls,
+                kind: UrlKind::Unknown,
             }
         );
     }
+
 
     #[test]
     fn test_classify_query_with_fake_extension_is_unknown() {
@@ -363,13 +340,14 @@ mod tests {
             }
         );
         assert_eq!(
-            classify("https://soundcloud.com/podcast.pls"),
+            classify("https://soundcloud.com/track.flac"),
             Input::Url {
-                url: "https://soundcloud.com/podcast.pls".to_string(),
-                kind: UrlKind::PlaylistFile,
+                url: "https://soundcloud.com/track.flac".to_string(),
+                kind: UrlKind::DirectAudio,
             }
         );
     }
+
 
     #[test]
     fn test_classify_unknown_url() {
@@ -383,26 +361,13 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_content_type_playlist() {
+    fn test_classify_content_type_playlist_and_hls_are_other() {
         let headers = [
             "audio/x-mpegurl",
             "audio/mpegurl",
             "audio/x-scpls",
             "application/pls+xml",
             "Audio/X-MpegUrl; charset=utf-8",
-        ];
-        for h in headers {
-            assert_eq!(
-                classify_content_type(h),
-                ContentKind::Playlist,
-                "Fallo en playlist header: {h}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_classify_content_type_hls() {
-        let headers = [
             "application/vnd.apple.mpegurl",
             "application/x-mpegurl",
             "APPLICATION/VND.APPLE.MPEGURL; charset=utf-8",
@@ -410,11 +375,12 @@ mod tests {
         for h in headers {
             assert_eq!(
                 classify_content_type(h),
-                ContentKind::Hls,
-                "Fallo en HLS header: {h}"
+                ContentKind::Other,
+                "Fallo esperando Other: {h}"
             );
         }
     }
+
 
     #[test]
     fn test_classify_content_type_audio() {
