@@ -1,6 +1,8 @@
 //! Clasificación de fuentes de entrada: archivos locales vs URLs remotas
 //! y detección por URL o cabecera Content-Type.
 
+pub mod http_stream;
+
 use std::path::PathBuf;
 
 /// Tipo de entrada clasificada a partir de un string de entrada.
