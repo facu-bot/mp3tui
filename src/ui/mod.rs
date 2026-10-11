@@ -388,14 +388,8 @@ fn event_loop(tui: &mut Tui, app: &mut App, engine: &mut AudioEngine) -> io::Res
             match rx.try_recv() {
                 Ok((req_id, result)) => {
                     app.ytdlp_rx = None;
-                    if let Some((audio_url, _title)) = handle_ytdlp_result(app, req_id, result) {
-                        match engine.play_url(&audio_url) {
-                            Ok(_) => {}
-                            Err(err) => {
-                                app.status = Status::Stopped;
-                                app.error = Some(err.to_string());
-                            }
-                        }
+                    if let Some((audio_url, title)) = handle_ytdlp_result(app, req_id, result) {
+                        start_url_playback(app, engine, audio_url, title);
                     }
                 }
                 Err(TryRecvError::Empty) => {}
@@ -717,6 +711,7 @@ fn handle_url_prompt_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine)
     if key.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V'))
     {
+        // El pegado del portapapeles llega vía Event::Paste o como secuencia de caracteres del terminal.
         return;
     }
 
@@ -742,46 +737,70 @@ fn handle_url_prompt_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine)
     }
 }
 
-fn submit_url_prompt(input: String, app: &mut App, engine: &mut AudioEngine) {
+fn cancel_pending_ytdlp(app: &mut App) {
+    app.ytdlp_request_id = app.ytdlp_request_id.wrapping_add(1);
+    app.ytdlp_rx = None;
     app.ytdlp_failed = false;
+}
+
+fn start_local_playback(app: &mut App, engine: &mut AudioEngine, path: PathBuf) -> bool {
+    cancel_pending_ytdlp(app);
+    app.is_url = false;
+    let label = path.to_string_lossy().into_owned();
+    match engine.play(&path) {
+        Ok(()) => {
+            app.current_path = Some(path);
+            app.track_label = label;
+            app.has_player = true;
+            app.status = Status::Playing;
+            app.error = None;
+            true
+        }
+        Err(err) => {
+            app.status = Status::Stopped;
+            app.error = Some(err.to_string());
+            false
+        }
+    }
+}
+
+fn start_url_playback(app: &mut App, engine: &mut AudioEngine, url: String, label: String) {
+    cancel_pending_ytdlp(app);
+    app.is_url = true;
+    app.current_path = None;
+    app.track_label = label;
+    app.has_player = true;
+    app.status = Status::Connecting;
+    app.error = None;
+    if let Err(err) = engine.play_url(&url) {
+        app.status = Status::Stopped;
+        app.error = Some(err.to_string());
+    }
+}
+
+fn submit_url_prompt(input: String, app: &mut App, engine: &mut AudioEngine) {
     match classify_submit_input(&input) {
         SubmitAction::Empty => {}
         SubmitAction::Local(path) => {
             if path.is_file() {
-                let label = path.to_string_lossy().into_owned();
-                match engine.play(&path) {
-                    Ok(()) => {
-                        app.current_path = Some(path.clone());
-                        app.track_label = label;
-                        app.has_player = true;
-                        app.is_url = false;
-                        app.mode = Mode::Player;
-                        app.error = None;
-                        if let Some(lib) = app.library.as_mut() {
-                            let idx = lib.index_of(&path);
-                            lib.set_current(idx);
-                        }
+                if start_local_playback(app, engine, path.clone()) {
+                    app.mode = Mode::Player;
+                    if let Some(lib) = app.library.as_mut() {
+                        let idx = lib.index_of(&path);
+                        lib.set_current(idx);
                     }
-                    Err(err) => app.error = Some(err.to_string()),
                 }
             } else {
                 app.error = Some(format!("'{}' no existe o no es un archivo.", path.display()));
             }
         }
         SubmitAction::DirectAudio(url) | SubmitAction::Unknown(url) => {
-            app.is_url = true;
-            app.current_path = None;
-            app.track_label = url_display_label(&url);
-            app.has_player = true;
+            let label = url_display_label(&url);
+            start_url_playback(app, engine, url, label);
             app.mode = Mode::Player;
-            app.status = Status::Connecting;
-            app.error = None;
-            if let Err(err) = engine.play_url(&url) {
-                app.status = Status::Stopped;
-                app.error = Some(err.to_string());
-            }
         }
         SubmitAction::Page(url) => {
+            cancel_pending_ytdlp(app);
             app.is_url = true;
             app.current_path = None;
             app.track_label = url_display_label(&url);
@@ -790,7 +809,6 @@ fn submit_url_prompt(input: String, app: &mut App, engine: &mut AudioEngine) {
             app.status = Status::Resolving;
             app.error = None;
 
-            app.ytdlp_request_id = app.ytdlp_request_id.wrapping_add(1);
             let req_id = app.ytdlp_request_id;
             let (tx, rx) = mpsc::channel();
             thread::spawn(move || {
@@ -848,10 +866,8 @@ fn toggle_play(app: &mut App, engine: &mut AudioEngine) {
         engine.pause();
     } else if engine.is_paused() {
         engine.resume();
-    } else if let Some(path) = app.current_path.clone()
-        && let Err(err) = engine.play(&path)
-    {
-        app.error = Some(err.to_string());
+    } else if let Some(path) = app.current_path.clone() {
+        start_local_playback(app, engine, path);
     }
 }
 
@@ -866,20 +882,11 @@ fn play_selected(app: &mut App, engine: &mut AudioEngine) {
     let Some(track) = library_get(app, library_index) else {
         return;
     };
-    let path = track.path.clone();
-    let label = path.to_string_lossy().into_owned();
-    match engine.play(&path) {
-        Ok(()) => {
-            if let Some(library) = app.library.as_mut() {
-                library.set_current(Some(library_index));
-            }
-            app.current_path = Some(path);
-            app.track_label = label;
-            app.has_player = true;
-            app.mode = Mode::Player;
-            app.error = None;
+    if start_local_playback(app, engine, track.path.clone()) {
+        if let Some(library) = app.library.as_mut() {
+            library.set_current(Some(library_index));
         }
-        Err(err) => app.error = Some(err.to_string()),
+        app.mode = Mode::Player;
     }
 }
 
@@ -908,20 +915,11 @@ fn play_step(app: &mut App, engine: &mut AudioEngine, step: isize) {
     let Some(track) = library_get(app, library_index) else {
         return;
     };
-    let path = track.path.clone();
-    let label = path.to_string_lossy().into_owned();
-    match engine.play(&path) {
-        Ok(()) => {
-            if let Some(library) = app.library.as_mut() {
-                library.set_current(Some(library_index));
-            }
-            app.current_path = Some(path);
-            app.track_label = label;
-            app.has_player = true;
-            app.selected = target;
-            app.error = None;
+    if start_local_playback(app, engine, track.path.clone()) {
+        if let Some(library) = app.library.as_mut() {
+            library.set_current(Some(library_index));
         }
-        Err(err) => app.error = Some(err.to_string()),
+        app.selected = target;
     }
 }
 
@@ -973,10 +971,8 @@ fn handle_natural_end(app: &mut App, engine: &mut AudioEngine) {
     match app.repeat {
         RepeatMode::Off => {}
         RepeatMode::One => {
-            if let Some(path) = app.current_path.clone()
-                && let Err(err) = engine.play(&path)
-            {
-                app.error = Some(err.to_string());
+            if let Some(path) = app.current_path.clone() {
+                start_local_playback(app, engine, path);
             }
         }
         RepeatMode::All => play_step(app, engine, 1),
@@ -1967,7 +1963,7 @@ fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
     if app.url_input.is_some() {
         return vec![
             Line::from(" Pegá o escribí una URL (directa o YouTube) o ruta local "),
-            Line::from(" Enter: reproducir   Esc: cancelar   Ctrl+V: pegar "),
+            Line::from(" Enter: reproducir   Esc: cancelar   (pegar con el terminal) "),
         ];
     }
 
@@ -2996,5 +2992,141 @@ mod tests {
             Status::Ended,
             "non-playback app.error must not mask natural end into Stopped"
         );
+    }
+
+    fn make_test_wav(num_samples: usize) -> Vec<u8> {
+        let sample_rate = 44100u32;
+        let channels = 1u16;
+        let bits_per_sample = 16u16;
+        let byte_rate = sample_rate * (channels as u32) * (bits_per_sample as u32 / 8);
+        let block_align = channels * (bits_per_sample / 8);
+        let data_len = (num_samples * 2) as u32;
+        let riff_len = 36 + data_len;
+
+        let mut wav = Vec::with_capacity(44 + num_samples * 2);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&riff_len.to_le_bytes());
+        wav.extend_from_slice(b"WAVE");
+        wav.extend_from_slice(b"fmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&channels.to_le_bytes());
+        wav.extend_from_slice(&sample_rate.to_le_bytes());
+        wav.extend_from_slice(&byte_rate.to_le_bytes());
+        wav.extend_from_slice(&block_align.to_le_bytes());
+        wav.extend_from_slice(&bits_per_sample.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_len.to_le_bytes());
+        for i in 0..num_samples {
+            let sample = ((i as f32 / 10.0).sin() * 10000.0) as i16;
+            wav.extend_from_slice(&sample.to_le_bytes());
+        }
+        wav
+    }
+
+    fn track_with_path(path: PathBuf, name: &str) -> Track {
+        Track {
+            path,
+            title: name.to_string(),
+            artist: None,
+            album: None,
+            duration: None,
+            folder: "x".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_local_playback_clears_is_url_and_allows_natural_end_advance() {
+        let mut app = test_app();
+        let dir = std::env::temp_dir();
+        let t1 = dir.join(format!("mp3tui_t61_adv1_{}.wav", std::process::id()));
+        let t2 = dir.join(format!("mp3tui_t61_adv2_{}.wav", std::process::id()));
+        let wav = make_test_wav(4410);
+        let _ = std::fs::write(&t1, &wav);
+        let _ = std::fs::write(&t2, &wav);
+
+        let trk1 = track_with_path(t1.clone(), "track_1");
+        let trk2 = track_with_path(t2.clone(), "track_2");
+
+        app.library = Some(crate::playlist::from_tracks_for_test(vec![trk1, trk2]));
+        refresh_view(&mut app);
+        app.repeat = RepeatMode::All;
+
+        // 1. Simulate prior URL playback
+        app.is_url = true;
+        app.track_label = "https://example.com/audio.mp3".to_string();
+        app.status = Status::Playing;
+
+        let mut engine = match AudioEngine::new() {
+            Ok(e) => e,
+            Err(_) => {
+                let _ = std::fs::remove_file(&t1);
+                let _ = std::fs::remove_file(&t2);
+                return;
+            }
+        };
+
+        // 2. User plays first library track via normal Enter path (play_selected)
+        app.selected = 0;
+        play_selected(&mut app, &mut engine);
+
+        // Before fix: play_selected left app.is_url = true!
+        assert!(!app.is_url, "playing local track must clear is_url");
+        assert_eq!(app.current_path.as_ref(), Some(&t1));
+
+        // 3. Track ends naturally: should advance to track_2
+        handle_natural_end(&mut app, &mut engine);
+        assert_eq!(app.selected, 1, "natural end must auto-advance local track");
+        assert_eq!(app.current_path.as_ref(), Some(&t2));
+
+        let _ = std::fs::remove_file(&t1);
+        let _ = std::fs::remove_file(&t2);
+    }
+
+    #[test]
+    fn test_playing_library_track_invalidates_pending_ytdlp_resolution() {
+        let mut app = test_app();
+        let dir = std::env::temp_dir();
+        let t1 = dir.join(format!("mp3tui_t61_inv1_{}.wav", std::process::id()));
+        let wav = make_test_wav(4410);
+        let _ = std::fs::write(&t1, &wav);
+
+        let trk1 = track_with_path(t1.clone(), "track_1");
+
+        app.library = Some(crate::playlist::from_tracks_for_test(vec![trk1]));
+        refresh_view(&mut app);
+        app.selected = 0;
+
+        let mut engine = match AudioEngine::new() {
+            Ok(e) => e,
+            Err(_) => {
+                let _ = std::fs::remove_file(&t1);
+                return;
+            }
+        };
+
+        // 1. Submit a page URL: resolution is now pending
+        submit_url_prompt("https://youtube.com/watch?v=abc".to_string(), &mut app, &mut engine);
+        assert!(app.ytdlp_rx.is_some(), "resolution should be pending");
+        let initial_req_id = app.ytdlp_request_id;
+        assert_eq!(app.status, Status::Resolving);
+
+        // 2. User plays a library track before resolution finishes
+        play_selected(&mut app, &mut engine);
+
+        // In fixed code: ytdlp_rx must be cleared and request_id bumped
+        assert!(app.ytdlp_rx.is_none(), "pending resolution must be cleared");
+        assert_ne!(app.ytdlp_request_id, initial_req_id, "request id must be bumped");
+        assert_ne!(app.status, Status::Resolving, "status must not stay Resolving");
+
+        // 3. Late arrival of old resolution result must be ignored
+        let stale_result = Ok(crate::source::ytdlp::Resolved {
+            title: "Stale Video".to_string(),
+            audio_url: "https://example.com/stale.m4a".to_string(),
+        });
+        let action = handle_ytdlp_result(&mut app, initial_req_id, stale_result);
+        assert_eq!(action, None, "stale ytdlp result must be rejected");
+
+        let _ = std::fs::remove_file(&t1);
     }
 }
