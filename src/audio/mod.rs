@@ -996,11 +996,16 @@ fn decode_url_pipeline(
         Ok(res) => res,
         Err(err) => {
             #[cfg(test)]
-            if let Ok(mut hooks) = shared.test_hooks.lock()
-                && let Some((tx, rx)) = hooks.pre_error.take()
             {
-                let _ = tx.send(());
-                let _ = rx.recv();
+                let hook = shared
+                    .test_hooks
+                    .lock()
+                    .ok()
+                    .and_then(|mut hooks| hooks.pre_error.take());
+                if let Some((tx, rx)) = hook {
+                    let _ = tx.send(());
+                    let _ = rx.recv();
+                }
             }
 
             report_error(AudioError::Http(err.to_string()));
@@ -1010,11 +1015,16 @@ fn decode_url_pipeline(
 
     let cancel_handle = http_stream.cancel_handle();
     #[cfg(test)]
-    if let Ok(mut hooks) = shared.test_hooks.lock()
-        && let Some((tx, rx)) = hooks.pre_publish.take()
     {
-        let _ = tx.send(());
-        let _ = rx.recv();
+        let hook = shared
+            .test_hooks
+            .lock()
+            .ok()
+            .and_then(|mut hooks| hooks.pre_publish.take());
+        if let Some((tx, rx)) = hook {
+            let _ = tx.send(());
+            let _ = rx.recv();
+        }
     }
 
     {
@@ -1974,6 +1984,104 @@ mod tests {
             err_msg.contains("404"),
             "el error debe corresponder al 404, recibido: {err_msg}"
         );
+    }
+
+    #[test]
+    fn test_new_play_clears_previous_unread_playback_error() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener1 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port1 = listener1.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let (mut socket, _) = listener1.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf);
+            let response =
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let _ = socket.write_all(response.as_bytes());
+        });
+
+        let wav = make_test_wav(44100 * 2);
+        let listener2 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port2 = listener2.local_addr().unwrap().port();
+        let server_wav = wav.clone();
+        thread::spawn(move || {
+            let (mut socket, _) = listener2.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                server_wav.len()
+            );
+            let _ = socket.write_all(response.as_bytes());
+            let _ = socket.write_all(&server_wav);
+        });
+
+        let url_404 = format!("http://127.0.0.1:{port1}/missing.mp3");
+        let url_good = format!("http://127.0.0.1:{port2}/good.wav");
+        let mut engine = match AudioEngine::new() {
+            Ok(engine) => engine,
+            Err(_) => return,
+        };
+
+        // 1. URL falla con 404
+        engine.play_url(&url_404).expect("play_url 404");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !engine.had_playback_error() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(engine.had_playback_error(), "debe registrar fallo 404");
+
+        // 2. Usuario o play-next hace stop() sin drenar take_error()
+        engine.stop();
+
+        // 3. Inicia un nuevo play vía URL: debe limpiar el error no leído previo
+        engine.play_url(&url_good).expect("play_url good");
+        assert!(
+            engine.take_error().is_none(),
+            "iniciar una nueva reproducción por URL debe limpiar el error no leído previo"
+        );
+
+        // Esperar que la buena URL comience a sonar
+        thread::sleep(Duration::from_millis(100));
+        assert!(
+            engine.take_error().is_none(),
+            "la nueva pista no debe reportar el error previo"
+        );
+        engine.stop();
+
+        // 4. Verificamos también con un archivo local (MediaInput::File)
+        let listener3 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port3 = listener3.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let (mut socket, _) = listener3.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf);
+            let response =
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let _ = socket.write_all(response.as_bytes());
+        });
+        let url_404_2 = format!("http://127.0.0.1:{port3}/missing2.mp3");
+        engine.play_url(&url_404_2).expect("play_url 404 2");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !engine.had_playback_error() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        engine.stop();
+
+        // Escribir archivo WAV temporal para probar engine.play(path)
+        let temp_wav_path = std::env::temp_dir().join(format!("mp3tui_test_{}.wav", port3));
+        std::fs::write(&temp_wav_path, &wav).expect("escribir wav temporal");
+        let play_file_res = engine.play(&temp_wav_path);
+        let _ = std::fs::remove_file(&temp_wav_path);
+
+        play_file_res.expect("play archivo local");
+        assert!(
+            engine.take_error().is_none(),
+            "iniciar una nueva reproducción por archivo local debe limpiar el error previo"
+        );
+        engine.stop();
     }
 
     fn make_test_wav(num_samples: usize) -> Vec<u8> {
