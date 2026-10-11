@@ -159,11 +159,13 @@ fn handle_ytdlp_result(
             app.status = Status::Connecting;
             app.track_label = resolved.title.clone();
             app.error = None;
+            app.ytdlp_failed = false;
             Some((resolved.audio_url, resolved.title))
         }
         Err(err) => {
             app.status = Status::Stopped;
             app.error = Some(err.to_string());
+            app.ytdlp_failed = true;
             None
         }
     }
@@ -217,6 +219,7 @@ struct App {
     ytdlp_rx: Option<Receiver<(u64, Result<crate::source::ytdlp::Resolved, crate::source::ytdlp::YtDlpError>)>>,
     ytdlp_request_id: u64,
     is_url: bool,
+    ytdlp_failed: bool,
 }
 
 /// Guard de terminal: raw mode + alternate screen vía `ratatui::try_init`.
@@ -310,6 +313,7 @@ pub fn run(engine: &mut AudioEngine, start: StartMode) -> io::Result<()> {
         ytdlp_rx: None,
         ytdlp_request_id: 0,
         is_url: is_url_start,
+        ytdlp_failed: false,
     };
 
     if let Some((url, kind)) = start_url_info {
@@ -366,10 +370,7 @@ fn event_loop(tui: &mut Tui, app: &mut App, engine: &mut AudioEngine) -> io::Res
         // La transición Playing → Ended es el fin natural de la pista: ahí
         // decide repeat (uno la relanza, todo salta y envuelve).
         let previous_status = app.status;
-        let pending_resolution = app.ytdlp_rx.is_some();
-        let app_has_error = app.error.is_some() && !engine.is_playing() && !engine.is_paused();
-        let snapshot = EngineSnapshot::from_engine(engine, app_has_error);
-        app.status = compute_status(pending_resolution, snapshot);
+        app.status = compute_frame_status(app, engine, playback_error.is_some());
         if playback_error.is_none()
             && previous_status == Status::Playing
             && app.status == Status::Ended
@@ -470,6 +471,17 @@ pub fn compute_status(pending_resolution: bool, snapshot: EngineSnapshot) -> Sta
     } else {
         Status::Ended
     }
+}
+
+fn compute_frame_status(
+    app: &App,
+    engine: &AudioEngine,
+    this_frame_error: bool,
+) -> Status {
+    let pending_resolution = app.ytdlp_rx.is_some();
+    let playback_failed = engine.had_playback_error() || this_frame_error || app.ytdlp_failed;
+    let snapshot = EngineSnapshot::from_engine(engine, playback_failed);
+    compute_status(pending_resolution, snapshot)
 }
 
 fn status_of(engine: &AudioEngine) -> Status {
@@ -731,6 +743,7 @@ fn handle_url_prompt_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine)
 }
 
 fn submit_url_prompt(input: String, app: &mut App, engine: &mut AudioEngine) {
+    app.ytdlp_failed = false;
     match classify_submit_input(&input) {
         SubmitAction::Empty => {}
         SubmitAction::Local(path) => {
@@ -2286,6 +2299,7 @@ mod tests {
             ytdlp_rx: None,
             ytdlp_request_id: 0,
             is_url: false,
+            ytdlp_failed: false,
         }
     }
 
@@ -2961,6 +2975,26 @@ mod tests {
             app.error.is_none(),
             "must not attempt to play local tracks or set error: {:?}",
             app.error
+        );
+    }
+
+    #[test]
+    fn test_non_playback_app_error_does_not_mask_natural_end() {
+        let mut app = test_app();
+        app.error = Some("config: advertencia de configuración".to_string());
+        app.status = Status::Playing;
+
+        let engine = match AudioEngine::new() {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+
+        // Engine is not playing, not paused, and has no playback error (ended normally).
+        let status = compute_frame_status(&app, &engine, false);
+        assert_eq!(
+            status,
+            Status::Ended,
+            "non-playback app.error must not mask natural end into Stopped"
         );
     }
 }
