@@ -2,6 +2,9 @@ mod audio;
 mod config;
 mod playback;
 mod playlist;
+// Conectado en T4 / T6 (reproduccion-url-http)
+#[allow(dead_code)]
+mod source;
 mod ui;
 mod visualizer;
 
