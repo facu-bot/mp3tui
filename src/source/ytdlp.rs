@@ -49,6 +49,88 @@ pub trait CommandRunner: Send + Sync {
 /// Implementación real de `CommandRunner` usando `std::process::Command`.
 pub struct ProcessCommandRunner;
 
+#[cfg(windows)]
+fn kill_process_tree(child: &mut std::process::Child) {
+    let pid = child.id();
+    let status = Command::new("taskkill")
+        .args(["/T", "/F", "/PID", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    if status.is_err() || !status.as_ref().map(|s| s.success()).unwrap_or(false) {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+}
+
+#[cfg(not(windows))]
+fn kill_process_tree(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn spawn_reader_thread<R: std::io::Read + Send + 'static>(
+    reader: Option<R>,
+) -> (thread::JoinHandle<()>, std::sync::mpsc::Receiver<Vec<u8>>) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handle = thread::spawn(move || {
+        if let Some(mut r) = reader {
+            let mut buf = [0u8; 4096];
+            loop {
+                match r.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if tx.send(buf[..n].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+        }
+    });
+    (handle, rx)
+}
+
+fn drain_reader(
+    rx: &std::sync::mpsc::Receiver<Vec<u8>>,
+    deadline: std::time::Instant,
+) -> (Vec<u8>, bool) {
+    let mut collected = Vec::new();
+    let mut completed = false;
+    loop {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let wait = deadline - now;
+        match rx.recv_timeout(wait) {
+            Ok(chunk) => collected.extend_from_slice(&chunk),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                completed = true;
+                break;
+            }
+        }
+    }
+    (collected, completed)
+}
+
+fn is_valid_http_url(url: &str) -> bool {
+    let trimmed = url.trim();
+    if trimmed.starts_with('-') {
+        return false;
+    }
+    let prefix: String = trimmed
+        .chars()
+        .take(8)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    prefix.starts_with("http://") || prefix.starts_with("https://")
+}
+
 impl CommandRunner for ProcessCommandRunner {
     fn run(
         &self,
@@ -72,26 +154,11 @@ impl CommandRunner for ProcessCommandRunner {
             Err(err) => return Err(RunError::Io(err.to_string())),
         };
 
-        let mut stdout_pipe = child.stdout.take();
-        let mut stderr_pipe = child.stderr.take();
+        let stdout_pipe = child.stdout.take();
+        let stderr_pipe = child.stderr.take();
 
-        let stdout_handle = thread::spawn(move || {
-            let mut out = Vec::new();
-            if let Some(pipe) = stdout_pipe.as_mut() {
-                use std::io::Read;
-                let _ = pipe.read_to_end(&mut out);
-            }
-            out
-        });
-
-        let stderr_handle = thread::spawn(move || {
-            let mut err = Vec::new();
-            if let Some(pipe) = stderr_pipe.as_mut() {
-                use std::io::Read;
-                let _ = pipe.read_to_end(&mut err);
-            }
-            err
-        });
+        let (stdout_handle, stdout_rx) = spawn_reader_thread(stdout_pipe);
+        let (stderr_handle, stderr_rx) = spawn_reader_thread(stderr_pipe);
 
         let start = std::time::Instant::now();
         let exit_status = loop {
@@ -99,13 +166,10 @@ impl CommandRunner for ProcessCommandRunner {
                 Ok(Some(status)) => break status,
                 Ok(None) => {
                     if start.elapsed() >= timeout {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        // En Windows, empaquetados PyInstaller (como yt-dlp.exe) pueden engendrar
-                        // subprocesos que heredan los descriptores de stdout/stderr. Si se hace join
-                        // de los hilos lectores, estos quedarían bloqueados indefinidamente esperando EOF.
-                        // Al descartar los JoinHandles sin join(), los hilos se desacoplan (detach)
-                        // y retornamos Timeout inmediatamente.
+                        kill_process_tree(&mut child);
+                        // Los hilos lectores se desacoplan (detach) al descartar sus JoinHandles
+                        drop(stdout_handle);
+                        drop(stderr_handle);
                         return Err(RunError::Timeout);
                     }
                     thread::sleep(Duration::from_millis(10));
@@ -114,8 +178,23 @@ impl CommandRunner for ProcessCommandRunner {
             }
         };
 
-        let stdout = stdout_handle.join().unwrap_or_default();
-        let stderr = stderr_handle.join().unwrap_or_default();
+        // Post-exit bounded join: recolectamos a través de los canales hasta cierre de pipes
+        // o hasta agotar la gracia (500 ms o el tiempo restante). Si un subproceso descendiente
+        // retiene los descriptores abiertos, no bloqueamos indefinidamente: devolvemos lo leído
+        // hasta el momento y limpiamos el árbol de procesos residual.
+        let now = std::time::Instant::now();
+        let remaining = timeout.saturating_sub(start.elapsed());
+        let grace = Duration::from_millis(500).min(remaining);
+        let deadline = now + grace;
+        let (stdout, stdout_done) = drain_reader(&stdout_rx, deadline);
+        let (stderr, stderr_done) = drain_reader(&stderr_rx, deadline);
+
+        if !stdout_done || !stderr_done {
+            kill_process_tree(&mut child);
+        }
+
+        drop(stdout_handle);
+        drop(stderr_handle);
 
         Ok(CommandOutput {
             status_code: exit_status.code(),
@@ -140,6 +219,7 @@ pub enum YtDlpError {
     Timeout,
     NoCompatibleFormat(String),
     BadOutput(String),
+    InvalidUrl(String),
 }
 
 impl std::fmt::Display for YtDlpError {
@@ -158,6 +238,7 @@ impl std::fmt::Display for YtDlpError {
                 )
             }
             YtDlpError::BadOutput(msg) => write!(f, "salida inesperada de yt-dlp: {msg}"),
+            YtDlpError::InvalidUrl(msg) => write!(f, "URL no válida para yt-dlp: {msg}"),
         }
     }
 }
@@ -184,6 +265,12 @@ pub fn resolve_with_timeout(
     runner: &dyn CommandRunner,
     timeout: Duration,
 ) -> Result<Resolved, YtDlpError> {
+    if !is_valid_http_url(page_url) {
+        return Err(YtDlpError::InvalidUrl(format!(
+            "la URL debe comenzar con http:// o https://: {page_url}"
+        )));
+    }
+
     let args = vec![
         "--no-playlist".to_string(),
         "--no-warnings".to_string(),
@@ -195,6 +282,7 @@ pub fn resolve_with_timeout(
         "%(title)s".to_string(),
         "--print".to_string(),
         "%(url)s".to_string(),
+        "--".to_string(),
         page_url.to_string(),
     ];
 
@@ -316,8 +404,43 @@ mod tests {
                 "%(title)s".to_string(),
                 "--print".to_string(),
                 "%(url)s".to_string(),
+                "--".to_string(),
                 "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn test_resolve_rejects_option_injection_and_invalid_scheme() {
+        let fake = FakeRunner::new(Ok(CommandOutput {
+            status_code: Some(0),
+            stdout: b"Never Gonna Give You Up\nhttps://googlevideo.com/playback\n".to_vec(),
+            stderr: Vec::new(),
+        }));
+
+        let bad_inputs = [
+            "--exec calc",
+            "-o evil.mp3",
+            "--help",
+            "ftp://example.com/audio.mp3",
+            "file:///etc/passwd",
+            "C:\\music\\song.mp3",
+            "just-a-string",
+            "",
+        ];
+
+        for bad in bad_inputs {
+            let res = resolve(bad, &fake);
+            assert!(
+                matches!(res, Err(YtDlpError::InvalidUrl(_))),
+                "debe retornar InvalidUrl para '{bad}', pero retornó {res:?}"
+            );
+        }
+
+        assert_eq!(
+            fake.calls().len(),
+            0,
+            "el runner de comandos nunca debe ser invocado si la URL es inválida"
         );
     }
 
@@ -482,11 +605,20 @@ mod tests {
     fn test_real_runner_timeout_grandchild_pipe_does_not_hang() {
         let runner = ProcessCommandRunner;
         let start = std::time::Instant::now();
+        let marker = std::env::temp_dir().join(format!(
+            "mp3tui_grandchild_marker_{}.tmp",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&marker);
+
         let res = runner.run(
             "cmd",
             &[
                 "/C".to_string(),
-                "start /b ping -n 5 127.0.0.1 & ping -n 5 127.0.0.1".to_string(),
+                format!(
+                    "start /b cmd /C \"ping -n 8 127.0.0.1 > {}\" & ping -n 8 127.0.0.1",
+                    marker.display()
+                ),
             ],
             Duration::from_millis(200),
         );
@@ -495,6 +627,51 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(2),
             "timeout con subproceso en segundo plano debe cortar en < 2 s, tardó {elapsed:?}"
+        );
+
+        // Si el subproceso nieto siguiera vivo (como ocurre con child.kill() sin taskkill /T),
+        // mantendría el archivo marker bloqueado para escritura en Windows.
+        // Con taskkill /T /F, todo el árbol es eliminado y el archivo se puede abrir exclusivamente.
+        thread::sleep(Duration::from_millis(150));
+        let open_result = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&marker);
+        assert!(
+            open_result.is_ok(),
+            "el subproceso nieto debe haber sido terminado por taskkill liberando el archivo marker: {open_result:?}"
+        );
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_real_runner_post_exit_unbounded_join_is_bounded() {
+        let runner = ProcessCommandRunner;
+        let start = std::time::Instant::now();
+        // cmd.exe imprime y sale de inmediato (status 0), pero start /b ping hereda el pipe por 5 s
+        let res = runner.run(
+            "cmd",
+            &[
+                "/C".to_string(),
+                "echo Title& echo https://example.com/stream.m4a& start /b ping -n 5 127.0.0.1"
+                    .to_string(),
+            ],
+            Duration::from_secs(10),
+        );
+        let elapsed = start.elapsed();
+        assert!(res.is_ok(), "el comando debe retornar Ok: {res:?}");
+        let out = res.unwrap();
+        assert_eq!(out.status_code, Some(0));
+        let stdout_str = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout_str.contains("Title"),
+            "stdout debe contener lo impreso antes del exit: {stdout_str}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "el join post-exit debe estar acotado a < 2 s, tardó {elapsed:?}"
         );
     }
 
