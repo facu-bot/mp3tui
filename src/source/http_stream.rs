@@ -725,13 +725,12 @@ pub(crate) fn open_with_params(
         }
     };
 
-    if status == 206 && let Some(total_len) = range_total && total_len > 0 {
-        if total_len > MAX_RANGED_TOTAL || usize::try_from(total_len).is_err() {
-            return Err(StreamError::Io(format!(
-                "tamaño Content-Range ({total_len} bytes) excede el máximo permitido ({MAX_RANGED_TOTAL} bytes)"
-            )));
-        }
-
+    if status == 206
+        && let Some(total_len) = range_total
+        && total_len > 0
+        && total_len <= MAX_RANGED_TOTAL
+        && usize::try_from(total_len).is_ok()
+    {
         let info = StreamInfo {
             content_type,
             content_length: Some(total_len),
@@ -806,11 +805,47 @@ pub(crate) fn open_with_params(
 
         Ok((stream, info))
     } else {
-        let content_length = response
-            .headers()
-            .get("content-length")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.trim().parse::<u64>().ok());
+        let (response, content_type, content_length) = if status == 206 {
+            drop(response);
+            let resp = agent
+                .get(&effective_url)
+                .header("User-Agent", &user_agent)
+                .header("Accept-Encoding", "identity")
+                .call()
+                .map_err(|e| match e {
+                    ureq::Error::StatusCode(code) => {
+                        StreamError::HttpStatus(code, format!("HTTP {code}"))
+                    }
+                    other => StreamError::Connection(other.to_string()),
+                })?;
+
+            let s = resp.status().as_u16();
+            if s >= 400 {
+                let reason = resp.status().canonical_reason().unwrap_or("Error");
+                return Err(StreamError::HttpStatus(s, reason.to_string()));
+            }
+
+            let ctype = resp
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+
+            let clen = resp
+                .headers()
+                .get("content-length")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.trim().parse::<u64>().ok());
+
+            (resp, ctype, clen)
+        } else {
+            let clen = response
+                .headers()
+                .get("content-length")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.trim().parse::<u64>().ok());
+            (response, content_type, clen)
+        };
 
         let info = StreamInfo {
             content_type,
@@ -1525,28 +1560,132 @@ mod tests {
     }
 
     #[test]
-    fn test_huge_content_range_rejected_without_panic_or_abort() {
+    fn test_huge_content_range_falls_back_to_sequential_unseekable() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
 
-        thread::spawn(move || {
-            let (mut socket, _) = listener.accept().unwrap();
-            let mut req_buf = [0u8; 1024];
-            let _ = socket.read(&mut req_buf);
+        let total_bytes = 200 * 1024;
+        let mut expected_payload = vec![0u8; total_bytes];
+        for (i, b) in expected_payload.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        let expected_payload = Arc::new(expected_payload);
+        let payload_server = Arc::clone(&expected_payload);
 
-            let body = b"0123456789abcdef"; // 16 bytes
-            let response = "HTTP/1.1 206 Partial Content\r\nContent-Type: audio/mp4\r\nContent-Range: bytes 0-15/18446744073709551000\r\nContent-Length: 16\r\nConnection: close\r\n\r\n";
-            let _ = socket.write_all(response.as_bytes());
-            let _ = socket.write_all(body);
+        thread::spawn(move || {
+            if let Ok((mut socket1, _)) = listener.accept() {
+                let mut req1 = [0u8; 1024];
+                let n1 = socket1.read(&mut req1).unwrap_or(0);
+                let req_str1 = String::from_utf8_lossy(&req1[..n1]);
+                assert!(
+                    req_str1.to_ascii_lowercase().contains("range: bytes="),
+                    "first request must contain Range header"
+                );
+                let body1 = b"0123456789abcdef"; // 16 bytes
+                let resp1 = "HTTP/1.1 206 Partial Content\r\nContent-Type: audio/mp4\r\nContent-Range: bytes 0-15/18446744073709551000\r\nContent-Length: 16\r\nConnection: close\r\n\r\n";
+                let _ = socket1.write_all(resp1.as_bytes());
+                let _ = socket1.write_all(body1);
+            }
+
+            if let Ok((mut socket2, _)) = listener.accept() {
+                let mut req2 = [0u8; 1024];
+                let n2 = socket2.read(&mut req2).unwrap_or(0);
+                let req_str2 = String::from_utf8_lossy(&req2[..n2]);
+                assert!(
+                    !req_str2.to_ascii_lowercase().contains("range:"),
+                    "second fallback request must NOT contain Range header"
+                );
+                let resp2 = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: audio/mp4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    payload_server.len()
+                );
+                let _ = socket2.write_all(resp2.as_bytes());
+                let _ = socket2.write_all(&payload_server);
+            }
         });
 
         let url = format!("http://127.0.0.1:{port}/huge.mp3");
-        let res = open_with_params(&url, HttpTimeouts::default(), 16);
-        match res {
-            Err(StreamError::Io(msg)) => {
-                assert!(msg.contains("excede el máximo"), "esperaba mensaje de límite: {msg}");
-            }
-            other => panic!("esperaba Err(StreamError::Io) por tamaño excesivo, pero dio: {other:?}"),
+        let (mut stream, _) = open_with_params(&url, HttpTimeouts::default(), 16)
+            .expect("open stream must succeed in sequential fallback");
+
+        assert!(
+            !stream.is_seekable(),
+            "stream with huge Content-Range must fall back to unseekable"
+        );
+        assert_eq!(
+            stream.byte_len(),
+            None,
+            "stream with huge Content-Range must yield byte_len=None"
+        );
+
+        let mut data = Vec::new();
+        stream.read_to_end(&mut data).expect("read_to_end");
+        assert_eq!(data.len(), expected_payload.len());
+        assert_eq!(data, *expected_payload);
+    }
+
+    #[test]
+    fn test_content_range_40gib_falls_back_to_sequential_unseekable() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let total_bytes = 200 * 1024;
+        let mut expected_payload = vec![0u8; total_bytes];
+        for (i, b) in expected_payload.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
         }
+        let expected_payload = Arc::new(expected_payload);
+        let payload_server = Arc::clone(&expected_payload);
+
+        thread::spawn(move || {
+            if let Ok((mut socket1, _)) = listener.accept() {
+                let mut req1 = [0u8; 1024];
+                let n1 = socket1.read(&mut req1).unwrap_or(0);
+                let req_str1 = String::from_utf8_lossy(&req1[..n1]);
+                assert!(
+                    req_str1.to_ascii_lowercase().contains("range: bytes="),
+                    "first request must contain Range header"
+                );
+                let body1 = b"0123456789abcdef"; // 16 bytes
+                let resp1 = "HTTP/1.1 206 Partial Content\r\nContent-Type: audio/mp4\r\nContent-Range: bytes 0-15/42949672960\r\nContent-Length: 16\r\nConnection: close\r\n\r\n";
+                let _ = socket1.write_all(resp1.as_bytes());
+                let _ = socket1.write_all(body1);
+            }
+
+            if let Ok((mut socket2, _)) = listener.accept() {
+                let mut req2 = [0u8; 1024];
+                let n2 = socket2.read(&mut req2).unwrap_or(0);
+                let req_str2 = String::from_utf8_lossy(&req2[..n2]);
+                assert!(
+                    !req_str2.to_ascii_lowercase().contains("range:"),
+                    "second fallback request must NOT contain Range header"
+                );
+                let resp2 = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: audio/mp4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    payload_server.len()
+                );
+                let _ = socket2.write_all(resp2.as_bytes());
+                let _ = socket2.write_all(&payload_server);
+            }
+        });
+
+        let url = format!("http://127.0.0.1:{port}/large_40gib.mp3");
+        let (mut stream, _) = open_with_params(&url, HttpTimeouts::default(), 16)
+            .expect("open stream must succeed in sequential fallback for 40 GiB");
+
+        assert!(
+            !stream.is_seekable(),
+            "stream with 40 GiB Content-Range must fall back to unseekable"
+        );
+        assert_eq!(
+            stream.byte_len(),
+            None,
+            "stream with 40 GiB Content-Range must yield byte_len=None"
+        );
+
+        let mut data = Vec::new();
+        stream.read_to_end(&mut data).expect("read_to_end");
+        assert_eq!(data.len(), expected_payload.len());
+        assert_eq!(data, *expected_payload);
     }
 }
