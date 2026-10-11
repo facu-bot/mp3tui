@@ -2,6 +2,7 @@
 //! y detección por URL o cabecera Content-Type.
 
 pub mod http_stream;
+pub mod ytdlp;
 
 use std::path::PathBuf;
 
@@ -70,7 +71,6 @@ pub fn classify(input: &str) -> Input {
     } else {
         return Input::Local(PathBuf::from(trimmed));
     };
-
 
     let rest = &trimmed[scheme_len..];
     let (authority, path_and_rest) = match rest.find(['/', '?', '#']) {
@@ -147,8 +147,6 @@ pub fn classify_content_type(header: &str) -> ContentKind {
     }
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,7 +186,6 @@ mod tests {
             assert_eq!(classify(path), Input::Local(PathBuf::from(path)));
         }
     }
-
 
     #[test]
     fn test_classify_direct_audio_extensions() {
@@ -247,7 +244,6 @@ mod tests {
             }
         );
     }
-
 
     #[test]
     fn test_classify_query_with_fake_extension_is_unknown() {
@@ -350,7 +346,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn test_classify_unknown_url() {
         assert_eq!(
@@ -382,7 +377,6 @@ mod tests {
             );
         }
     }
-
 
     #[test]
     fn test_classify_content_type_audio() {
