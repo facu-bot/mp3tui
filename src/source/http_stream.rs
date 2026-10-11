@@ -153,6 +153,13 @@ impl fmt::Debug for HttpStream {
     }
 }
 
+impl HttpStream {
+    /// Obtiene un handle clonable para cancelar la descarga asociada a este stream.
+    pub fn cancel_handle(&self) -> CancelHandle {
+        self.cancel.clone()
+    }
+}
+
 impl Drop for HttpStream {
     fn drop(&mut self) {
         self.cancel.cancel();
@@ -293,6 +300,7 @@ pub(crate) fn open_with(
     let response = agent
         .get(url)
         .header("User-Agent", &user_agent)
+        .header("Accept-Encoding", "identity")
         .call()
         .map_err(|e| match e {
             ureq::Error::StatusCode(code) => StreamError::HttpStatus(code, format!("HTTP {code}")),
@@ -639,5 +647,32 @@ mod tests {
             .read_to_end(&mut data)
             .expect("la lectura del body no debe fallar por timeout total");
         assert_eq!(&data, b"hello world!");
+    }
+
+    #[test]
+    fn test_integration_open_sends_accept_encoding_identity() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let handle = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut req_buf = [0u8; 2048];
+            let n = socket.read(&mut req_buf).unwrap();
+            let req_str = String::from_utf8_lossy(&req_buf[..n]);
+
+            let response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let _ = socket.write_all(response.as_bytes());
+            req_str.to_string()
+        });
+
+        let url = format!("http://127.0.0.1:{port}/track.mp3");
+        let _ = open(&url);
+        let request_str = handle.join().unwrap();
+        assert!(
+            request_str
+                .to_ascii_lowercase()
+                .contains("accept-encoding: identity"),
+            "El request debe incluir 'Accept-Encoding: identity', recibido:\n{request_str}"
+        );
     }
 }
