@@ -43,6 +43,9 @@ impl fmt::Display for StreamError {
 impl std::error::Error for StreamError {}
 
 /// Handle clonable para cancelar la descarga en segundo plano y despertar lectores bloqueados.
+///
+/// Tras cancelar, las lecturas en `HttpStream` retornan inmediatamente `io::ErrorKind::ConnectionAborted`,
+/// evitando bucles infinitos de reintento en métodos como `read_exact`, `read_to_end` o adaptadores de symphonia.
 #[derive(Clone)]
 pub struct CancelHandle {
     shared: Arc<Shared>,
@@ -170,7 +173,7 @@ impl Read for HttpStream {
         loop {
             if self.shared.canceled.load(Ordering::SeqCst) {
                 return Err(io::Error::new(
-                    io::ErrorKind::Interrupted,
+                    io::ErrorKind::ConnectionAborted,
                     "descarga cancelada",
                 ));
             }
@@ -425,7 +428,32 @@ mod tests {
         let res = rx
             .recv_timeout(Duration::from_secs(1))
             .expect("El lector bloqueado no se desbloqueó a tiempo");
-        assert!(res.is_err(), "Cancel debe retornar un error");
+        assert_eq!(
+            res.unwrap_err().kind(),
+            io::ErrorKind::ConnectionAborted,
+            "Cancel debe retornar ConnectionAborted"
+        );
+    }
+
+    #[test]
+    fn test_cancel_unblocks_read_exact() {
+        let (producer, mut stream) = StreamProducer::new(Some(100));
+        let cancel = producer.cancel_handle();
+        let (tx, rx) = mpsc::channel();
+
+        thread::spawn(move || {
+            let mut buf = [0u8; 10];
+            let res = stream.read_exact(&mut buf);
+            tx.send(res).unwrap();
+        });
+
+        thread::sleep(Duration::from_millis(50));
+        cancel.cancel();
+
+        let res = rx
+            .recv_timeout(Duration::from_millis(300))
+            .expect("read_exact no retornó tras cancel (livelock por Interrupted)");
+        assert_eq!(res.unwrap_err().kind(), io::ErrorKind::ConnectionAborted);
     }
 
     #[test]
