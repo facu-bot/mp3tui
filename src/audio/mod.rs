@@ -623,6 +623,9 @@ impl AudioEngine {
     /// Tiempo transcurrido de la pista actual, contado sobre los frames que ya
     /// salieron al device (se recalibra al instante en cada seek).
     pub fn position(&self) -> Duration {
+        if self.is_connecting() {
+            return Duration::ZERO;
+        }
         let frames = self.shared.played_frames.load(Ordering::Acquire);
         let rate = u64::from(self.config.sample_rate).max(1);
         let nanos = u128::from(frames) * 1_000_000_000 / u128::from(rate);
@@ -1141,6 +1144,7 @@ fn decode_url_pipeline(
         && session.id == session_id
     {
         session.is_connecting = false;
+        shared.played_frames.store(0, Ordering::Release);
     }
 
     decode_loop(
@@ -2622,6 +2626,41 @@ mod tests {
         assert!(
             matches!(seek_res, Err(AudioError::Io(_))),
             "seek durante conexión debe ser rechazado sincrónicamente con AudioError::Io, pero dio: {seek_res:?}"
+        );
+        engine.stop();
+    }
+
+    #[test]
+    fn test_position_does_not_advance_while_connecting() {
+        use std::io::Read;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf);
+            thread::sleep(Duration::from_millis(500));
+        });
+
+        let url = format!("http://127.0.0.1:{port}/slow_connect.mp3");
+        let mut engine = match AudioEngine::new() {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+
+        engine.play_url(&url).expect("play_url");
+        assert!(engine.is_connecting());
+
+        // Wait a bit while connecting so audio callback runs and counts silence frames
+        thread::sleep(Duration::from_millis(100));
+        assert!(engine.is_connecting());
+        assert_eq!(
+            engine.position(),
+            Duration::ZERO,
+            "position must not advance while is_connecting is true"
         );
         engine.stop();
     }
