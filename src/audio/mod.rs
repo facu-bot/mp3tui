@@ -188,10 +188,20 @@ impl VisualizerTap {
 }
 
 struct SessionState {
+    /// Identificador de generación/sesión autoritativo. Protegido por el mutex
+    /// de sesión; toda mutación de estado dependiente de la sesión (cancel_handle,
+    /// is_seekable, error) valida `session.id == session_id` bajo este lock.
     id: u64,
     cancel_handle: Option<crate::source::http_stream::CancelHandle>,
     is_seekable: bool,
     error: Option<AudioError>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct TestHooks {
+    pub(crate) pre_publish: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+    pub(crate) pre_error: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
 }
 
 struct Shared {
@@ -202,8 +212,21 @@ struct Shared {
     /// Velocidad (f32 en bits): estado idempotente que lee el hilo
     /// decodificador en cada ciclo, igual que `volume`.
     speed: AtomicU32,
+    /// Estado mutable por sesión protegido por mutex. `session.id` es la
+    /// fuente autoritativa de verdad para resolver carreras entre sesiones.
     session: Mutex<SessionState>,
-    /// Generación/sesión para aislar hilos detached de URLs previas (lectura lock-free).
+    /// Copia atómica de `session.id` utilizada como camino rápido sin bloqueo
+    /// (lock-free fast path) para chequeos frecuentes en el hilo URL (`is_current`)
+    /// y en el loop de decodificación.
+    ///
+    /// Seguridad:
+    /// 1. Los IDs de sesión crecen de forma estrictamente monótona (con wrapping tras u64::MAX).
+    /// 2. Un chequeo atómico con ordenamiento `Acquire` es conservador: si observa
+    ///    un ID distinto al de la sesión del hilo, el hilo es definitivamente obsoleto
+    ///    y puede abortar de inmediato sin adquirir el lock.
+    /// 3. Toda mutación sensible (publicar cancel_handle, cambiar is_seekable o escribir
+    ///    errores) re-valida `session.id == session_id` bajo el mutex `session`
+    ///    (fuente autoritativa).
     session_id: AtomicU64,
     /// Sticky: la última reproducción falló (apertura, decode o device).
     /// A diferencia de `error` (que se consume con `take_error`), este flag
@@ -221,6 +244,8 @@ struct Shared {
     played_frames: AtomicU64,
     /// Duración total de la pista en nanosegundos; 0 = desconocida.
     duration_ns: AtomicU64,
+    #[cfg(test)]
+    test_hooks: Mutex<TestHooks>,
 }
 
 pub struct AudioEngine {
@@ -268,6 +293,8 @@ impl AudioEngine {
                 playback_clear: AtomicBool::new(false),
                 played_frames: AtomicU64::new(0),
                 duration_ns: AtomicU64::new(0),
+                #[cfg(test)]
+                test_hooks: Mutex::new(TestHooks::default()),
             }),
             tap: Arc::new(Mutex::new(VisualizerTap {
                 consumer: None,
@@ -518,7 +545,9 @@ impl AudioEngine {
             session.id = session.id.wrapping_add(1);
             self.shared.session_id.store(session.id, Ordering::Release);
             session.is_seekable = false;
-            session.error = None;
+            // No se borra `session.error`: el error de una pista que falló debe
+            // seguir disponible para que la UI lo drene vía `take_error()`, incluso si
+            // se invoca `stop()` antes del drenaje. Se limpia recién al iniciar un nuevo play.
             session.cancel_handle.take()
         } else {
             None
@@ -704,6 +733,26 @@ impl AudioEngine {
     /// `take_error`, no se consume: queda hasta el próximo `play()` exitoso.
     pub fn had_playback_error(&self) -> bool {
         self.shared.had_playback_error.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_pre_publish(
+        &self,
+        pair: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+    ) {
+        if let Ok(mut hooks) = self.shared.test_hooks.lock() {
+            hooks.pre_publish = pair;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_pre_error(
+        &self,
+        pair: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+    ) {
+        if let Ok(mut hooks) = self.shared.test_hooks.lock() {
+            hooks.pre_error = pair;
+        }
     }
 
     fn reset_state(&self) {
@@ -913,39 +962,6 @@ fn ns_u64(duration: Duration) -> u64 {
     duration.as_nanos().min(u128::from(u64::MAX)) as u64
 }
 
-#[cfg(test)]
-mod test_hooks {
-    use std::sync::Mutex;
-    use std::sync::mpsc::{Receiver, Sender};
-
-    static PRE_PUBLISH: Mutex<Option<(Sender<()>, Receiver<()>)>> = Mutex::new(None);
-    static PRE_ERROR: Mutex<Option<(Sender<()>, Receiver<()>)>> = Mutex::new(None);
-
-    pub fn set_pre_publish_channel(pair: Option<(Sender<()>, Receiver<()>)>) {
-        *PRE_PUBLISH.lock().unwrap() = pair;
-    }
-
-    pub fn signal_and_wait_pre_publish() {
-        let pair = PRE_PUBLISH.lock().unwrap().take();
-        if let Some((tx, rx)) = pair {
-            let _ = tx.send(());
-            let _ = rx.recv();
-        }
-    }
-
-    pub fn set_pre_error_channel(pair: Option<(Sender<()>, Receiver<()>)>) {
-        *PRE_ERROR.lock().unwrap() = pair;
-    }
-
-    pub fn signal_and_wait_pre_error() {
-        let pair = PRE_ERROR.lock().unwrap().take();
-        if let Some((tx, rx)) = pair {
-            let _ = tx.send(());
-            let _ = rx.recv();
-        }
-    }
-}
-
 fn decode_url_pipeline(
     url: String,
     dev_rate: u32,
@@ -980,7 +996,12 @@ fn decode_url_pipeline(
         Ok(res) => res,
         Err(err) => {
             #[cfg(test)]
-            test_hooks::signal_and_wait_pre_error();
+            if let Ok(mut hooks) = shared.test_hooks.lock()
+                && let Some((tx, rx)) = hooks.pre_error.take()
+            {
+                let _ = tx.send(());
+                let _ = rx.recv();
+            }
 
             report_error(AudioError::Http(err.to_string()));
             return;
@@ -989,7 +1010,12 @@ fn decode_url_pipeline(
 
     let cancel_handle = http_stream.cancel_handle();
     #[cfg(test)]
-    test_hooks::signal_and_wait_pre_publish();
+    if let Ok(mut hooks) = shared.test_hooks.lock()
+        && let Some((tx, rx)) = hooks.pre_publish.take()
+    {
+        let _ = tx.send(());
+        let _ = rx.recv();
+    }
 
     {
         let mut session = match shared.session.lock() {
@@ -1899,6 +1925,57 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_stop_does_not_clear_unread_playback_error() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf);
+            let response =
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let _ = socket.write_all(response.as_bytes());
+        });
+
+        let url = format!("http://127.0.0.1:{port}/missing.mp3");
+        let mut engine = match AudioEngine::new() {
+            Ok(engine) => engine,
+            Err(_) => return,
+        };
+
+        engine.play_url(&url).expect("play_url debe retornar Ok");
+
+        // Esperar a que el hilo falle con 404
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !engine.had_playback_error() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            engine.had_playback_error(),
+            "debe registrar fallo de reproducción"
+        );
+
+        // Llamamos a stop() ANTES de que la UI drene take_error()
+        engine.stop();
+
+        // take_error() debe seguir devolviendo el error no leído
+        let err = engine.take_error();
+        assert!(
+            err.is_some(),
+            "stop() no debe descartar el error no leído de la sesión que falló"
+        );
+        let err_msg = err.unwrap().to_string();
+        assert!(
+            err_msg.contains("404"),
+            "el error debe corresponder al 404, recibido: {err_msg}"
+        );
+    }
+
     fn make_test_wav(num_samples: usize) -> Vec<u8> {
         let sample_rate = 44100u32;
         let channels = 1u16;
@@ -2241,8 +2318,7 @@ mod tests {
         let s2_conn = Arc::clone(&session2_connected);
         let s2_canc = Arc::clone(&session2_cancelled);
 
-        let wav2 = make_test_wav(44100 * 5);
-        let server_wav2 = wav2.clone();
+        let server_wav2 = make_test_wav(44100 * 5);
         thread::spawn(move || {
             let (mut socket, _) = listener2.accept().unwrap();
             s2_conn.store(true, Ordering::SeqCst);
@@ -2276,7 +2352,7 @@ mod tests {
 
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (resume_tx, resume_rx) = std::sync::mpsc::channel();
-        super::test_hooks::set_pre_publish_channel(Some((ready_tx, resume_rx)));
+        engine.set_test_pre_publish(Some((ready_tx, resume_rx)));
 
         engine.play_url(&url1).expect("play url1");
 
@@ -2354,7 +2430,7 @@ mod tests {
 
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (resume_tx, resume_rx) = std::sync::mpsc::channel();
-        super::test_hooks::set_pre_error_channel(Some((ready_tx, resume_rx)));
+        engine.set_test_pre_error(Some((ready_tx, resume_rx)));
 
         engine.play_url(&url1).expect("play url1");
 
