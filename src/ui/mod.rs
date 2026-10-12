@@ -428,7 +428,7 @@ fn key_for_chip(keys_text: &str) -> Option<KeyCode> {
         &keys.shuffle, &keys.repeat, &keys.search, &keys.speed_up,
         &keys.speed_down, &keys.explorer, &keys.move_up, &keys.move_down,
         &keys.page_up, &keys.page_down, &keys.home, &keys.end, &keys.select,
-        &keys.back, &keys.open_url, &keys.theme_menu, &keys.settings,
+        &keys.back, &keys.open_url, &keys.settings,
     ]
     .into_iter()
     .flatten()
@@ -674,8 +674,8 @@ struct ThemeMenuState {
     original_theme: Theme,
 }
 
-/// Filas fijas del panel de configuración (T1): el contenido de cada una
-/// llega en T2 (Temas), T3 (Mouse) y T4 (Bandas).
+/// Filas fijas del panel de configuración: el contenido de cada una llega en
+/// T2 (Temas), T3 (Bandas) y T4 (Mouse).
 const SETTINGS_ROWS: [&str; 3] = ["Temas", "Mouse", "Bandas"];
 
 /// Estado del panel de configuración (T1: shell sin contenido): selección por
@@ -1013,7 +1013,9 @@ fn dispatch_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine) {
         return;
     }
 
-    // Modal de temas (T12): con el menú abierto las teclas van al menú.
+    // Menú de temas: con el menú abierto las teclas van al menú —vale igual
+    // como sub-modal del panel (T2), que sigue abierto debajo y retoma al
+    // cerrar el sub-modal con Enter/Esc—.
     if app.theme_menu.is_some() {
         handle_theme_menu_key(key, app, config::persist_theme_name);
         return;
@@ -1077,8 +1079,6 @@ fn handle_player_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine) {
         app.repeat = app.repeat.cycle();
     } else if config::pressed(&keys.open_url, code) {
         open_url_prompt(app);
-    } else if config::pressed(&keys.theme_menu, code) {
-        open_theme_menu(app);
     } else if config::pressed(&keys.search, code) {
         toggle_explorer(app);
         open_search(app);
@@ -1120,8 +1120,6 @@ fn handle_list_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine) {
         app.repeat = app.repeat.cycle();
     } else if config::pressed(&keys.open_url, code) {
         open_url_prompt(app);
-    } else if config::pressed(&keys.theme_menu, code) {
-        open_theme_menu(app);
     } else if config::pressed(&keys.search, code) {
         open_search(app);
     } else if config::pressed(&keys.move_up, code) {
@@ -1407,9 +1405,19 @@ fn handle_settings_panel_key(key: KeyEvent, app: &mut App) {
             let delta = if matches!(key.code, KeyCode::Up) { -1 } else { 1 };
             panel.selected = move_selection(panel.selected, delta, SETTINGS_ROWS.len());
         }
-        // T1: Enter es NO-OP a propósito —el contenido de cada fila llega en
-        // T2/T3/T4—: el panel sigue abierto y el estado queda intacto.
-        KeyCode::Enter => {}
+        // T2: Enter en «Temas» abre el ThemeMenuState existente como
+        // sub-modal (el panel sigue abierto debajo; el dispatch prioriza al
+        // menú y su Enter/Esc vuelven al panel). Mouse (T4) y Bandas (T3)
+        // siguen NO-OP a propósito.
+        KeyCode::Enter => {
+            let selected = match app.settings_panel.as_ref() {
+                Some(panel) => panel.selected,
+                None => return,
+            };
+            if selected == 0 {
+                open_theme_menu(app);
+            }
+        }
         // Un solo Esc cierra el panel; como no toca la guarda de salida, el
         // doble-Esc para salir solo aplica sin modal (igual que con el menú).
         KeyCode::Esc => {
@@ -1871,12 +1879,13 @@ fn render(frame: &mut Frame<'_>, app: &App, engine: &AudioEngine) {
         render_url_prompt(frame, buf);
     }
 
-    if let Some(menu) = &app.theme_menu {
-        render_theme_menu(frame, menu);
-    }
-
     if let Some(panel) = &app.settings_panel {
         render_settings_panel(frame, panel);
+    }
+
+    // El sub-modal de temas (T2) va encima del panel: se dibuja último.
+    if let Some(menu) = &app.theme_menu {
+        render_theme_menu(frame, menu);
     }
 }
 
@@ -3168,11 +3177,10 @@ fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
         )];
     }
 
-    // Panel de configuración (T1: shell): Enter todavía no hace nada —el
-    // contenido de cada fila llega en T2/T3/T4— así que el pie solo ayuda a
-    // mover y cerrar.
+    // Panel de configuración (T2): Enter abre el sub-modal de Temas en la
+    // primera fila (Mouse y Bandas siguen NO-OP hasta T4/T3).
     if app.settings_panel.is_some() {
-        return vec![Line::from(" ↑/↓: mover   Esc: cerrar ")];
+        return vec![Line::from(" ↑/↓: mover   Enter: abrir   Esc: cerrar ")];
     }
 
     if app.search.is_some() {
@@ -3209,13 +3217,12 @@ fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
                 key_labels(&keys.explorer),
             )),
             Line::from(format!(
-                " {}: pausa   {}/{}: ±5s   {}: shuffle   {}: repeat   {}: temas   {}×2: salir",
+                " {}: pausa   {}/{}: ±5s   {}: shuffle   {}: repeat   {}×2: salir",
                 key_labels(&keys.play_pause),
                 key_labels(&keys.seek_back),
                 key_labels(&keys.seek_fwd),
                 key_labels(&keys.shuffle),
                 key_labels(&keys.repeat),
-                key_labels(&keys.theme_menu),
                 key_labels(&keys.quit),
             )),
             Line::from(format!(
@@ -3243,12 +3250,11 @@ fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
                 key_labels(&keys.open_url),
             )),
             Line::from(format!(
-                " {}: shuffle   {}: repeat   {}/{}: vel   {}: temas   Ctrl+{}: config   {}×2: salir",
+                " {}: shuffle   {}: repeat   {}/{}: vel   Ctrl+{}: config   {}×2: salir",
                 key_labels(&keys.shuffle),
                 key_labels(&keys.repeat),
                 key_labels(&keys.speed_down),
                 key_labels(&keys.speed_up),
-                key_labels(&keys.theme_menu),
                 settings_key_display(),
                 key_labels(&keys.quit),
             )),
@@ -3277,9 +3283,8 @@ fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
                 key_labels(&keys.repeat),
             )),
             Line::from(format!(
-                " {}: URL   {}: temas   Ctrl+{}: config   {}: volver   {}×2: salir",
+                " {}: URL   Ctrl+{}: config   {}: volver   {}×2: salir",
                 key_labels(&keys.open_url),
-                key_labels(&keys.theme_menu),
                 settings_key_display(),
                 key_labels(&keys.back),
                 key_labels(&keys.quit),
@@ -4926,27 +4931,6 @@ mod tests {
     }
 
     #[test]
-    fn theme_menu_key_opens_menu_from_list() {
-        let _setup = theme_menu_test_setup();
-        let mut app = test_app();
-        let mut engine = match AudioEngine::new() {
-            Ok(engine) => engine,
-            Err(_) => return,
-        };
-
-        handle_list_key(
-            theme_menu_key(KeyCode::Char('t')),
-            &mut app,
-            &mut engine,
-        );
-
-        assert!(
-            app.theme_menu.is_some(),
-            "'t' por defecto abre el menú desde la lista"
-        );
-    }
-
-    #[test]
     fn handle_key_routes_to_theme_menu_when_open() {
         let _setup = theme_menu_test_setup();
         let mut app = test_app();
@@ -4969,18 +4953,6 @@ mod tests {
                 .selected,
             2,
             "con el menú abierto las teclas van al menú, no a la lista"
-        );
-    }
-
-    #[test]
-    fn footer_shows_theme_menu_key() {
-        let app = test_app();
-        let lines = footer_lines(&app, false);
-        let joined: String =
-            lines.iter().map(line_text).collect::<Vec<_>>().join(" ");
-        assert!(
-            joined.contains("t: temas"),
-            "footer debe mencionar el atajo del menú de temas: {joined}"
         );
     }
 
@@ -5082,8 +5054,7 @@ mod tests {
 
     #[test]
     fn settings_enter_is_noop_that_keeps_state() {
-        // Candado de alcance T1: Enter no cierra el panel ni rompe el estado
-        // (el contenido de cada fila llega en T2/T3/T4).
+        // Candado de alcance T2: Enter en la fila Mouse (T4) sigue NO-OP.
         let mut app = test_app();
         open_settings_panel(&mut app);
         app.settings_panel.as_mut().expect("abierto").selected = 1;
@@ -5151,7 +5122,8 @@ mod tests {
     #[test]
     fn footer_shows_settings_chip_in_player_and_browser() {
         let mut app = test_app();
-        // Reproductor y explorador (panel + pantalla completa): chip + `t` intacto.
+        // Reproductor y explorador (panel + pantalla completa): chip del panel
+        // sin `t` (T2 la deja libre).
         for (mode, open) in [
             (Mode::Player, false),
             (Mode::Player, true),
@@ -5168,7 +5140,10 @@ mod tests {
                 joined.contains("Ctrl+P: config"),
                 "falta el chip en {mode:?}/{open}: {joined}"
             );
-            assert!(joined.contains("t: temas"), "`t` sigue en T1: {joined}");
+            assert!(
+                !joined.contains(": temas"),
+                "sin `t: temas` en T2 ({mode:?}/{open}): {joined}"
+            );
             for line in footer_lines(&app, false) {
                 assert!(
                     line_width(&line) <= 78,
@@ -5246,6 +5221,177 @@ mod tests {
             "con el panel abierto las teclas van al panel, no a la lista"
         );
         assert!(app.search.is_none());
+    }
+
+    // -------------------------------------------------------------------------
+    // T2: Temas dentro del panel + eliminar `t`
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn settings_enter_on_themes_opens_theme_submodal_keeping_panel() {
+        let _setup = theme_menu_test_setup();
+        let mut app = test_app();
+        open_settings_panel(&mut app);
+        assert_eq!(
+            app.settings_panel.as_ref().expect("panel abierto").selected,
+            0,
+            "la primera fila es Temas"
+        );
+        handle_settings_panel_key(theme_menu_key(KeyCode::Enter), &mut app);
+        assert!(
+            app.settings_panel.is_some(),
+            "el panel sigue abierto debajo del sub-modal"
+        );
+        assert!(
+            app.theme_menu.is_some(),
+            "Enter en Temas abre el ThemeMenuState existente"
+        );
+    }
+
+    #[test]
+    fn settings_enter_on_mouse_and_bands_stays_noop() {
+        // Candados de alcance T2: el contenido de Mouse (T4) y Bandas (T3)
+        // todavía no existe; Enter no hace nada en esas filas.
+        for selected in [1usize, 2usize] {
+            let mut app = test_app();
+            open_settings_panel(&mut app);
+            app.settings_panel.as_mut().expect("abierto").selected = selected;
+            handle_settings_panel_key(theme_menu_key(KeyCode::Enter), &mut app);
+            assert!(
+                app.settings_panel.is_some(),
+                "fila {selected}: Enter no cierra el panel"
+            );
+            assert!(
+                app.theme_menu.is_none(),
+                "fila {selected}: Enter sigue NO-OP en T2"
+            );
+            assert_eq!(
+                app.settings_panel.as_ref().expect("abierto").selected,
+                selected,
+                "fila {selected}: Enter no mueve la selección"
+            );
+        }
+    }
+
+    #[test]
+    fn t_key_is_free_does_nothing_in_player_and_list() {
+        let Some(mut engine) = engine_or_skip() else { return };
+        let mut app = test_app();
+        app.mode = Mode::Player;
+        handle_player_key(theme_menu_key(KeyCode::Char('t')), &mut app, &mut engine);
+        assert!(
+            app.theme_menu.is_none() && app.settings_panel.is_none(),
+            "'t' queda libre en el reproductor: no abre nada"
+        );
+        let mut app = test_app();
+        handle_list_key(theme_menu_key(KeyCode::Char('t')), &mut app, &mut engine);
+        assert!(
+            app.theme_menu.is_none() && app.settings_panel.is_none(),
+            "'t' queda libre en la lista: no abre nada"
+        );
+    }
+
+    #[test]
+    fn theme_submodal_enter_saves_and_returns_to_panel() {
+        let _setup = theme_menu_test_setup();
+        let path = std::env::temp_dir()
+            .join(format!("mp3tui_t2_submodal_enter_{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut app = test_app();
+        open_settings_panel(&mut app);
+        handle_settings_panel_key(theme_menu_key(KeyCode::Enter), &mut app);
+        let menu = app.theme_menu.as_ref().expect("sub-modal abierto");
+        let expected = config::builtin_themes()[menu.selected].0;
+        handle_theme_menu_key(theme_menu_key(KeyCode::Enter), &mut app, |id| {
+            config::persist_theme_name_at(&path, id)
+        });
+        assert!(app.theme_menu.is_none(), "Enter cierra el sub-modal");
+        assert!(
+            app.settings_panel.is_some(),
+            "pero VUELVE al panel, no lo cierra"
+        );
+        assert_eq!(config::active_theme_name(), expected, "el tema queda aplicado");
+        let text = std::fs::read_to_string(&path).expect("tema persistido");
+        assert!(
+            text.contains(expected),
+            "el tema se persiste como hoy: {text:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn theme_submodal_esc_restores_and_returns_to_panel() {
+        let _setup = theme_menu_test_setup();
+        let Some(mut engine) = engine_or_skip() else { return };
+        let mut app = test_app();
+        open_settings_panel(&mut app);
+        handle_settings_panel_key(theme_menu_key(KeyCode::Enter), &mut app);
+        let before_name = config::active_theme_name();
+        let before_theme = config::active_theme();
+        // Previsualiza otro tema moviéndose dentro del sub-modal.
+        handle_key(theme_menu_key(KeyCode::Down), &mut app, &mut engine);
+        handle_key(theme_menu_key(KeyCode::Esc), &mut app, &mut engine);
+        assert!(app.theme_menu.is_none(), "Esc cierra el sub-modal");
+        assert!(
+            app.settings_panel.is_some(),
+            "y VUELVE al panel, no lo cierra"
+        );
+        assert_eq!(config::active_theme_name(), before_name, "Esc restaura el id");
+        assert_eq!(config::active_theme(), before_theme, "Esc restaura los colores");
+    }
+
+    #[test]
+    fn mouse_is_inert_under_theme_submodal() {
+        // El guard inerte ya cubre el panel (T1) y el sub-modal (existente):
+        // se verifica, no se duplica.
+        let Some(mut engine) = engine_or_skip() else { return };
+        let mut app = test_app();
+        app.mode = Mode::Player;
+        app.has_player = true;
+        *app.hit.borrow_mut() = sample_hit();
+        open_settings_panel(&mut app);
+        open_theme_menu(&mut app);
+        handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 30, 5),
+            &mut app,
+            &mut engine,
+        );
+        assert_eq!(engine.volume(), 0.0, "el clic no atraviesa el sub-modal");
+        assert_eq!(app.drag, None);
+    }
+
+    #[test]
+    fn footer_no_longer_shows_t_temas_but_keeps_ctrl_p() {
+        let mut app = test_app();
+        for (mode, open) in [
+            (Mode::Player, false),
+            (Mode::Player, true),
+            (Mode::Browser, false),
+        ] {
+            app.mode = mode;
+            app.explorer_open = open;
+            let joined: String = footer_lines(&app, false)
+                .iter()
+                .map(line_text)
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(
+                !joined.contains(": temas"),
+                "sin chip `t: temas` en {mode:?}/{open}: {joined}"
+            );
+            assert!(
+                joined.contains("Ctrl+P: config"),
+                "el chip del panel sigue en {mode:?}/{open}: {joined}"
+            );
+            for line in footer_lines(&app, false) {
+                assert!(
+                    line_width(&line) <= 78,
+                    "línea del pie demasiado ancha ({}): {}",
+                    line_width(&line),
+                    line_text(&line)
+                );
+            }
+        }
     }
 
     #[test]

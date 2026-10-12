@@ -51,7 +51,6 @@ Windows.
 | `r` | Modo repetir (off → una → todas) |
 | `[` / `]` | Velocidad 0.50x – 2.00x (pasos de 0.25x) |
 | `u` | Abrir diálogo para reproducir URL o archivo |
-| `t` | Abrir el selector de temas (↑/↓ previsualiza, Enter guarda, Esc cancela) |
 | `Ctrl+P` | Abrir el panel de configuración (Temas/Mouse/Bandas) |
 | `Tab` / `Ctrl+Tab` | Abrir o cerrar el panel del explorador |
 | `b` | Abrir el panel del explorador con la búsqueda |
@@ -90,7 +89,6 @@ audio (arranque sin archivo) el explorador sigue ocupando toda la pantalla.
 | `n` / `p` | Pista siguiente / anterior |
 | `s` | Aleatorio |
 | `r` | Modo repetir |
-| `t` | Selector de temas |
 | `Ctrl+P` | Abrir el panel de configuración |
 | `b` | Búsqueda incremental (vive en el panel) |
 | `Esc` / `Tab` / `Ctrl+Tab` | Cerrar el panel (el reproductor de fondo queda solo) |
@@ -139,7 +137,7 @@ Con el mouse activado (por defecto):
 - **Rueda** sobre el reproductor: sube o baja el volumen.
 - **Footer de atajos:** cada atajo es un chip (la tecla resaltada y su acción);
   clickearlo hace lo mismo que apretar esa tecla.
-- Con el prompt de URL, el menú de temas o el panel de configuración
+- Con el prompt de URL, el panel de configuración o su submenú de temas
   abiertos, el mouse no actúa sobre lo que queda debajo.
 
 La captura del mouse reemplaza la selección de texto nativa de la terminal (en
@@ -169,10 +167,10 @@ El tema por defecto es **Kanagawa Dragon** (la variante `dragon` de
 abajo son justamente esos valores: solo hace falta escribir las claves que
 se quieran cambiar.
 
-Con la tecla `t` se abre el selector de temas: `↑`/`↓` previsualizan cada
-paleta en vivo, `Enter` aplica el tema y guarda su `name` en este archivo
-(creando la sección `[theme]` si no existe) y `Esc` cancela y restaura el
-tema anterior.
+Desde el panel (`Ctrl+P` → `Temas`) se abre el selector de temas: `↑`/`↓`
+previsualizan cada paleta en vivo, `Enter` aplica el tema y guarda su `name`
+en este archivo (creando la sección `[theme]` si no existe) y vuelve al panel,
+y `Esc` cancela, restaura el tema anterior y vuelve al panel.
 
 ```toml
 [theme]
@@ -197,7 +195,7 @@ seek_back = "left"
 #   quit, play_pause, volume_up, volume_down, seek_back, seek_fwd,
 #   prev_track, next_track, shuffle, repeat, search, speed_up,
 #   speed_down, explorer, open_url, move_up, move_down, page_up, page_down,
-#   home, end, select, back, theme_menu, settings
+#   home, end, select, back, settings
 # `settings` se dispara con Ctrl+tecla (por defecto Ctrl+P): la letra suelta
 # sigue siendo de su acción (`p` = pista anterior).
 # Nombres de tecla: space, enter, esc, tab, up, down, left, right,

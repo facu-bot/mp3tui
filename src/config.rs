@@ -856,8 +856,6 @@ pub struct Keys {
     pub back: Vec<KeyCode>,
     /// Abrir prompt para reproducir URL (T6): por defecto 'u'.
     pub open_url: Vec<KeyCode>,
-    /// Abrir el menú de temas (T12): por defecto 't'.
-    pub theme_menu: Vec<KeyCode>,
     /// Abrir el panel de configuración (T1: shell con filas Temas/Mouse/Bandas).
     /// Se dispara con Ctrl+tecla (por defecto `Ctrl+P`): a diferencia de
     /// `explorer` (donde Tab y Ctrl+Tab valen por igual porque el dispatch
@@ -895,7 +893,6 @@ impl Default for Keys {
             select: keys(&[KeyCode::Enter]),
             back: keys(&[KeyCode::Esc]),
             open_url: keys(&[KeyCode::Char('u')]),
-            theme_menu: keys(&[KeyCode::Char('t')]),
             settings: keys(&[KeyCode::Char('p')]),
         }
     }
@@ -920,7 +917,6 @@ fn parse_keybindings(
             "repeat" => &mut keys.repeat,
             "search" => &mut keys.search,
             "open_url" => &mut keys.open_url,
-            "theme_menu" => &mut keys.theme_menu,
             "settings" => &mut keys.settings,
             "speed_up" => &mut keys.speed_up,
             "speed_down" => &mut keys.speed_down,
@@ -1011,7 +1007,6 @@ fn resolve_key_collisions(keys: &mut Keys, warnings: &mut Vec<String>) {
         ("repeat", &mut keys.repeat, &defaults.repeat),
         ("search", &mut keys.search, &defaults.search),
         ("open_url", &mut keys.open_url, &defaults.open_url),
-        ("theme_menu", &mut keys.theme_menu, &defaults.theme_menu),
         ("settings", &mut keys.settings, &defaults.settings),
         ("move_up", &mut keys.move_up, &defaults.move_up),
         ("move_down", &mut keys.move_down, &defaults.move_down),
@@ -1202,7 +1197,7 @@ pub fn pressed(bindings: &[KeyCode], code: KeyCode) -> bool {
 /// ¿`key` dispara un atajo `Ctrl+...` (`settings`, por defecto Ctrl+P)? A
 /// diferencia de `pressed` —que ignora modificadores, como el Ctrl+Tab que cae
 /// en `explorer`—, exige Ctrl: la letra suelta sigue siendo de su acción
-/// (`p` = pista anterior, `t` = menú de temas).
+/// (`p` = pista anterior).
 pub fn pressed_ctrl(bindings: &[KeyCode], key: KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL) && pressed(bindings, key.code)
 }
@@ -2090,45 +2085,17 @@ zoom = 2");
     }
 
     #[test]
-    fn theme_menu_default_parse_and_collision() {        assert_eq!(Keys::default().theme_menu, vec![KeyCode::Char('t')]);
-
-        let config = parse(
-            r#"
-            [keybindings]
-            theme_menu = "T"
-            "#,
-        );
-        assert_eq!(config.keys.theme_menu, vec![KeyCode::Char('T')]);
-        assert!(config.warnings.is_empty(), "warnings: {:?}", config.warnings);
-
-        // Sin remapear, 't' no colisiona con ninguna otra acción default.
-        assert_eq!(Keys::default().next_track, vec![KeyCode::Char('n')]);
-
-        // Colisión al estilo open_url: next_track va antes en la prioridad de
-        // dispatch, theme_menu pierde 'n' y vuelve a su default ('t').
-        let collision = parse(
-            r#"
-            [keybindings]
-            theme_menu = "n"
-            "#,
-        );
-        assert_eq!(
-            collision.keys.next_track,
-            vec![KeyCode::Char('n')],
-            "next_track conserva su tecla"
-        );
-        assert_eq!(
-            collision.keys.theme_menu,
-            vec![KeyCode::Char('t')],
-            "theme_menu vuelve a su default"
-        );
+    fn theme_menu_action_removed_warns_as_unknown() {
+        // T2: la acción `theme_menu` ya no existe; la tecla `t` queda libre y
+        // una config vieja que la mencione avisa como acción desconocida.
+        let config = parse("[keybindings]\ntheme_menu = \"t\"\n");
         assert!(
-            collision
+            config
                 .warnings
                 .iter()
-                .any(|w| w.contains("theme_menu") && w.contains("next_track")),
+                .any(|w| w.contains("theme_menu") && w.contains("desconocida")),
             "warnings: {:?}",
-            collision.warnings
+            config.warnings
         );
     }
 
