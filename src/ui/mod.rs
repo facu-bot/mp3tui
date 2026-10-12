@@ -35,11 +35,12 @@ const PAGE_STEP: isize = 10;
 /// Bloques de octavo de celda para el visualizador sub-celda (mejora 1).
 const EIGHTH_BLOCKS: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
 
-// Paleta compartida por todo el programa (T9): viene de la config, con
-// defaults pulidos en `config::Theme::default()`. Se lee en cada estilizado
-// (es un par de loads atómicos por frame, nada relevante).
-fn theme() -> &'static Theme {
-    &config::config().theme
+// Paleta compartida por todo el programa (T9/T12): la celda runtime de
+// config, que cambia en caliente al previsualizar/aplicar temas desde el menú
+// (default: la del `[theme] name` cargado al arrancar). Copia de 11 `Color`
+// por llamada; barato por frame.
+fn theme() -> Theme {
+    config::active_theme()
 }
 
 const CURSOR: &str = "\u{258c}"; // ▌ fila seleccionada
@@ -264,6 +265,19 @@ struct App {
     pub history: crate::history::History,
     pub pending_history: Option<(String, String)>,
     pub history_path: Option<PathBuf>,
+    /// Menú de temas abierto (T12): `Some` mientras el modal está activo.
+    theme_menu: Option<ThemeMenuState>,
+}
+
+/// Estado del menú de temas (T12): selección con previsualización en vivo y
+/// el tema con el que se abrió (para el marcador y para restaurar con Esc).
+struct ThemeMenuState {
+    /// Índice en `config::builtin_themes()`.
+    selected: usize,
+    /// Id del tema activo al abrir (fila «actual» marcada con ●).
+    original_name: String,
+    /// Colores activos al abrir: Esc los restaura.
+    original_theme: Theme,
 }
 
 /// Guard de terminal: raw mode + alternate screen vía `ratatui::try_init`.
@@ -371,6 +385,7 @@ pub fn run(engine: &mut AudioEngine, start: StartMode) -> io::Result<()> {
         history,
         pending_history: None,
         history_path: crate::history::history_path(),
+        theme_menu: None,
     };
 
     if let Some((url, kind)) = start_url_info {
@@ -576,6 +591,12 @@ fn handle_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine) {
         return;
     }
 
+    // Modal de temas (T12): con el menú abierto las teclas van al menú.
+    if app.theme_menu.is_some() {
+        handle_theme_menu_key(key, app, config::persist_theme_name);
+        return;
+    }
+
     // Con la búsqueda abierta todo lo demás se escribe en el query: ni 'q'
     // sale ni las flechas mueven la selección.
     if app.search.is_some() {
@@ -623,6 +644,8 @@ fn handle_player_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine) {
         app.repeat = app.repeat.cycle();
     } else if config::pressed(&keys.open_url, code) {
         open_url_prompt(app);
+    } else if config::pressed(&keys.theme_menu, code) {
+        open_theme_menu(app);
     } else if config::pressed(&keys.search, code) {
         toggle_explorer(app);
         open_search(app);
@@ -660,6 +683,8 @@ fn handle_list_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine) {
         app.repeat = app.repeat.cycle();
     } else if config::pressed(&keys.open_url, code) {
         open_url_prompt(app);
+    } else if config::pressed(&keys.theme_menu, code) {
+        open_theme_menu(app);
     } else if config::pressed(&keys.search, code) {
         open_search(app);
     } else if config::pressed(&keys.move_up, code) {
@@ -872,6 +897,83 @@ fn cancel_pending_ytdlp(app: &mut App) {
     app.ytdlp_rx = None;
     app.ytdlp_failed = false;
     app.pending_history = None;
+}
+
+// --- Menú de temas (T12) ----------------------------------------------------
+
+fn open_theme_menu(app: &mut App) {
+    let name = config::active_theme_name();
+    let selected = config::builtin_themes()
+        .iter()
+        .position(|(id, _)| *id == name)
+        .unwrap_or(0);
+    app.theme_menu = Some(ThemeMenuState {
+        selected,
+        original_name: name,
+        original_theme: config::active_theme(),
+    });
+}
+
+fn handle_theme_menu_key(
+    key: KeyEvent,
+    app: &mut App,
+    persist: impl FnOnce(&str) -> Result<(), String>,
+) {
+    let len = config::builtin_themes().len();
+    match key.code {
+        KeyCode::Up | KeyCode::Down => {
+            let Some(menu) = app.theme_menu.as_mut() else {
+                return;
+            };
+            let delta = if matches!(key.code, KeyCode::Up) { -1 } else { 1 };
+            menu.selected = move_selection(menu.selected, delta, len);
+            let (id, _) = config::builtin_themes()[menu.selected];
+            // Previsualización en vivo: cambia los colores sin tocar el id.
+            config::preview_theme(config::resolve_theme(id));
+        }
+        KeyCode::Enter => {
+            let Some(menu) = app.theme_menu.take() else {
+                return;
+            };
+            let (id, _) = config::builtin_themes()[menu.selected];
+            // Aplica primero (queda en la sesión aunque falle el guardado)
+            // y recién después persiste; un fallo solo deja el aviso.
+            config::activate_theme(id, config::resolve_theme(id));
+            if let Err(err) = persist(id) {
+                app.error = Some(err);
+            }
+        }
+        KeyCode::Esc => {
+            let Some(menu) = app.theme_menu.take() else {
+                return;
+            };
+            // Restaura el tema con el que se abrió (colores + id).
+            config::activate_theme(&menu.original_name, menu.original_theme);
+        }
+        _ => {}
+    }
+}
+
+/// Filas del modal: una por tema builtin; ● marca el tema activo al abrir y
+/// la selección va resaltada con los colores vivos del tema previsualizado.
+fn theme_menu_lines(menu: &ThemeMenuState) -> Vec<Line<'static>> {
+    let colors = theme(); // snapshot coherente para todas las filas
+    config::builtin_themes()
+        .iter()
+        .enumerate()
+        .map(|(i, (id, _))| {
+            let marker = if *id == menu.original_name { "● " } else { "  " };
+            let style = if i == menu.selected {
+                Style::default()
+                    .bg(colors.select_bg)
+                    .fg(colors.accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(colors.text)
+            };
+            Line::from(Span::styled(format!(" {}{} ", marker, id), style))
+        })
+        .collect()
 }
 
 fn start_local_playback(app: &mut App, engine: &mut AudioEngine, path: PathBuf) -> bool {
@@ -1301,6 +1403,10 @@ fn render(frame: &mut Frame<'_>, app: &App, engine: &AudioEngine) {
     if let Some(buf) = &app.url_input {
         render_url_prompt(frame, buf);
     }
+
+    if let Some(menu) = &app.theme_menu {
+        render_theme_menu(frame, menu);
+    }
 }
 
 fn render_url_prompt(frame: &mut Frame<'_>, input: &str) {
@@ -1326,6 +1432,31 @@ fn render_url_prompt(frame: &mut Frame<'_>, input: &str) {
     let display_text = format!(" {input}▌");
     let line = Line::from(Span::styled(display_text, Style::default().fg(theme().text)));
     frame.render_widget(Paragraph::new(vec![line]), inner);
+}
+
+/// Modal centrado de temas (T12), al estilo del prompt de URL.
+fn render_theme_menu(frame: &mut Frame<'_>, menu: &ThemeMenuState) {
+    let area = frame.area();
+    let width = 44.min(area.width.saturating_sub(4)).max(24);
+    let height = (config::builtin_themes().len() as u16 + 2)
+        .min(area.height.saturating_sub(2))
+        .max(3);
+
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let rect = Rect::new(x, y, width, height);
+
+    frame.render_widget(Clear, rect);
+
+    let block = Block::bordered()
+        .border_style(Style::default().fg(theme().accent))
+        .title(Span::styled(
+            " Temas ",
+            Style::default().fg(theme().accent).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    frame.render_widget(Paragraph::new(theme_menu_lines(menu)), inner);
 }
 
 /// Bloque con borde apagado y título acentuado: el patrón de todo el programa.
@@ -2267,7 +2398,7 @@ fn render_visualizer(frame: &mut Frame<'_>, area: Rect, bands: &[f32; NUM_BANDS]
         .title(accent_title("Visualizador"));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    paint_bands(frame.buffer_mut(), inner, bands, theme());
+        paint_bands(frame.buffer_mut(), inner, bands, &theme());
 }
 
 /// Pinta las 32 barras dentro del área interior del bloque, sin widgets.
@@ -2408,6 +2539,12 @@ fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
         ];
     }
 
+    if app.theme_menu.is_some() {
+        return vec![Line::from(
+            " ↑/↓: previsualizar tema   Enter: guardar   Esc: cancelar ",
+        )];
+    }
+
     if app.search.is_some() {
         return vec![
             Line::from(" Escribí para filtrar por título, artista, álbum o archivo "),
@@ -2441,28 +2578,29 @@ fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
                 key_labels(&keys.explorer),
             )),
             Line::from(format!(
-                " {}: pausa   {}/{}: ±5s   {}/{}: vel   {}: shuffle   {}: repeat   {}: salir",
+                " {}: pausa   {}/{}: ±5s   {}: shuffle   {}: repeat   {}: temas   {}: salir",
                 key_labels(&keys.play_pause),
                 key_labels(&keys.seek_back),
                 key_labels(&keys.seek_fwd),
-                key_labels(&keys.speed_down),
-                key_labels(&keys.speed_up),
                 key_labels(&keys.shuffle),
                 key_labels(&keys.repeat),
+                key_labels(&keys.theme_menu),
                 key_labels(&keys.quit),
             )),
             Line::from(format!(
-                " {}/{}: pista sig/ant   volumen {}/{}: con el panel cerrado",
+                " {}/{}: pista sig/ant   volumen {}/{}: con el panel cerrado   {}/{}: vel",
                 key_labels(&keys.next_track),
                 key_labels(&keys.prev_track),
                 key_labels(&keys.volume_up),
                 key_labels(&keys.volume_down),
+                key_labels(&keys.speed_down),
+                key_labels(&keys.speed_up),
             )),
         ],
         Mode::Player => vec![
             Line::from(format!(
                 " {}: pausa   {}/{}: volumen   {}/{}: ±5s   \
-                 {}/{}: pista sig/ant   {}: buscar",
+                 {}/{}: pista   {}: buscar   {}: URL",
                 key_labels(&keys.play_pause),
                 key_labels(&keys.volume_up),
                 key_labels(&keys.volume_down),
@@ -2471,14 +2609,15 @@ fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
                 key_labels(&keys.next_track),
                 key_labels(&keys.prev_track),
                 key_labels(&keys.search),
+                key_labels(&keys.open_url),
             )),
             Line::from(format!(
-                " {}: shuffle   {}: repeat   {}/{}: vel   {}: URL   {}: biblio   {}: salir",
+                " {}: shuffle   {}: repeat   {}/{}: vel   {}: temas   {}: biblio   {}: salir",
                 key_labels(&keys.shuffle),
                 key_labels(&keys.repeat),
                 key_labels(&keys.speed_down),
                 key_labels(&keys.speed_up),
-                key_labels(&keys.open_url),
+                key_labels(&keys.theme_menu),
                 key_labels(&keys.explorer),
                 key_labels(&keys.quit),
             )),
@@ -2507,8 +2646,9 @@ fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
                 key_labels(&keys.repeat),
             )),
             Line::from(format!(
-                " {}: URL   {}: volver   {}: salir",
+                " {}: URL   {}: temas   {}: volver   {}: salir",
                 key_labels(&keys.open_url),
+                key_labels(&keys.theme_menu),
                 key_labels(&keys.back),
                 key_labels(&keys.quit),
             )),
@@ -2741,6 +2881,7 @@ mod tests {
             history: crate::history::History::default(),
             pending_history: None,
             history_path: Some(test_temp_history_path()),
+            theme_menu: None,
         }
     }
 
@@ -3300,6 +3441,303 @@ mod tests {
         assert!(
             joined.contains("u: URL") || joined.contains("u: url") || joined.contains("URL"),
             "footer debe mencionar atajo de URL: {joined}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // T12: menú de temas
+    // -------------------------------------------------------------------------
+
+    static THEME_MENU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct ThemeMenuTestGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        name: String,
+        theme: Theme,
+    }
+
+    impl Drop for ThemeMenuTestGuard {
+        fn drop(&mut self) {
+            config::activate_theme(&self.name, self.theme.clone());
+        }
+    }
+
+    /// Serializa los tests que mutan el tema global y restaura el estado
+    /// activo al salir (incluso si el test falla).
+    fn theme_menu_test_setup() -> ThemeMenuTestGuard {
+        let lock = THEME_MENU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        ThemeMenuTestGuard {
+            _lock: lock,
+            name: config::active_theme_name(),
+            theme: config::active_theme(),
+        }
+    }
+
+    fn theme_menu_key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn theme_menu_open_snapshots_current_theme() {
+        let _setup = theme_menu_test_setup();
+        let mut app = test_app();
+
+        open_theme_menu(&mut app);
+
+        let menu = app
+            .theme_menu
+            .as_ref()
+            .expect("open_theme_menu debe abrir el menú");
+        let current = config::active_theme_name();
+        let expected = config::builtin_themes()
+            .iter()
+            .position(|(id, _)| *id == current)
+            .expect("el tema activo es un id builtin");
+        assert_eq!(menu.selected, expected, "selección = tema actual");
+        assert_eq!(menu.original_name, current, "guarda el id original");
+        assert_eq!(
+            menu.original_theme,
+            config::active_theme(),
+            "guarda los colores originales para Esc"
+        );
+        // Abrir no cambia el tema.
+        assert_eq!(config::active_theme_name(), current, "solo previsualiza al mover");
+    }
+
+    #[test]
+    fn theme_menu_navigation_previews_live() {
+        let _setup = theme_menu_test_setup();
+        let mut app = test_app();
+        app.theme_menu = Some(ThemeMenuState {
+            selected: 0,
+            original_name: config::active_theme_name(),
+            original_theme: config::active_theme(),
+        });
+
+        handle_theme_menu_key(theme_menu_key(KeyCode::Down), &mut app, |_| Ok(()));
+        let menu = app
+            .theme_menu
+            .as_ref()
+            .expect("el menú sigue abierto al navegar");
+        assert_eq!(menu.selected, 1, "↓ mueve la selección");
+        let second_id = config::builtin_themes()[1].0;
+        assert_eq!(
+            config::active_theme(),
+            config::resolve_theme(second_id),
+            "↓ previsualiza la paleta en vivo"
+        );
+
+        handle_theme_menu_key(theme_menu_key(KeyCode::Up), &mut app, |_| Ok(()));
+        assert_eq!(
+            app.theme_menu.as_ref().expect("menú abierto").selected,
+            0,
+            "↑ vuelve a la primera fila"
+        );
+        assert_eq!(
+            config::active_theme(),
+            config::resolve_theme(config::builtin_themes()[0].0),
+            "↑ restaura la previsualización anterior"
+        );
+    }
+
+    #[test]
+    fn theme_menu_enter_applies_and_persists_injected_path() {
+        let _setup = theme_menu_test_setup();
+        let path = std::env::temp_dir()
+            .join(format!("mp3tui_theme_menu_{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let mut app = test_app();
+        let last = config::builtin_themes().len() - 1;
+        app.theme_menu = Some(ThemeMenuState {
+            selected: last,
+            original_name: config::active_theme_name(),
+            original_theme: config::active_theme(),
+        });
+
+        handle_theme_menu_key(theme_menu_key(KeyCode::Enter), &mut app, |id| {
+            config::persist_theme_name_at(&path, id)
+        });
+
+        let expected = config::builtin_themes()[last].0;
+        assert!(app.theme_menu.is_none(), "Enter cierra el menú");
+        assert_eq!(
+            config::active_theme_name(),
+            expected,
+            "el id aplicado queda activo"
+        );
+        assert_eq!(
+            config::active_theme(),
+            config::resolve_theme(expected),
+            "la paleta aplicada queda activa"
+        );
+        assert!(app.error.is_none(), "sin error: {:?}", app.error);
+        let text = std::fs::read_to_string(&path).expect("archivo persistido");
+        assert_eq!(
+            text,
+            format!("[theme]\nname = \"{expected}\"\n"),
+            "config.toml temporal con el name nuevo"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn theme_menu_enter_persist_failure_keeps_applied_theme() {
+        let _setup = theme_menu_test_setup();
+        let mut app = test_app();
+        app.theme_menu = Some(ThemeMenuState {
+            selected: 2,
+            original_name: config::active_theme_name(),
+            original_theme: config::active_theme(),
+        });
+
+        handle_theme_menu_key(theme_menu_key(KeyCode::Enter), &mut app, |_| {
+            Err("no se pudo guardar el tema: disco lleno".to_string())
+        });
+
+        let expected = config::builtin_themes()[2].0;
+        assert!(app.theme_menu.is_none(), "Enter cierra igual");
+        assert_eq!(
+            config::active_theme_name(),
+            expected,
+            "el tema queda aplicado en la sesión pese al fallo"
+        );
+        assert_eq!(config::active_theme(), config::resolve_theme(expected));
+        let err = app.error.as_deref().expect("error visible en la app");
+        assert!(!err.is_empty(), "mensaje corto no vacío");
+    }
+
+    #[test]
+    fn theme_menu_escape_restores_previous_theme() {
+        let _setup = theme_menu_test_setup();
+        let mut app = test_app();
+        let before_name = config::active_theme_name();
+        let before_theme = config::active_theme();
+        app.theme_menu = Some(ThemeMenuState {
+            selected: 0,
+            original_name: before_name.clone(),
+            original_theme: before_theme.clone(),
+        });
+
+        handle_theme_menu_key(theme_menu_key(KeyCode::Down), &mut app, |_| {
+            Ok(())
+        });
+        handle_theme_menu_key(theme_menu_key(KeyCode::Esc), &mut app, |_| {
+            panic!("Esc no debe persistir")
+        });
+
+        assert!(app.theme_menu.is_none(), "Esc cierra el menú");
+        assert_eq!(
+            config::active_theme(),
+            before_theme,
+            "Esc restaura los colores originales"
+        );
+        assert_eq!(
+            config::active_theme_name(),
+            before_name,
+            "Esc restaura el id original"
+        );
+    }
+
+    #[test]
+    fn theme_menu_key_opens_menu_from_list() {
+        let _setup = theme_menu_test_setup();
+        let mut app = test_app();
+        let mut engine = match AudioEngine::new() {
+            Ok(engine) => engine,
+            Err(_) => return,
+        };
+
+        handle_list_key(
+            theme_menu_key(KeyCode::Char('t')),
+            &mut app,
+            &mut engine,
+        );
+
+        assert!(
+            app.theme_menu.is_some(),
+            "'t' por defecto abre el menú desde la lista"
+        );
+    }
+
+    #[test]
+    fn handle_key_routes_to_theme_menu_when_open() {
+        let _setup = theme_menu_test_setup();
+        let mut app = test_app();
+        let mut engine = match AudioEngine::new() {
+            Ok(engine) => engine,
+            Err(_) => return,
+        };
+        app.theme_menu = Some(ThemeMenuState {
+            selected: 1,
+            original_name: config::active_theme_name(),
+            original_theme: config::active_theme(),
+        });
+
+        handle_key(theme_menu_key(KeyCode::Down), &mut app, &mut engine);
+
+        assert_eq!(
+            app.theme_menu
+                .as_ref()
+                .expect("el menú sigue abierto")
+                .selected,
+            2,
+            "con el menú abierto las teclas van al menú, no a la lista"
+        );
+    }
+
+    #[test]
+    fn footer_shows_theme_menu_key() {
+        let app = test_app();
+        let lines = footer_lines(&app, false);
+        let joined: String =
+            lines.iter().map(line_text).collect::<Vec<_>>().join(" ");
+        assert!(
+            joined.contains("t: temas"),
+            "footer debe mencionar el atajo del menú de temas: {joined}"
+        );
+    }
+
+    #[test]
+    fn theme_menu_lines_list_all_themes_and_mark_current() {
+        let _setup = theme_menu_test_setup();
+        let menu = ThemeMenuState {
+            selected: 3,
+            original_name: "nord".to_string(),
+            original_theme: config::active_theme(),
+        };
+
+        let lines = theme_menu_lines(&menu);
+        let texts: Vec<String> =
+            lines.iter().map(line_text).collect::<Vec<_>>();
+        assert_eq!(texts.len(), 7, "una fila por tema: {texts:?}");
+        for (id, _) in config::builtin_themes() {
+            assert!(
+                texts.iter().any(|t| t.contains(id)),
+                "falta la fila de {id}: {texts:?}"
+            );
+        }
+        let nord_row = config::builtin_themes()
+            .iter()
+            .position(|(id, _)| *id == "nord")
+            .expect("nord builtin");
+        assert!(
+            texts[nord_row].contains('●'),
+            "● marca el tema actual: {:?}",
+            texts[nord_row]
+        );
+        assert!(
+            !texts[0].contains('●'),
+            "solo la fila actual lleva el marcador: {:?}",
+            texts[0]
+        );
+        let selected = &lines[3].spans[0];
+        assert_eq!(
+            selected.style.bg,
+            Some(config::active_theme().select_bg),
+            "la fila seleccionada va resaltada"
         );
     }
 

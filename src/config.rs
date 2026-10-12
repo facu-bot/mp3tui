@@ -29,7 +29,7 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 
 use ratatui::crossterm::event::KeyCode;
 use ratatui::style::Color;
@@ -37,15 +37,37 @@ use ratatui::style::Color;
 /// Override de la ruta del archivo (pruebas / instalaciones portables).
 pub const CONFIG_ENV_OVERRIDE: &str = "MP3TUI_CONFIG";
 
+/// Id del tema builtin usado cuando no hay `[theme] name` o no se reconoce.
+pub const DEFAULT_THEME_ID: &str = "kanagawa-dragon";
+
 /// Configuración efectiva de la app (se carga una vez al arrancar).
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Config {
+    /// Tema efectivo: paleta del `[theme] name` resuelto + overrides encima.
     pub theme: Theme,
+    /// Id del tema builtin resuelto desde `[theme] name` (o el default).
+    pub theme_name: String,
+    /// Colores personalizados de `[theme]` (clave → color): se aplican
+    /// encima de la paleta del tema elegido, también al previsualizar.
+    pub theme_overrides: Vec<(String, Color)>,
     pub keys: Keys,
     pub library: LibraryConfig,
     /// Avisos de la carga: campos inválidos, claves desconocidas o archivo
     /// ilegible. Vacío cuando todo (o el archivo mismo) está bien.
     pub warnings: Vec<String>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            theme: Theme::default(),
+            theme_name: DEFAULT_THEME_ID.to_string(),
+            theme_overrides: Vec::new(),
+            keys: Keys::default(),
+            library: LibraryConfig::default(),
+            warnings: Vec::new(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -161,7 +183,7 @@ pub fn parse(text: &str) -> Config {
     match table.get("theme") {
         None => {}
         Some(value) => match value.as_table() {
-            Some(section) => parse_theme(section, &mut config.theme, &mut warnings),
+            Some(section) => parse_theme(section, &mut config, &mut warnings),
             None => warnings.push(
                 "[theme] debe ser una tabla con claves de la forma \
                  clave = \"valor\""
@@ -276,26 +298,50 @@ impl Default for Theme {
 
 fn parse_theme(
     section: &toml::Table,
-    theme: &mut Theme,
+    config: &mut Config,
     warnings: &mut Vec<String>,
 ) {
+    // Pass 1: `name` — resuelve la paleta base ANTES de los overrides de
+    // color, que siguen pisando lo que sea (T12).
+    match section.get("name") {
+        None => {}
+        Some(value) => match value.as_str() {
+            Some(raw) => match builtin_themes()
+                .iter()
+                .find(|(id, _)| *id == raw)
+            {
+                Some((id, theme)) => {
+                    config.theme_name = id.to_string();
+                    config.theme = theme.clone();
+                }
+                None => warnings.push(format!(
+                    "[theme] nombre desconocido «{raw}»; se usa \
+                     «{DEFAULT_THEME_ID}» (disponibles: {})",
+                    builtin_themes()
+                        .iter()
+                        .map(|(id, _)| *id)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )),
+            },
+            None => warnings.push(format!(
+                "[theme] name: se espera un id de tema entre comillas, \
+                 p. ej. \"{DEFAULT_THEME_ID}\"; se usa «{DEFAULT_THEME_ID}»"
+            )),
+        },
+    }
+
+    // Pass 2: colores — pisan la paleta elegida y quedan registrados en
+    // `theme_overrides` para re-aplicarlos en cada previsualización.
+    let theme = &mut config.theme;
+    let overrides = &mut config.theme_overrides;
     for (key, value) in section {
-        let field = match key.as_str() {
-            "accent" => &mut theme.accent,
-            "text" => &mut theme.text,
-            "dim" => &mut theme.dim,
-            "select_bg" => &mut theme.select_bg,
-            "error" => &mut theme.error,
-            "ok" => &mut theme.ok,
-            "warn" => &mut theme.warn,
-            "spectrum_low" => &mut theme.spectrum_low,
-            "spectrum_mid" => &mut theme.spectrum_mid,
-            "spectrum_high" => &mut theme.spectrum_high,
-            "buffered" => &mut theme.buffered,
-            other => {
-                warnings.push(format!("[theme] clave desconocida «{other}»"));
-                continue;
-            }
+        if key == "name" {
+            continue;
+        }
+        let Some(field) = theme_slot(theme, key) else {
+            warnings.push(format!("[theme] clave desconocida «{key}»"));
+            continue;
         };
         let Some(raw) = value.as_str() else {
             warnings.push(format!(
@@ -305,7 +351,13 @@ fn parse_theme(
             continue;
         };
         match parse_color(raw) {
-            Some(color) => *field = color,
+            Some(color) => {
+                *field = color;
+                match overrides.iter().position(|(k, _)| k == key) {
+                    Some(pos) => overrides[pos].1 = color,
+                    None => overrides.push((key.clone(), color)),
+                }
+            }
             None => warnings.push(format!(
                 "[theme] {key}: color «{raw}» no reconocido («#RRGGBB» o \
                  nombre); se mantiene el valor por defecto"
@@ -343,6 +395,370 @@ pub fn parse_color(raw: &str) -> Option<Color> {
         _ => return None,
     };
     Some(color)
+}
+
+// ---------------------------------------------------------------------------
+// Paletas builtin (T12)
+// ---------------------------------------------------------------------------
+
+/// Las 7 paletas oficiales, en orden estable de menú. El id es el identificador
+/// que `[theme] name` acepta en config.toml y el que se guarda al aplicar.
+/// Cada paleta llena los 11 slots de `Theme`; los hex son los colores oficiales
+/// de cada proyecto (comentario por paleta).
+pub fn builtin_themes() -> &'static [(&'static str, Theme)] {
+    static THEMES: OnceLock<Vec<(&'static str, Theme)>> = OnceLock::new();
+    THEMES
+        .get_or_init(|| {
+            vec![
+                // Kanagawa Dragon == Theme::default() (rebelot/kanagawa.nvim).
+                ("kanagawa-dragon", Theme::default()),
+                // folke/tokyonight.nvim, variante `night`.
+                ("tokyonight", Theme {
+                    accent: Color::Rgb(0x7A, 0xA2, 0xF7),   // blue
+                    text: Color::Rgb(0xC0, 0xCA, 0xF5),     // fg
+                    dim: Color::Rgb(0x56, 0x5F, 0x89),      // comment
+                    select_bg: Color::Rgb(0x29, 0x2E, 0x42), // bg_highlight
+                    error: Color::Rgb(0xF7, 0x76, 0x8E),    // red
+                    ok: Color::Rgb(0x9E, 0xCE, 0x6A),       // green
+                    warn: Color::Rgb(0xE0, 0xAF, 0x68),     // yellow
+                    spectrum_low: Color::Rgb(0x7D, 0xCF, 0xFF), // cyan
+                    spectrum_mid: Color::Rgb(0x7A, 0xA2, 0xF7), // blue
+                    spectrum_high: Color::Rgb(0xF7, 0x76, 0x8E), // red
+                    buffered: Color::Rgb(0x54, 0x5C, 0x7E), // dark3
+                }),
+                // catppuccin/catppuccin, flavor `mocha`.
+                ("catppuccin-mocha", Theme {
+                    accent: Color::Rgb(0xCB, 0xA6, 0xF7),   // mauve
+                    text: Color::Rgb(0xCD, 0xD6, 0xF4),     // text
+                    dim: Color::Rgb(0x6C, 0x70, 0x86),      // overlay0
+                    select_bg: Color::Rgb(0x45, 0x47, 0x5A), // surface1
+                    error: Color::Rgb(0xF3, 0x8B, 0xA8),    // red
+                    ok: Color::Rgb(0xA6, 0xE3, 0xA1),       // green
+                    warn: Color::Rgb(0xF9, 0xE2, 0xAF),     // yellow
+                    spectrum_low: Color::Rgb(0x89, 0xDC, 0xEB), // sky
+                    spectrum_mid: Color::Rgb(0xB4, 0xBE, 0xFE), // lavender
+                    spectrum_high: Color::Rgb(0xF3, 0x8B, 0xA8), // red
+                    buffered: Color::Rgb(0x7F, 0x84, 0x9C), // overlay1
+                }),
+                // dracula/dracula-theme (colores core).
+                ("dracula", Theme {
+                    accent: Color::Rgb(0xBD, 0x93, 0xF9),   // purple
+                    text: Color::Rgb(0xF8, 0xF8, 0xF2),     // fg
+                    dim: Color::Rgb(0x62, 0x72, 0xA4),      // comment
+                    select_bg: Color::Rgb(0x44, 0x47, 0x5A), // selection
+                    error: Color::Rgb(0xFF, 0x55, 0x55),    // red
+                    ok: Color::Rgb(0x50, 0xFA, 0x7B),       // green
+                    warn: Color::Rgb(0xF1, 0xFA, 0x8C),     // yellow
+                    spectrum_low: Color::Rgb(0x8B, 0xE9, 0xFD), // cyan
+                    spectrum_mid: Color::Rgb(0xFF, 0x79, 0xC6), // pink
+                    spectrum_high: Color::Rgb(0xFF, 0x55, 0x55), // red
+                    // El set core de Dracula no tiene un neutro claro extra:
+                    // la franja `buffered` reusa el fg («franja clara»).
+                    buffered: Color::Rgb(0xF8, 0xF8, 0xF2), // fg
+                }),
+                // morhetz/gruvbox (dark; tonos bright para estados).
+                ("gruvbox-dark", Theme {
+                    accent: Color::Rgb(0xFE, 0x80, 0x19),   // orange
+                    text: Color::Rgb(0xEB, 0xDB, 0xB2),     // fg bright
+                    dim: Color::Rgb(0x7C, 0x6F, 0x64),      // dark4
+                    select_bg: Color::Rgb(0x3C, 0x38, 0x36), // bg1
+                    error: Color::Rgb(0xFB, 0x49, 0x34),    // red bright
+                    ok: Color::Rgb(0xB8, 0xBB, 0x26),       // green bright
+                    warn: Color::Rgb(0xFA, 0xBD, 0x2F),     // yellow bright
+                    spectrum_low: Color::Rgb(0x8E, 0xC0, 0x7C), // aqua bright
+                    spectrum_mid: Color::Rgb(0x83, 0xA5, 0x98), // blue bright
+                    spectrum_high: Color::Rgb(0xFE, 0x80, 0x19), // orange
+                    buffered: Color::Rgb(0x92, 0x83, 0x74), // gray
+                }),
+                // nordtheme/nord (nord0–nord15).
+                ("nord", Theme {
+                    accent: Color::Rgb(0x88, 0xC0, 0xD0),   // nord8
+                    text: Color::Rgb(0xD8, 0xDE, 0xE9),     // nord4
+                    dim: Color::Rgb(0x4C, 0x56, 0x6A),      // nord3
+                    select_bg: Color::Rgb(0x3B, 0x42, 0x52), // nord1
+                    error: Color::Rgb(0xBF, 0x61, 0x6A),    // nord11
+                    ok: Color::Rgb(0xA3, 0xBE, 0x8C),       // nord14
+                    warn: Color::Rgb(0xEB, 0xCB, 0x8B),     // nord13
+                    spectrum_low: Color::Rgb(0x8F, 0xBC, 0xBB), // nord7
+                    spectrum_mid: Color::Rgb(0x81, 0xA1, 0xC1), // nord9
+                    spectrum_high: Color::Rgb(0xD0, 0x87, 0x70), // nord12
+                    buffered: Color::Rgb(0x5E, 0x81, 0xAC), // nord10
+                }),
+                // rosé-pine/main (Rosé Pine).
+                ("rose-pine", Theme {
+                    accent: Color::Rgb(0xC4, 0xA7, 0xE7),   // iris
+                    text: Color::Rgb(0xE0, 0xDE, 0xF4),     // text
+                    dim: Color::Rgb(0x6E, 0x6A, 0x86),      // muted
+                    select_bg: Color::Rgb(0x40, 0x3D, 0x52), // highlightMed
+                    error: Color::Rgb(0xEB, 0x6F, 0x92),    // love
+                    ok: Color::Rgb(0x31, 0x74, 0x8F),       // pine
+                    warn: Color::Rgb(0xF6, 0xC1, 0x77),     // gold
+                    spectrum_low: Color::Rgb(0x9C, 0xCF, 0xD8), // foam
+                    spectrum_mid: Color::Rgb(0xC4, 0xA7, 0xE7), // iris
+                    spectrum_high: Color::Rgb(0xEB, 0xBC, 0xBA), // rose
+                    buffered: Color::Rgb(0x90, 0x8C, 0xAA), // subtle
+                }),
+            ]
+        })
+        .as_slice()
+}
+
+/// Paleta builtin por id; `None` si el id no existe.
+pub fn builtin_theme(id: &str) -> Option<&'static Theme> {
+    builtin_themes()
+        .iter()
+        .find(|(name, _)| *name == id)
+        .map(|(_, theme)| theme)
+}
+
+/// Paleta efectiva para un id: builtin + los overrides personalizados de
+/// `[theme]` (pisan la paleta, también al previsualizar). Id desconocido →
+/// default.
+pub fn resolve_theme(id: &str) -> Theme {
+    let mut theme = builtin_theme(id).cloned().unwrap_or_default();
+    apply_theme_overrides(&mut theme, &config().theme_overrides);
+    theme
+}
+
+/// Aplica los overrides de `[theme]` sobre una paleta base, en el mismo orden
+/// que `parse_theme`.
+fn apply_theme_overrides(theme: &mut Theme, overrides: &[(String, Color)]) {
+    for (key, color) in overrides {
+        if let Some(field) = theme_slot(theme, key) {
+            *field = *color;
+        }
+    }
+}
+
+/// Campo mutable de `Theme` para una clave de config; `None` si no existe.
+fn theme_slot<'a>(theme: &'a mut Theme, key: &str) -> Option<&'a mut Color> {
+    match key {
+        "accent" => Some(&mut theme.accent),
+        "text" => Some(&mut theme.text),
+        "dim" => Some(&mut theme.dim),
+        "select_bg" => Some(&mut theme.select_bg),
+        "error" => Some(&mut theme.error),
+        "ok" => Some(&mut theme.ok),
+        "warn" => Some(&mut theme.warn),
+        "spectrum_low" => Some(&mut theme.spectrum_low),
+        "spectrum_mid" => Some(&mut theme.spectrum_mid),
+        "spectrum_high" => Some(&mut theme.spectrum_high),
+        "buffered" => Some(&mut theme.buffered),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Persistencia del tema (T12)
+// ---------------------------------------------------------------------------
+
+/// Actualiza (o inserta) solo la clave `name` dentro de `[theme]` de un texto
+/// TOML, preservando el resto — comentarios, otras claves, otras secciones y
+/// los finales de línea CRLF. Sin sección `[theme]`, la agrega al final.
+pub fn update_theme_name(text: &str, name: &str) -> String {
+    let crlf = text.contains("\r\n");
+    let eol = if crlf { "\r\n" } else { "\n" };
+
+    // Encabezado de sección: `[sección]` (+ comentario opcional). Un
+    // comentario que menciona `[theme]` no abre sección.
+    fn header_section(line: &str) -> Option<&str> {
+        let t = line.trim_start();
+        let rest = t.strip_prefix('[')?;
+        let end = rest.find(']')?;
+        let after = rest[end + 1..].trim();
+        if after.is_empty() || after.starts_with('#') {
+            Some(rest[..end].trim())
+        } else {
+            None
+        }
+    }
+
+    // Cola de comentario de una línea `clave = valor …` respetando comillas.
+    fn line_comment(after_equals: &str) -> &str {
+        let mut quote: Option<char> = None;
+        for (i, c) in after_equals.char_indices() {
+            match quote {
+                Some(q) if c == q => quote = None,
+                Some(_) => {}
+                None => match c {
+                    '"' | '\'' => quote = Some(c),
+                    '#' => return after_equals[i..].trim_end(),
+                    _ => {}
+                },
+            }
+        }
+        ""
+    }
+
+    let mut lines: Vec<String> =
+        text.split('\n').map(str::to_string).collect();
+
+    let Some(start) =
+        lines.iter().position(|l| header_section(l) == Some("theme"))
+    else {
+        // Sin sección: agregarla al final, sin tocar lo existente.
+        let mut out = text.to_string();
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push_str(eol);
+        }
+        out.push_str(&format!("[theme]{eol}name = \"{name}\"{eol}"));
+        return out;
+    };
+
+    // Fin de la sección: la próxima cabecera (de cualquier sección).
+    let end = lines
+        .iter()
+        .skip(start + 1)
+        .position(|l| header_section(l).is_some())
+        .map(|offset| start + 1 + offset)
+        .unwrap_or(lines.len());
+
+    // ¿Ya hay una clave `name` dentro de la sección?
+    for i in (start + 1)..end {
+        let line = &lines[i];
+        let t = line.trim_start();
+        if t.starts_with('#') {
+            continue;
+        }
+        let Some(rest) = t.strip_prefix("name") else {
+            continue;
+        };
+        let Some(after) = rest.trim_start().strip_prefix('=') else {
+            // «names», «name2», etc.: no es la clave.
+            continue;
+        };
+        let indent = &line[..line.len() - t.len()];
+        let comment = line_comment(after);
+        let mut new_line = format!("{indent}name = \"{name}\"");
+        if !comment.is_empty() {
+            new_line.push(' ');
+            new_line.push_str(comment);
+        }
+        if line.ends_with('\r') {
+            new_line.push('\r');
+        }
+        lines[i] = new_line;
+        return lines.join("\n");
+    }
+
+    // Clave ausente: insertarla justo debajo del encabezado.
+    let mut inserted = format!("name = \"{name}\"");
+    if crlf {
+        inserted.push('\r');
+    }
+    lines.insert(start + 1, inserted);
+    lines.join("\n")
+}
+
+/// Escribe el `name` del tema en `path` de forma atómica (archivo temporal +
+/// rename). Crea el archivo (y su directorio) si no existe. Nunca toca la
+/// config real: las pruebas usan rutas temporales vía esta función.
+pub(crate) fn persist_theme_name_at(
+    path: &Path,
+    name: &str,
+) -> Result<(), String> {
+    let existing = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            String::new()
+        }
+        Err(err) => {
+            return Err(format!("no se pudo leer '{}': {err}", path.display()));
+        }
+    };
+    let updated = update_theme_name(&existing, name);
+
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && let Err(err) = fs::create_dir_all(parent)
+    {
+        return Err(format!("no se pudo guardar el tema: {err}"));
+    }
+
+    let mut tmp_os = path.as_os_str().to_os_string();
+    tmp_os.push(".tmp");
+    let tmp = PathBuf::from(tmp_os);
+    if let Err(err) = fs::write(&tmp, updated.as_bytes()) {
+        return Err(format!("no se pudo guardar el tema: {err}"));
+    }
+    match fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let _ = fs::remove_file(&tmp);
+            Err(format!("no se pudo guardar el tema: {err}"))
+        }
+    }
+}
+
+/// Persiste el id del tema en la config del usuario (ruta por defecto o
+/// `MP3TUI_CONFIG`).
+pub fn persist_theme_name(name: &str) -> Result<(), String> {
+    let Some((path, _)) = resolve_path() else {
+        return Err(
+            "no se pudo guardar el tema: sin ruta de config".to_string(),
+        );
+    };
+    persist_theme_name_at(&path, name)
+}
+
+// ---------------------------------------------------------------------------
+// Tema activo en runtime (T12)
+// ---------------------------------------------------------------------------
+
+/// Estado que cambia en caliente al previsualizar/aplicar temas desde el menú.
+/// Se eligió una celda `RwLock` con copia por lectura (11 `Color` por frame)
+/// en vez de pasar `&Theme` por todo el render: un solo punto de acceso
+/// (`ui::theme()`), cero cambios en los ~100 call sites y sin dependencias.
+struct ActiveTheme {
+    name: String,
+    theme: Theme,
+}
+
+static ACTIVE: OnceLock<RwLock<ActiveTheme>> = OnceLock::new();
+
+fn active_cell() -> &'static RwLock<ActiveTheme> {
+    ACTIVE.get_or_init(|| {
+        let config = config();
+        RwLock::new(ActiveTheme {
+            name: config.theme_name.clone(),
+            theme: config.theme.clone(),
+        })
+    })
+}
+
+/// Tema activo para renderizar. Copia barata: 11 `Color` (~44 B).
+pub fn active_theme() -> Theme {
+    active_cell()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .theme
+        .clone()
+}
+
+/// Id del tema activo (el que quedó aplicado; la previsualización no lo toca).
+pub fn active_theme_name() -> String {
+    active_cell()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .name
+        .clone()
+}
+
+/// Previsualización (↑/↓ del menú): cambia solo los colores.
+pub fn preview_theme(theme: Theme) {
+    active_cell()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .theme = theme;
+}
+
+/// Aplica tema con su nombre (Enter del menú, después de persistir).
+pub fn activate_theme(name: &str, theme: Theme) {
+    let mut guard = active_cell()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard.name = name.to_string();
+    guard.theme = theme;
 }
 
 // ---------------------------------------------------------------------------
@@ -388,6 +804,8 @@ pub struct Keys {
     pub back: Vec<KeyCode>,
     /// Abrir prompt para reproducir URL (T6): por defecto 'u'.
     pub open_url: Vec<KeyCode>,
+    /// Abrir el menú de temas (T12): por defecto 't'.
+    pub theme_menu: Vec<KeyCode>,
 }
 
 impl Default for Keys {
@@ -419,6 +837,7 @@ impl Default for Keys {
             select: keys(&[KeyCode::Enter]),
             back: keys(&[KeyCode::Esc]),
             open_url: keys(&[KeyCode::Char('u')]),
+            theme_menu: keys(&[KeyCode::Char('t')]),
         }
     }
 }
@@ -442,6 +861,7 @@ fn parse_keybindings(
             "repeat" => &mut keys.repeat,
             "search" => &mut keys.search,
             "open_url" => &mut keys.open_url,
+            "theme_menu" => &mut keys.theme_menu,
             "speed_up" => &mut keys.speed_up,
             "speed_down" => &mut keys.speed_down,
             "explorer" => &mut keys.explorer,
@@ -531,6 +951,7 @@ fn resolve_key_collisions(keys: &mut Keys, warnings: &mut Vec<String>) {
         ("repeat", &mut keys.repeat, &defaults.repeat),
         ("search", &mut keys.search, &defaults.search),
         ("open_url", &mut keys.open_url, &defaults.open_url),
+        ("theme_menu", &mut keys.theme_menu, &defaults.theme_menu),
         ("move_up", &mut keys.move_up, &defaults.move_up),
         ("move_down", &mut keys.move_down, &defaults.move_down),
         ("page_up", &mut keys.page_up, &defaults.page_up),
@@ -875,6 +1296,14 @@ pub fn key_labels(codes: &[KeyCode]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rose_pine_uses_main_variant_palette() {
+        // rose-pine/palette, variante principal (no Moon ni Dawn).
+        let theme = builtin_theme("rose-pine").expect("rose-pine existe");
+        assert_eq!(theme.select_bg, Color::Rgb(0x40, 0x3D, 0x52), "highlightMed");
+        assert_eq!(theme.spectrum_high, Color::Rgb(0xEB, 0xBC, 0xBA), "rose");
+    }
 
     #[test]
     fn empty_text_gives_defaults() {
@@ -1266,6 +1695,289 @@ mod tests {
         );
         assert_eq!(config.theme.buffered, Color::Rgb(0x12, 0x34, 0x56));
         assert!(config.warnings.is_empty(), "warnings: {:?}", config.warnings);
+    }
+
+    // -------------------------------------------------------------------------
+    // T12: paletas builtin, [theme] name, tecla del menú y persistencia
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn theme_palette_table_lists_seven_ids_and_kanagawa_matches_default() {
+        let ids: Vec<&str> =
+            builtin_themes().iter().map(|(id, _)| *id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "kanagawa-dragon",
+                "tokyonight",
+                "catppuccin-mocha",
+                "dracula",
+                "gruvbox-dark",
+                "nord",
+                "rose-pine",
+            ],
+            "los 7 ids oficiales, en orden estable de menú"
+        );
+        // kanagawa-dragon es exactamente el tema actual: la look & feel de hoy.
+        assert_eq!(
+            builtin_theme("kanagawa-dragon"),
+            Some(&Theme::default()),
+            "kanagawa-dragon debe ser el default actual"
+        );
+        // Cada paleta llena los 11 slots (struct sin Option) y todas son
+        // distintas entre sí: sin copy-paste de una paleta a otra.
+        let themes: Vec<&Theme> = builtin_themes().iter().map(|(_, t)| t).collect();
+        for (i, a) in themes.iter().enumerate() {
+            for b in themes.iter().skip(i + 1) {
+                assert_ne!(a, b, "paletas duplicadas en la tabla builtin");
+            }
+        }
+        assert!(builtin_theme("no-existe").is_none(), "id desconocido");
+    }
+
+    #[test]
+    fn theme_name_resolves_palette_and_color_overrides_stay_on_top() {
+        let config = parse(
+            r##"
+            [theme]
+            name = "dracula"
+            accent = "#123456"
+            "##,
+        );
+        assert_eq!(config.theme_name, "dracula");
+        assert!(config.warnings.is_empty(), "warnings: {:?}", config.warnings);
+        // El override de color pisa la paleta elegida…
+        assert_eq!(config.theme.accent, Color::Rgb(0x12, 0x34, 0x56));
+        // …y el resto de los slots viene de la paleta dracula, no del default.
+        let base = builtin_theme("dracula").expect("dracula es builtin");
+        assert_eq!(config.theme.text, base.text, "slots sin override = paleta");
+        assert_eq!(config.theme.select_bg, base.select_bg);
+        assert_eq!(config.theme.buffered, base.buffered);
+        assert_eq!(config.theme.spectrum_low, base.spectrum_low);
+        assert_eq!(config.theme.spectrum_high, base.spectrum_high);
+        assert_ne!(config.theme, Theme::default(), "dracula ≠ default");
+        // Los overrides quedan registrados para re-aplicarlos al previsualizar.
+        assert_eq!(
+            config.theme_overrides,
+            vec![("accent".to_string(), Color::Rgb(0x12, 0x34, 0x56))]
+        );
+    }
+
+    #[test]
+    fn theme_name_unknown_or_invalid_warns_and_falls_back() {
+        let unknown = parse(
+            r#"
+            [theme]
+            name = "no-existe"
+            "#,
+        );
+        assert_eq!(unknown.theme_name, DEFAULT_THEME_ID);
+        assert_eq!(unknown.theme, Theme::default(), "fallback al default");
+        assert!(
+            unknown
+                .warnings
+                .iter()
+                .any(|w| w.contains("no-existe") && w.contains("desconocido")),
+            "warnings: {:?}",
+            unknown.warnings
+        );
+
+        let invalid = parse(
+            r#"
+            [theme]
+            name = 42
+            "#,
+        );
+        assert_eq!(invalid.theme_name, DEFAULT_THEME_ID);
+        assert_eq!(invalid.theme, Theme::default());
+        assert!(
+            invalid.warnings.iter().any(|w| w.contains("name")),
+            "warnings: {:?}",
+            invalid.warnings
+        );
+
+        // Sin `name`: default, sin ningún aviso.
+        let plain = parse("[theme]\naccent = \"#112233\"\n");
+        assert_eq!(plain.theme_name, DEFAULT_THEME_ID);
+        assert!(plain.warnings.is_empty(), "warnings: {:?}", plain.warnings);
+    }
+
+    #[test]
+    fn theme_menu_default_parse_and_collision() {
+        assert_eq!(Keys::default().theme_menu, vec![KeyCode::Char('t')]);
+
+        let config = parse(
+            r#"
+            [keybindings]
+            theme_menu = "T"
+            "#,
+        );
+        assert_eq!(config.keys.theme_menu, vec![KeyCode::Char('T')]);
+        assert!(config.warnings.is_empty(), "warnings: {:?}", config.warnings);
+
+        // Sin remapear, 't' no colisiona con ninguna otra acción default.
+        assert_eq!(Keys::default().next_track, vec![KeyCode::Char('n')]);
+
+        // Colisión al estilo open_url: next_track va antes en la prioridad de
+        // dispatch, theme_menu pierde 'n' y vuelve a su default ('t').
+        let collision = parse(
+            r#"
+            [keybindings]
+            theme_menu = "n"
+            "#,
+        );
+        assert_eq!(
+            collision.keys.next_track,
+            vec![KeyCode::Char('n')],
+            "next_track conserva su tecla"
+        );
+        assert_eq!(
+            collision.keys.theme_menu,
+            vec![KeyCode::Char('t')],
+            "theme_menu vuelve a su default"
+        );
+        assert!(
+            collision
+                .warnings
+                .iter()
+                .any(|w| w.contains("theme_menu") && w.contains("next_track")),
+            "warnings: {:?}",
+            collision.warnings
+        );
+    }
+
+    #[test]
+    fn update_theme_name_creates_section_when_missing() {
+        assert_eq!(
+            update_theme_name("", "nord"),
+            "[theme]\nname = \"nord\"\n",
+            "archivo vacío: crea la sección"
+        );
+
+        let existing = "[library]\nroots = []\n";
+        let out = update_theme_name(existing, "nord");
+        assert!(
+            out.starts_with(existing),
+            "el contenido existente se preserva: {out:?}"
+        );
+        assert!(
+            out.ends_with("[theme]\nname = \"nord\"\n"),
+            "se agrega [theme] al final: {out:?}"
+        );
+    }
+
+    #[test]
+    fn update_theme_name_inserts_into_existing_section() {
+        let out = update_theme_name("[theme]\naccent = \"#111111\"\n", "nord");
+        assert_eq!(
+            out,
+            "[theme]\nname = \"nord\"\naccent = \"#111111\"\n",
+            "inserta name justo después del encabezado"
+        );
+
+        let out = update_theme_name(
+            "[keybindings]\nname = \"otra\"\n\n[theme]\nok = \"#00FF00\"\n",
+            "dracula",
+        );
+        assert!(
+            out.contains("[keybindings]\nname = \"otra\"\n"),
+            "otra sección intacta: {out:?}"
+        );
+        assert!(
+            out.contains("[theme]\nname = \"dracula\"\nok = \"#00FF00\"\n"),
+            "insertada solo dentro de [theme]: {out:?}"
+        );
+    }
+
+    #[test]
+    fn update_theme_name_replaces_value_and_keeps_comments() {
+        let out = update_theme_name(
+            "[theme]\nname = \"dracula\"  # viejo\nok = \"#00FF00\"\n",
+            "nord",
+        );
+        assert_eq!(
+            out,
+            "[theme]\nname = \"nord\" # viejo\nok = \"#00FF00\"\n",
+            "reemplaza solo el valor y conserva el comentario"
+        );
+
+        let out = update_theme_name("[theme]\nname = \"nord\"\n", "gruvbox-dark");
+        assert_eq!(out, "[theme]\nname = \"gruvbox-dark\"\n");
+
+        // Un comentario que menciona [theme] no abre una sección.
+        let out =
+            update_theme_name("# [theme]\n[library]\nroots = []\n", "nord");
+        assert!(
+            out.starts_with("# [theme]\n")
+                && out.ends_with("[theme]\nname = \"nord\"\n"),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn update_theme_name_preserves_crlf_and_unrelated_content() {
+        let crlf = "[theme]\r\nname = \"nord\"\r\naccent = \"#111111\"\r\n";
+        let out = update_theme_name(crlf, "tokyonight");
+        assert_eq!(
+            out,
+            "[theme]\r\nname = \"tokyonight\"\r\naccent = \"#111111\"\r\n",
+            "reemplazo con CRLF: solo cambia el valor"
+        );
+
+        let out = update_theme_name("[theme]\r\naccent = \"#111111\"\r\n", "nord");
+        assert_eq!(
+            out,
+            "[theme]\r\nname = \"nord\"\r\naccent = \"#111111\"\r\n",
+            "inserción con CRLF"
+        );
+
+        let out = update_theme_name("[library]\r\nroots = []", "nord");
+        assert_eq!(
+            out,
+            "[library]\r\nroots = []\r\n[theme]\r\nname = \"nord\"\r\n",
+            "creación con CRLF y sin salto final previo"
+        );
+    }
+
+    #[test]
+    fn persist_theme_name_at_updates_or_creates_and_reports_errors() {
+        let path = std::env::temp_dir()
+            .join(format!("mp3tui_theme_cfg_{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        // 1. No existe: lo crea con la sección mínima.
+        persist_theme_name_at(&path, "nord").expect("crea el archivo");
+        let text = std::fs::read_to_string(&path).expect("recién creado");
+        assert_eq!(text, "[theme]\nname = \"nord\"\n");
+
+        // 2. Existe: solo cambia name; comentarios, otras claves y secciones
+        //    quedan intactos y no queda archivo temporal.
+        let original = "# mío\n[theme]\nname = \"nord\"\nbuffered = \"#123456\"\n";
+        std::fs::write(&path, original).unwrap();
+        persist_theme_name_at(&path, "dracula").expect("actualiza");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            text,
+            "# mío\n[theme]\nname = \"dracula\"\nbuffered = \"#123456\"\n"
+        );
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        assert!(
+            !std::path::PathBuf::from(&tmp).exists(),
+            "sin archivo temporal colgando"
+        );
+
+        // 3. Destino no escribible (directorio): error corto, sin pánico.
+        let dir = std::env::temp_dir()
+            .join(format!("mp3tui_theme_dir_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = persist_theme_name_at(&dir, "nord")
+            .expect_err("un directorio no es escribible");
+        assert!(!err.is_empty(), "mensaje de error no vacío");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&path);
     }
 }
 

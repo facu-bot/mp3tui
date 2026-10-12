@@ -51,6 +51,7 @@ Windows.
 | `r` | Modo repetir (off → una → todas) |
 | `[` / `]` | Velocidad 0.50x – 2.00x (pasos de 0.25x) |
 | `u` | Abrir diálogo para reproducir URL o archivo |
+| `t` | Abrir el selector de temas (↑/↓ previsualiza, Enter guarda, Esc cancela) |
 | `b` / `Tab` / `Ctrl+Tab` | Abrir o cerrar el panel del explorador |
 | `/` | Abrir el panel del explorador con la búsqueda |
 | `q` / `Esc` | Salir |
@@ -88,6 +89,7 @@ audio (arranque sin archivo) el explorador sigue ocupando toda la pantalla.
 | `n` / `p` | Pista siguiente / anterior |
 | `s` | Aleatorio |
 | `r` | Modo repetir |
+| `t` | Selector de temas |
 | `/` | Búsqueda incremental (vive en el panel) |
 | `Esc` / `Tab` / `Ctrl+Tab` / `b` | Cerrar el panel (el reproductor de fondo queda solo) |
 | `q` | Salir |
@@ -139,8 +141,14 @@ El tema por defecto es **Kanagawa Dragon** (la variante `dragon` de
 abajo son justamente esos valores: solo hace falta escribir las claves que
 se quieran cambiar.
 
+Con la tecla `t` se abre el selector de temas: `↑`/`↓` previsualizan cada
+paleta en vivo, `Enter` aplica el tema y guarda su `name` en este archivo
+(creando la sección `[theme]` si no existe) y `Esc` cancela y restaura el
+tema anterior.
+
 ```toml
 [theme]
+name = "kanagawa-dragon" # paleta de partida; ver IDs abajo
 accent = "#957FB8"       # #RRGGBB o nombre (cyan, cian, gris oscuro, ...)
 text = "#C5C9C5"
 dim = "#7A8382"
@@ -161,7 +169,7 @@ seek_back = "left"
 #   quit, play_pause, volume_up, volume_down, seek_back, seek_fwd,
 #   prev_track, next_track, shuffle, repeat, search, speed_up,
 #   speed_down, explorer, open_url, move_up, move_down, page_up, page_down,
-#   home, end, select, back
+#   home, end, select, back, theme_menu
 # Nombres de tecla: space, enter, esc, tab, up, down, left, right,
 #   pageup, pagedown, home, end, backspace, delete, insert, backtab,
 #   comma, minus, plus (o un carácter simple como "q" o "/")
@@ -178,6 +186,11 @@ roots = ["C:/Musica"]
 
 Notas del comportamiento de la config:
 
+- `theme.name` acepta una de estas paletas oficiales, en este orden:
+  `kanagawa-dragon` (default), `tokyonight`, `catppuccin-mocha`, `dracula`,
+  `gruvbox-dark`, `nord`, `rose-pine`. Un ID desconocido o que no sea texto
+  genera un aviso y se usa el default. Los colores escritos a mano en
+  `[theme]` tienen prioridad sobre la paleta: siguen pisándola.
 - Se mergea campo a campo: un valor inválido vuelve a su default sin
   arrastrar al resto. Los avisos salen en stderr antes de la TUI y en la
   primera pantalla.
