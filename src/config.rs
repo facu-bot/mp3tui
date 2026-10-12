@@ -615,18 +615,53 @@ fn theme_slot<'a>(theme: &'a mut Theme, key: &str) -> Option<&'a mut Color> {
 }
 
 // ---------------------------------------------------------------------------
-// Persistencia del tema 
 // ---------------------------------------------------------------------------
+// Editor de config.toml por líneas
+// ---------------------------------------------------------------------------
+//
+// Tema, bandas, modo y mouse se guardan con el mismo editor: agregar la
+// sección si falta, reemplazar la clave dentro de la sección conservando
+// indentación y comentarios, o insertarla debajo del encabezado. Antes había
+// cuatro copias del mismo cuerpo, que ya habían divergido entre sí.
 
-/// Actualiza (o inserta) solo la clave `name` dentro de `[theme]` de un texto
-/// TOML, preservando el resto — comentarios, otras claves, otras secciones y
-/// los finales de línea CRLF. Sin sección `[theme]`, la agrega al final.
-pub fn update_theme_name(text: &str, name: &str) -> String {
+/// Valor de una clave de config ya validado: sabe renderizarse como token TOML
+/// y compararse contra lo que quedó escrito en el archivo.
+enum ConfigValue<'a> {
+    /// Cadena; en TOML va entre comillas.
+    Str(&'a str),
+    /// Booleano; en TOML va sin comillas.
+    Bool(bool),
+}
+
+impl ConfigValue<'_> {
+    /// Token TOML tal como se escribe: `"nord"` o `true`.
+    fn render(&self) -> String {
+        match self {
+            Self::Str(value) => format!("\"{value}\""),
+            Self::Bool(value) => value.to_string(),
+        }
+    }
+
+    /// ¿`value` es exactamente el valor que se pidió guardar?
+    fn matches(&self, value: &toml::Value) -> bool {
+        match (self, value) {
+            (Self::Str(want), toml::Value::String(got)) => got == want,
+            (Self::Bool(want), toml::Value::Boolean(got)) => got == want,
+            _ => false,
+        }
+    }
+}
+
+/// Devuelve `text` con `key = value` dentro de `[section]`: reemplaza la clave
+/// si ya está, la inserta debajo del encabezado si la sección existe, o agrega
+/// la sección al final con la clave adentro. Conserva CRLF, la indentación y
+/// el comentario de la línea reemplazada.
+fn edit_section_key(text: &str, section: &str, key: &str, value: &str) -> String {
     let crlf = text.contains("\r\n");
     let eol = if crlf { "\r\n" } else { "\n" };
 
     // Encabezado de sección: `[sección]` (+ comentario opcional). Un
-    // comentario que menciona `[theme]` no abre sección.
+    // comentario que menciona `[sección]` no abre sección.
     fn header_section(line: &str) -> Option<&str> {
         let t = line.trim_start();
         let rest = t.strip_prefix('[')?;
@@ -660,14 +695,14 @@ pub fn update_theme_name(text: &str, name: &str) -> String {
         text.split('\n').map(str::to_string).collect();
 
     let Some(start) =
-        lines.iter().position(|l| header_section(l) == Some("theme"))
+        lines.iter().position(|l| header_section(l) == Some(section))
     else {
         // Sin sección: agregarla al final, sin tocar lo existente.
         let mut out = text.to_string();
         if !out.is_empty() && !out.ends_with('\n') {
             out.push_str(eol);
         }
-        out.push_str(&format!("[theme]{eol}name = \"{name}\"{eol}"));
+        out.push_str(&format!("[{section}]{eol}{key} = {value}{eol}"));
         return out;
     };
 
@@ -679,14 +714,14 @@ pub fn update_theme_name(text: &str, name: &str) -> String {
         .map(|offset| start + 1 + offset)
         .unwrap_or(lines.len());
 
-    // ¿Ya hay una clave `name` dentro de la sección?
+    // ¿Ya está la clave dentro de la sección?
     for i in (start + 1)..end {
         let line = &lines[i];
         let t = line.trim_start();
         if t.starts_with('#') {
             continue;
         }
-        let Some(rest) = t.strip_prefix("name") else {
+        let Some(rest) = t.strip_prefix(key) else {
             continue;
         };
         let Some(after) = rest.trim_start().strip_prefix('=') else {
@@ -695,7 +730,7 @@ pub fn update_theme_name(text: &str, name: &str) -> String {
         };
         let indent = &line[..line.len() - t.len()];
         let comment = line_comment(after);
-        let mut new_line = format!("{indent}name = \"{name}\"");
+        let mut new_line = format!("{indent}{key} = {value}");
         if !comment.is_empty() {
             new_line.push(' ');
             new_line.push_str(comment);
@@ -708,7 +743,7 @@ pub fn update_theme_name(text: &str, name: &str) -> String {
     }
 
     // Clave ausente: insertarla justo debajo del encabezado.
-    let mut inserted = format!("name = \"{name}\"");
+    let mut inserted = format!("{key} = {value}");
     if crlf {
         inserted.push('\r');
     }
@@ -716,12 +751,22 @@ pub fn update_theme_name(text: &str, name: &str) -> String {
     lines.join("\n")
 }
 
-/// Escribe el `name` del tema en `path` de forma atómica (archivo temporal +
-/// rename). Crea el archivo (y su directorio) si no existe. Nunca toca la
-/// config real: las pruebas usan rutas temporales vía esta función.
-pub(crate) fn persist_theme_name_at(
+/// Escribe `key = value` en `[section]` de `path` de forma atómica (archivo
+/// temporal + rename). Crea el archivo (y su directorio) si no existe. Nunca
+/// toca la config real: las pruebas usan rutas temporales vía esta función.
+///
+/// `label` es cómo se nombra el valor en los mensajes de error ("el tema",
+/// "el mouse"). El resultado se reparsea antes de escribir: el editor por
+/// líneas solo entiende `[section]` + `key =`, y ante otras formas válidas
+/// (tabla inline, claves con punto o entre comillas) podría duplicar claves y
+/// dejar la config ilegible, así que si no queda TOML válido con el valor
+/// pedido no se toca el archivo.
+fn persist_key_at(
     path: &Path,
-    name: &str,
+    section: &str,
+    key: &str,
+    label: &str,
+    value: ConfigValue<'_>,
 ) -> Result<(), String> {
     let existing = match fs::read_to_string(path) {
         Ok(text) => text,
@@ -732,27 +777,18 @@ pub(crate) fn persist_theme_name_at(
             return Err(format!("no se pudo leer '{}': {err}", path.display()));
         }
     };
-    let updated = update_theme_name(&existing, name);
+    let updated = edit_section_key(&existing, section, key, &value.render());
 
-    // El editor por líneas solo entiende `[theme]` + `name =...`. Ante otras
-    // formas válidas (tabla inline, claves con punto o entre comillas) podría
-    // duplicar claves y dejar la config ilegible: se valida el resultado y, si
-    // no queda TOML válido con el nombre pedido, no se toca el archivo.
     let persisted = updated
         .parse::<toml::Table>()
         .ok()
-        .and_then(|table| {
-            table
-                .get("theme")?
-                .get("name")?
-                .as_str()
-                .map(|saved| saved == name)
-        })
+        .and_then(|table| table.get(section)?.get(key).map(|saved| value.matches(saved)))
         .unwrap_or(false);
     if !persisted {
         return Err(format!(
-            "no se pudo guardar el tema sin romper '{}'; agregá `name = \"{name}\"` en [theme] a mano",
-            path.display()
+            "no se pudo guardar {label} sin romper '{}'; agregá `{key} = {}` en [{section}] a mano",
+            path.display(),
+            value.render()
         ));
     }
 
@@ -760,22 +796,41 @@ pub(crate) fn persist_theme_name_at(
         && !parent.as_os_str().is_empty()
         && let Err(err) = fs::create_dir_all(parent)
     {
-        return Err(format!("no se pudo guardar el tema: {err}"));
+        return Err(format!("no se pudo guardar {label}: {err}"));
     }
 
     let mut tmp_os = path.as_os_str().to_os_string();
     tmp_os.push(".tmp");
     let tmp = PathBuf::from(tmp_os);
     if let Err(err) = fs::write(&tmp, updated.as_bytes()) {
-        return Err(format!("no se pudo guardar el tema: {err}"));
+        return Err(format!("no se pudo guardar {label}: {err}"));
     }
     match fs::rename(&tmp, path) {
         Ok(()) => Ok(()),
         Err(err) => {
             let _ = fs::remove_file(&tmp);
-            Err(format!("no se pudo guardar el tema: {err}"))
+            Err(format!("no se pudo guardar {label}: {err}"))
         }
     }
+}
+
+// Persistencia del tema 
+// ---------------------------------------------------------------------------
+
+/// Actualiza (o inserta) solo la clave `name` dentro de `[theme]` de un texto
+/// TOML, preservando el resto — comentarios, otras claves, otras secciones y
+/// los finales de línea CRLF. Sin sección `[theme]`, la agrega al final.
+/// Solo para tests: fachada tipada sobre [`edit_section_key`].
+#[cfg(test)]
+pub fn update_theme_name(text: &str, name: &str) -> String {
+    edit_section_key(text, "theme", "name", &ConfigValue::Str(name).render())
+}
+
+/// Escribe el `name` del tema en `path` de forma atómica (archivo temporal +
+/// rename). Crea el archivo (y su directorio) si no existe. Nunca toca la
+/// config real: las pruebas usan rutas temporales vía esta función.
+pub(crate) fn persist_theme_name_at(path: &Path, name: &str) -> Result<(), String> {
+    persist_key_at(path, "theme", "name", "el tema", ConfigValue::Str(name))
 }
 
 /// Persiste el id del tema en la config del usuario (ruta por defecto o
@@ -1454,99 +1509,15 @@ pub fn activate_visualizer_style(style: VisualizerStyle) {
 /// texto TOML, preservando el resto — comentarios, otras claves, otras
 /// secciones y los finales de línea CRLF. Sin sección `[visualizer]`, la
 /// agrega al final.
+/// Solo para tests: fachada tipada sobre [`edit_section_key`].
+#[cfg(test)]
 pub fn update_visualizer_style(text: &str, style: &str) -> String {
-    let crlf = text.contains("\r\n");
-    let eol = if crlf { "\r\n" } else { "\n" };
-
-    // Encabezado de sección: `[sección]` (+ comentario opcional). Un
-    // comentario que menciona `[visualizer]` no abre sección.
-    fn header_section(line: &str) -> Option<&str> {
-        let t = line.trim_start();
-        let rest = t.strip_prefix('[')?;
-        let end = rest.find(']')?;
-        let after = rest[end + 1..].trim();
-        if after.is_empty() || after.starts_with('#') {
-            Some(rest[..end].trim())
-        } else {
-            None
-        }
-    }
-
-    // Cola de comentario de una línea `clave = valor …` respetando comillas.
-    fn line_comment(after_equals: &str) -> &str {
-        let mut quote: Option<char> = None;
-        for (i, c) in after_equals.char_indices() {
-            match quote {
-                Some(q) if c == q => quote = None,
-                Some(_) => {}
-                None => match c {
-                    '"' | '\'' => quote = Some(c),
-                    '#' => return after_equals[i..].trim_end(),
-                    _ => {}
-                },
-            }
-        }
-        ""
-    }
-
-    let mut lines: Vec<String> =
-        text.split('\n').map(str::to_string).collect();
-
-    let Some(start) =
-        lines.iter().position(|l| header_section(l) == Some("visualizer"))
-    else {
-        // Sin sección: agregarla al final, sin tocar lo existente.
-        let mut out = text.to_string();
-        if !out.is_empty() && !out.ends_with('\n') {
-            out.push_str(eol);
-        }
-        out.push_str(&format!("[visualizer]{eol}style = \"{style}\"{eol}"));
-        return out;
-    };
-
-    // Fin de la sección: la próxima cabecera (de cualquier sección).
-    let end = lines
-        .iter()
-        .skip(start + 1)
-        .position(|l| header_section(l).is_some())
-        .map(|offset| start + 1 + offset)
-        .unwrap_or(lines.len());
-
-    // ¿Ya hay una clave `style` dentro de la sección?
-    for i in (start + 1)..end {
-        let line = &lines[i];
-        let t = line.trim_start();
-        if t.starts_with('#') {
-            continue;
-        }
-        let Some(rest) = t.strip_prefix("style") else {
-            continue;
-        };
-        let Some(after) = rest.trim_start().strip_prefix('=') else {
-            // «styles», «style2», etc.: no es la clave.
-            continue;
-        };
-        let indent = &line[..line.len() - t.len()];
-        let comment = line_comment(after);
-        let mut new_line = format!("{indent}style = \"{style}\"");
-        if !comment.is_empty() {
-            new_line.push(' ');
-            new_line.push_str(comment);
-        }
-        if line.ends_with('\r') {
-            new_line.push('\r');
-        }
-        lines[i] = new_line;
-        return lines.join("\n");
-    }
-
-    // Clave ausente: insertarla justo debajo del encabezado.
-    let mut inserted = format!("style = \"{style}\"");
-    if crlf {
-        inserted.push('\r');
-    }
-    lines.insert(start + 1, inserted);
-    lines.join("\n")
+    edit_section_key(
+        text,
+        "visualizer",
+        "style",
+        &ConfigValue::Str(style).render(),
+    )
 }
 
 /// Escribe el `style` en `path` de forma atómica (archivo temporal +
@@ -1556,59 +1527,13 @@ pub(crate) fn persist_visualizer_style_at(
     path: &Path,
     style: &str,
 ) -> Result<(), String> {
-    let existing = match fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            String::new()
-        }
-        Err(err) => {
-            return Err(format!("no se pudo leer '{}': {err}", path.display()));
-        }
-    };
-    let updated = update_visualizer_style(&existing, style);
-
-    // Igual que con el tema: ante formas válidas que el editor por líneas no
-    // reconoce (tabla inline, claves con punto o entre comillas) podría
-    // duplicar claves; se valida el resultado y, si no queda TOML válido con
-    // el estilo pedido, no se toca el archivo.
-    let persisted = updated
-        .parse::<toml::Table>()
-        .ok()
-        .and_then(|table| {
-            table
-                .get("visualizer")?
-                .get("style")?
-                .as_str()
-                .map(|saved| saved == style)
-        })
-        .unwrap_or(false);
-    if !persisted {
-        return Err(format!(
-            "no se pudo guardar el estilo sin romper '{}'; agregá `style = \"{style}\"` en [visualizer] a mano",
-            path.display()
-        ));
-    }
-
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-        && let Err(err) = fs::create_dir_all(parent)
-    {
-        return Err(format!("no se pudo guardar el estilo: {err}"));
-    }
-
-    let mut tmp_os = path.as_os_str().to_os_string();
-    tmp_os.push(".tmp");
-    let tmp = PathBuf::from(tmp_os);
-    if let Err(err) = fs::write(&tmp, updated.as_bytes()) {
-        return Err(format!("no se pudo guardar el estilo: {err}"));
-    }
-    match fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
-        Err(err) => {
-            let _ = fs::remove_file(&tmp);
-            Err(format!("no se pudo guardar el estilo: {err}"))
-        }
-    }
+    persist_key_at(
+        path,
+        "visualizer",
+        "style",
+        "el estilo",
+        ConfigValue::Str(style),
+    )
 }
 
 /// Persiste el estilo en la config del usuario (ruta por defecto o
@@ -1705,99 +1630,10 @@ pub fn activate_visualizer_mode(mode: VisualizerMode) {
 /// texto TOML, preservando el resto — comentarios, otras claves, otras
 /// secciones y los finales de línea CRLF. Sin sección `[visualizer]`, la
 /// agrega al final.
+/// Solo para tests: fachada tipada sobre [`edit_section_key`].
+#[cfg(test)]
 pub fn update_visualizer_mode(text: &str, mode: &str) -> String {
-    let crlf = text.contains("\r\n");
-    let eol = if crlf { "\r\n" } else { "\n" };
-
-    // Encabezado de sección: `[sección]` (+ comentario opcional). Un
-    // comentario que menciona `[visualizer]` no abre sección.
-    fn header_section(line: &str) -> Option<&str> {
-        let t = line.trim_start();
-        let rest = t.strip_prefix('[')?;
-        let end = rest.find(']')?;
-        let after = rest[end + 1..].trim();
-        if after.is_empty() || after.starts_with('#') {
-            Some(rest[..end].trim())
-        } else {
-            None
-        }
-    }
-
-    // Cola de comentario de una línea `clave = valor …` respetando comillas.
-    fn line_comment(after_equals: &str) -> &str {
-        let mut quote: Option<char> = None;
-        for (i, c) in after_equals.char_indices() {
-            match quote {
-                Some(q) if c == q => quote = None,
-                Some(_) => {}
-                None => match c {
-                    '"' | '\'' => quote = Some(c),
-                    '#' => return after_equals[i..].trim_end(),
-                    _ => {}
-                },
-            }
-        }
-        ""
-    }
-
-    let mut lines: Vec<String> =
-        text.split('\n').map(str::to_string).collect();
-
-    let Some(start) =
-        lines.iter().position(|l| header_section(l) == Some("visualizer"))
-    else {
-        // Sin sección: agregarla al final, sin tocar lo existente.
-        let mut out = text.to_string();
-        if !out.is_empty() && !out.ends_with('\n') {
-            out.push_str(eol);
-        }
-        out.push_str(&format!("[visualizer]{eol}mode = \"{mode}\"{eol}"));
-        return out;
-    };
-
-    // Fin de la sección: la próxima cabecera (de cualquier sección).
-    let end = lines
-        .iter()
-        .skip(start + 1)
-        .position(|l| header_section(l).is_some())
-        .map(|offset| start + 1 + offset)
-        .unwrap_or(lines.len());
-
-    // ¿Ya hay una clave `mode` dentro de la sección?
-    for i in (start + 1)..end {
-        let line = &lines[i];
-        let t = line.trim_start();
-        if t.starts_with('#') {
-            continue;
-        }
-        let Some(rest) = t.strip_prefix("mode") else {
-            continue;
-        };
-        let Some(after) = rest.trim_start().strip_prefix('=') else {
-            // «modes», «mode2», etc.: no es la clave.
-            continue;
-        };
-        let indent = &line[..line.len() - t.len()];
-        let comment = line_comment(after);
-        let mut new_line = format!("{indent}mode = \"{mode}\"");
-        if !comment.is_empty() {
-            new_line.push(' ');
-            new_line.push_str(comment);
-        }
-        if line.ends_with('\r') {
-            new_line.push('\r');
-        }
-        lines[i] = new_line;
-        return lines.join("\n");
-    }
-
-    // Clave ausente: insertarla justo debajo del encabezado.
-    let mut inserted = format!("mode = \"{mode}\"");
-    if crlf {
-        inserted.push('\r');
-    }
-    lines.insert(start + 1, inserted);
-    lines.join("\n")
+    edit_section_key(text, "visualizer", "mode", &ConfigValue::Str(mode).render())
 }
 
 /// Escribe el `mode` en `path` de forma atómica (archivo temporal +
@@ -1807,59 +1643,13 @@ pub(crate) fn persist_visualizer_mode_at(
     path: &Path,
     mode: &str,
 ) -> Result<(), String> {
-    let existing = match fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            String::new()
-        }
-        Err(err) => {
-            return Err(format!("no se pudo leer '{}': {err}", path.display()));
-        }
-    };
-    let updated = update_visualizer_mode(&existing, mode);
-
-    // Igual que con el estilo: ante formas válidas que el editor por líneas no
-    // reconoce (tabla inline, claves con punto o entre comillas) podría
-    // duplicar claves; se valida el resultado y, si no queda TOML válido con
-    // el modo pedido, no se toca el archivo.
-    let persisted = updated
-        .parse::<toml::Table>()
-        .ok()
-        .and_then(|table| {
-            table
-                .get("visualizer")?
-                .get("mode")?
-                .as_str()
-                .map(|saved| saved == mode)
-        })
-        .unwrap_or(false);
-    if !persisted {
-        return Err(format!(
-            "no se pudo guardar el modo sin romper '{}'; agregá `mode = \"{mode}\"` en [visualizer] a mano",
-            path.display()
-        ));
-    }
-
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-        && let Err(err) = fs::create_dir_all(parent)
-    {
-        return Err(format!("no se pudo guardar el modo: {err}"));
-    }
-
-    let mut tmp_os = path.as_os_str().to_os_string();
-    tmp_os.push(".tmp");
-    let tmp = PathBuf::from(tmp_os);
-    if let Err(err) = fs::write(&tmp, updated.as_bytes()) {
-        return Err(format!("no se pudo guardar el modo: {err}"));
-    }
-    match fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
-        Err(err) => {
-            let _ = fs::remove_file(&tmp);
-            Err(format!("no se pudo guardar el modo: {err}"))
-        }
-    }
+    persist_key_at(
+        path,
+        "visualizer",
+        "mode",
+        "el modo",
+        ConfigValue::Str(mode),
+    )
 }
 
 /// Persiste el modo en la config del usuario (ruta por defecto o
@@ -1899,162 +1689,17 @@ fn migrate_removed_visualizer_mode_at(path: &Path, warnings: &mut Vec<String>) {
 /// TOML, preservando el resto — comentarios, otras claves, otras secciones y
 /// los finales de línea CRLF. Sin sección `[ui]`, la agrega al final. Misma
 /// receta que `update_visualizer_style` pero con valor bool sin comillas.
+/// Solo para tests: fachada tipada sobre [`edit_section_key`].
+#[cfg(test)]
 pub fn update_ui_mouse(text: &str, enabled: bool) -> String {
-    let value = if enabled { "true" } else { "false" };
-    let crlf = text.contains("\r\n");
-    let eol = if crlf { "\r\n" } else { "\n" };
-
-    // Encabezado de sección: `[sección]` (+ comentario opcional). Un
-    // comentario que menciona `[ui]` no abre sección.
-    fn header_section(line: &str) -> Option<&str> {
-        let t = line.trim_start();
-        let rest = t.strip_prefix('[')?;
-        let end = rest.find(']')?;
-        let after = rest[end + 1..].trim();
-        if after.is_empty() || after.starts_with('#') {
-            Some(rest[..end].trim())
-        } else {
-            None
-        }
-    }
-
-    // Cola de comentario de una línea `clave = valor …` respetando comillas.
-    fn line_comment(after_equals: &str) -> &str {
-        let mut quote: Option<char> = None;
-        for (i, c) in after_equals.char_indices() {
-            match quote {
-                Some(q) if c == q => quote = None,
-                Some(_) => {}
-                None => match c {
-                    '"' | '\'' => quote = Some(c),
-                    '#' => return after_equals[i..].trim_end(),
-                    _ => {}
-                },
-            }
-        }
-        ""
-    }
-
-    let mut lines: Vec<String> =
-        text.split('\n').map(str::to_string).collect();
-
-    let Some(start) =
-        lines.iter().position(|l| header_section(l) == Some("ui"))
-    else {
-        // Sin sección: agregarla al final, sin tocar lo existente.
-        let mut out = text.to_string();
-        if !out.is_empty() && !out.ends_with('\n') {
-            out.push_str(eol);
-        }
-        out.push_str(&format!("[ui]{eol}mouse = {value}{eol}"));
-        return out;
-    };
-
-    // Fin de la sección: la próxima cabecera (de cualquier sección).
-    let end = lines
-        .iter()
-        .skip(start + 1)
-        .position(|l| header_section(l).is_some())
-        .map(|offset| start + 1 + offset)
-        .unwrap_or(lines.len());
-
-    // ¿Ya hay una clave `mouse` dentro de la sección?
-    for i in (start + 1)..end {
-        let line = &lines[i];
-        let t = line.trim_start();
-        if t.starts_with('#') {
-            continue;
-        }
-        let Some(rest) = t.strip_prefix("mouse") else {
-            continue;
-        };
-        let Some(after) = rest.trim_start().strip_prefix('=') else {
-            // «mouses», «mouse2», etc.: no es la clave.
-            continue;
-        };
-        let indent = &line[..line.len() - t.len()];
-        let comment = line_comment(after);
-        let mut new_line = format!("{indent}mouse = {value}");
-        if !comment.is_empty() {
-            new_line.push(' ');
-            new_line.push_str(comment);
-        }
-        if line.ends_with('\r') {
-            new_line.push('\r');
-        }
-        lines[i] = new_line;
-        return lines.join("\n");
-    }
-
-    // Clave ausente: insertarla justo debajo del encabezado.
-    let mut inserted = format!("mouse = {value}");
-    if crlf {
-        inserted.push('\r');
-    }
-    lines.insert(start + 1, inserted);
-    lines.join("\n")
+    edit_section_key(text, "ui", "mouse", &ConfigValue::Bool(enabled).render())
 }
 
 /// Escribe el estado del mouse en `path` de forma atómica (archivo temporal +
 /// rename). Crea el archivo (y su directorio) si no existe. Nunca toca la
 /// config real: las pruebas usan rutas temporales vía esta función.
-pub(crate) fn persist_mouse_enabled_at(
-    path: &Path,
-    enabled: bool,
-) -> Result<(), String> {
-    let existing = match fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            String::new()
-        }
-        Err(err) => {
-            return Err(format!("no se pudo leer '{}': {err}", path.display()));
-        }
-    };
-    let updated = update_ui_mouse(&existing, enabled);
-
-    // Igual que con el tema y el estilo: ante formas válidas que el editor
-    // por líneas no reconoce (tabla inline, claves con punto o entre
-    // comillas) podría duplicar claves; se valida el resultado y, si no
-    // queda TOML válido con el valor pedido, no se toca el archivo.
-    let persisted = updated
-        .parse::<toml::Table>()
-        .ok()
-        .and_then(|table| {
-            table
-                .get("ui")?
-                .get("mouse")?
-                .as_bool()
-                .map(|saved| saved == enabled)
-        })
-        .unwrap_or(false);
-    if !persisted {
-        return Err(format!(
-            "no se pudo guardar el mouse sin romper '{}'; agregá `mouse = {enabled}` en [ui] a mano",
-            path.display()
-        ));
-    }
-
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-        && let Err(err) = fs::create_dir_all(parent)
-    {
-        return Err(format!("no se pudo guardar el mouse: {err}"));
-    }
-
-    let mut tmp_os = path.as_os_str().to_os_string();
-    tmp_os.push(".tmp");
-    let tmp = PathBuf::from(tmp_os);
-    if let Err(err) = fs::write(&tmp, updated.as_bytes()) {
-        return Err(format!("no se pudo guardar el mouse: {err}"));
-    }
-    match fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
-        Err(err) => {
-            let _ = fs::remove_file(&tmp);
-            Err(format!("no se pudo guardar el mouse: {err}"))
-        }
-    }
+pub(crate) fn persist_mouse_enabled_at(path: &Path, enabled: bool) -> Result<(), String> {
+    persist_key_at(path, "ui", "mouse", "el mouse", ConfigValue::Bool(enabled))
 }
 
 /// Persiste el estado del mouse en la config del usuario (ruta por defecto o
