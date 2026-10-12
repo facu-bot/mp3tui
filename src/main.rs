@@ -3,6 +3,7 @@ mod config;
 pub mod history;
 mod playback;
 mod playlist;
+mod runtime;
 mod source;
 mod ui;
 mod visualizer;

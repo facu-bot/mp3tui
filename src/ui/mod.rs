@@ -28,6 +28,7 @@ use crate::playback::{
     RepeatMode, URL_REPLAY_TOO_SOON_MSG,
 };
 use crate::playlist::{move_selection, scroll_offset, Playlist, Track};
+use crate::runtime;
 use crate::visualizer::{SpectrumAnalyzer, NUM_BANDS};
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
@@ -40,12 +41,12 @@ const EIGHTH_BLOCKS: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇
 const ASCII_RAMP: [&str; 10] =
     [" ", ".", ":", "-", "=", ";", "+", "*", "#", "@"];
 
-// Paleta compartida por todo el programa: la celda runtime de
-// config, que cambia en caliente al previsualizar/aplicar temas desde el menú
+// Paleta compartida por todo el programa: la celda runtime del
+// módulo `runtime`, que cambia en caliente al previsualizar/aplicar temas desde el menú
 // (default: la del `[theme] name` cargado al arrancar). Copia de 11 `Color`
 // por llamada; barato por frame.
 fn theme() -> Theme {
-    config::active_theme()
+    runtime::active_theme()
 }
 
 const CURSOR: &str = "\u{258c}"; // ▌ fila seleccionada
@@ -1469,7 +1470,7 @@ fn handle_menu_key<T: MenuSelection, I>(
 // --- Menú de temas ----------------------------------------------------
 
 fn open_theme_menu(app: &mut App) {
-    let name = config::active_theme_name();
+    let name = runtime::active_theme_name();
     let selected = config::builtin_themes()
         .iter()
         .position(|(id, _)| *id == name)
@@ -1477,7 +1478,7 @@ fn open_theme_menu(app: &mut App) {
     app.theme_menu = Some(ThemeMenuState {
         selected,
         original_name: name,
-        original_theme: config::active_theme(),
+        original_theme: runtime::active_theme(),
     });
 }
 
@@ -1492,12 +1493,12 @@ fn handle_theme_menu_key(
         |app| &mut app.theme_menu,
         config::builtin_themes().len(),
         |i| config::builtin_themes()[i].0,
-        |id| config::preview_theme(config::resolve_theme(id)),
+        |id| runtime::preview_theme(config::resolve_theme(id)),
         |id| {
-            config::activate_theme(id, config::resolve_theme(id));
+            runtime::activate_theme(id, config::resolve_theme(id));
             (*id).to_string()
         },
-        |menu| config::activate_theme(&menu.original_name, menu.original_theme.clone()),
+        |menu| runtime::activate_theme(&menu.original_name, menu.original_theme.clone()),
         persist,
     );
 }
@@ -1505,7 +1506,7 @@ fn handle_theme_menu_key(
 // --- Selector de bandas (sub-modal del panel) ---------------------------
 
 fn open_bands_menu(app: &mut App) {
-    let current = config::active_visualizer_style();
+    let current = runtime::active_visualizer_style();
     let selected = config::VisualizerStyle::options()
         .iter()
         .position(|style| *style == current)
@@ -1527,12 +1528,12 @@ fn handle_bands_menu_key(
         |app| &mut app.bands_menu,
         config::VisualizerStyle::options().len(),
         |i| config::VisualizerStyle::options()[i],
-        |style| config::preview_visualizer_style(*style),
+        |style| runtime::preview_visualizer_style(*style),
         |style| {
-            config::activate_visualizer_style(*style);
+            runtime::activate_visualizer_style(*style);
             style.as_str().to_string()
         },
-        |menu| config::activate_visualizer_style(menu.original),
+        |menu| runtime::activate_visualizer_style(menu.original),
         persist,
     );
 }
@@ -1540,7 +1541,7 @@ fn handle_bands_menu_key(
 // --- Selector de modo (sub-modal del panel) ---------
 
 fn open_mode_menu(app: &mut App) {
-    let current = config::active_visualizer_mode();
+    let current = runtime::active_visualizer_mode();
     let selected = config::VisualizerMode::options()
         .iter()
         .position(|mode| *mode == current)
@@ -1562,12 +1563,12 @@ fn handle_mode_menu_key(
         |app| &mut app.mode_menu,
         config::VisualizerMode::options().len(),
         |i| config::VisualizerMode::options()[i],
-        |mode| config::preview_visualizer_mode(*mode),
+        |mode| runtime::preview_visualizer_mode(*mode),
         |mode| {
-            config::activate_visualizer_mode(*mode);
+            runtime::activate_visualizer_mode(*mode);
             mode.as_str().to_string()
         },
-        |menu| config::activate_visualizer_mode(menu.original),
+        |menu| runtime::activate_visualizer_mode(menu.original),
         persist,
     );
 }
@@ -3290,7 +3291,7 @@ fn render_visualizer(frame: &mut Frame<'_>, area: Rect, analyzer: &SpectrumAnaly
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let ascii = matches!(
-        config::effective_visualizer_style(),
+        runtime::effective_visualizer_style(),
         config::VisualizerStyle::Ascii
     );
     // Cada modo va a su propio pintor con los datos que necesita: `onda` al
@@ -3298,7 +3299,7 @@ fn render_visualizer(frame: &mut Frame<'_>, area: Rect, analyzer: &SpectrumAnaly
     // analizador (`scope_window`), `espejo` y `vu` con las bandas/RMS del
     // analizador, `circular` a su plot polar; `barras` sigue el path actual
     // byte-a-byte idéntico vía `paint_bands`.
-    match resolve_visualizer_paint(config::active_visualizer_mode()) {
+    match resolve_visualizer_paint(runtime::active_visualizer_mode()) {
         VisualizerPaint::Bars => {
             paint_bands(frame.buffer_mut(), inner, analyzer.bands(), &theme(), ascii)
         }
@@ -5968,7 +5969,7 @@ mod tests {
 
     impl Drop for ThemeMenuTestGuard {
         fn drop(&mut self) {
-            config::activate_theme(&self.name, self.theme.clone());
+            runtime::activate_theme(&self.name, self.theme.clone());
         }
     }
 
@@ -5980,8 +5981,8 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         ThemeMenuTestGuard {
             _lock: lock,
-            name: config::active_theme_name(),
-            theme: config::active_theme(),
+            name: runtime::active_theme_name(),
+            theme: runtime::active_theme(),
         }
     }
 
@@ -6515,7 +6516,7 @@ mod tests {
             .theme_menu
             .as_ref()
             .expect("open_theme_menu debe abrir el menú");
-        let current = config::active_theme_name();
+        let current = runtime::active_theme_name();
         let expected = config::builtin_themes()
             .iter()
             .position(|(id, _)| *id == current)
@@ -6524,11 +6525,11 @@ mod tests {
         assert_eq!(menu.original_name, current, "guarda el id original");
         assert_eq!(
             menu.original_theme,
-            config::active_theme(),
+            runtime::active_theme(),
             "guarda los colores originales para Esc"
         );
         // Abrir no cambia el tema.
-        assert_eq!(config::active_theme_name(), current, "solo previsualiza al mover");
+        assert_eq!(runtime::active_theme_name(), current, "solo previsualiza al mover");
     }
 
     #[test]
@@ -6537,8 +6538,8 @@ mod tests {
         // salirse del frame (ratatui entra en pánico al escribir fuera del buffer).
         let menu = ThemeMenuState {
             selected: 0,
-            original_name: config::active_theme_name(),
-            original_theme: config::active_theme(),
+            original_name: runtime::active_theme_name(),
+            original_theme: runtime::active_theme(),
         };
         for (w, h) in [(10, 2), (23, 10), (40, 2), (1, 1), (0, 0)] {
             let backend = ratatui::backend::TestBackend::new(w, h);
@@ -6555,8 +6556,8 @@ mod tests {
         let mut app = test_app();
         app.theme_menu = Some(ThemeMenuState {
             selected: 0,
-            original_name: config::active_theme_name(),
-            original_theme: config::active_theme(),
+            original_name: runtime::active_theme_name(),
+            original_theme: runtime::active_theme(),
         });
 
         handle_theme_menu_key(theme_menu_key(KeyCode::Down), &mut app, |_| Ok(()));
@@ -6567,7 +6568,7 @@ mod tests {
         assert_eq!(menu.selected, 1, "↓ mueve la selección");
         let second_id = config::builtin_themes()[1].0;
         assert_eq!(
-            config::active_theme(),
+            runtime::active_theme(),
             config::resolve_theme(second_id),
             "↓ previsualiza la paleta en vivo"
         );
@@ -6579,7 +6580,7 @@ mod tests {
             "↑ vuelve a la primera fila"
         );
         assert_eq!(
-            config::active_theme(),
+            runtime::active_theme(),
             config::resolve_theme(config::builtin_themes()[0].0),
             "↑ restaura la previsualización anterior"
         );
@@ -6596,8 +6597,8 @@ mod tests {
         let last = config::builtin_themes().len() - 1;
         app.theme_menu = Some(ThemeMenuState {
             selected: last,
-            original_name: config::active_theme_name(),
-            original_theme: config::active_theme(),
+            original_name: runtime::active_theme_name(),
+            original_theme: runtime::active_theme(),
         });
 
         handle_theme_menu_key(theme_menu_key(KeyCode::Enter), &mut app, |id| {
@@ -6607,12 +6608,12 @@ mod tests {
         let expected = config::builtin_themes()[last].0;
         assert!(app.theme_menu.is_none(), "Enter cierra el menú");
         assert_eq!(
-            config::active_theme_name(),
+            runtime::active_theme_name(),
             expected,
             "el id aplicado queda activo"
         );
         assert_eq!(
-            config::active_theme(),
+            runtime::active_theme(),
             config::resolve_theme(expected),
             "la paleta aplicada queda activa"
         );
@@ -6632,8 +6633,8 @@ mod tests {
         let mut app = test_app();
         app.theme_menu = Some(ThemeMenuState {
             selected: 2,
-            original_name: config::active_theme_name(),
-            original_theme: config::active_theme(),
+            original_name: runtime::active_theme_name(),
+            original_theme: runtime::active_theme(),
         });
 
         handle_theme_menu_key(theme_menu_key(KeyCode::Enter), &mut app, |_| {
@@ -6643,11 +6644,11 @@ mod tests {
         let expected = config::builtin_themes()[2].0;
         assert!(app.theme_menu.is_none(), "Enter cierra igual");
         assert_eq!(
-            config::active_theme_name(),
+            runtime::active_theme_name(),
             expected,
             "el tema queda aplicado en la sesión pese al fallo"
         );
-        assert_eq!(config::active_theme(), config::resolve_theme(expected));
+        assert_eq!(runtime::active_theme(), config::resolve_theme(expected));
         let err = app.error.as_deref().expect("error visible en la app");
         assert!(!err.is_empty(), "mensaje corto no vacío");
     }
@@ -6656,8 +6657,8 @@ mod tests {
     fn theme_menu_escape_restores_previous_theme() {
         let _setup = theme_menu_test_setup();
         let mut app = test_app();
-        let before_name = config::active_theme_name();
-        let before_theme = config::active_theme();
+        let before_name = runtime::active_theme_name();
+        let before_theme = runtime::active_theme();
         app.theme_menu = Some(ThemeMenuState {
             selected: 0,
             original_name: before_name.clone(),
@@ -6673,12 +6674,12 @@ mod tests {
 
         assert!(app.theme_menu.is_none(), "Esc cierra el menú");
         assert_eq!(
-            config::active_theme(),
+            runtime::active_theme(),
             before_theme,
             "Esc restaura los colores originales"
         );
         assert_eq!(
-            config::active_theme_name(),
+            runtime::active_theme_name(),
             before_name,
             "Esc restaura el id original"
         );
@@ -6694,8 +6695,8 @@ mod tests {
         };
         app.theme_menu = Some(ThemeMenuState {
             selected: 1,
-            original_name: config::active_theme_name(),
-            original_theme: config::active_theme(),
+            original_name: runtime::active_theme_name(),
+            original_theme: runtime::active_theme(),
         });
 
         handle_key(theme_menu_key(KeyCode::Down), &mut app, &mut engine);
@@ -6716,7 +6717,7 @@ mod tests {
         let menu = ThemeMenuState {
             selected: 3,
             original_name: "nord".to_string(),
-            original_theme: config::active_theme(),
+            original_theme: runtime::active_theme(),
         };
 
         let lines = theme_menu_lines(&menu);
@@ -6746,7 +6747,7 @@ mod tests {
         let selected = &lines[3].spans[0];
         assert_eq!(
             selected.style.bg,
-            Some(config::active_theme().select_bg),
+            Some(runtime::active_theme().select_bg),
             "la fila seleccionada va resaltada"
         );
     }
@@ -7183,7 +7184,7 @@ mod tests {
             app.settings_panel.is_some(),
             "pero VUELVE al panel, no lo cierra"
         );
-        assert_eq!(config::active_theme_name(), expected, "el tema queda aplicado");
+        assert_eq!(runtime::active_theme_name(), expected, "el tema queda aplicado");
         let text = std::fs::read_to_string(&path).expect("tema persistido");
         assert!(
             text.contains(expected),
@@ -7199,8 +7200,8 @@ mod tests {
         let mut app = test_app();
         open_settings_panel(&mut app);
         handle_settings_panel_key(theme_menu_key(KeyCode::Enter), &mut app, |_| Ok(()));
-        let before_name = config::active_theme_name();
-        let before_theme = config::active_theme();
+        let before_name = runtime::active_theme_name();
+        let before_theme = runtime::active_theme();
         // Previsualiza otro tema moviéndose dentro del sub-modal.
         handle_key(theme_menu_key(KeyCode::Down), &mut app, &mut engine);
         handle_key(theme_menu_key(KeyCode::Esc), &mut app, &mut engine);
@@ -7209,8 +7210,8 @@ mod tests {
             app.settings_panel.is_some(),
             "y VUELVE al panel, no lo cierra"
         );
-        assert_eq!(config::active_theme_name(), before_name, "Esc restaura el id");
-        assert_eq!(config::active_theme(), before_theme, "Esc restaura los colores");
+        assert_eq!(runtime::active_theme_name(), before_name, "Esc restaura el id");
+        assert_eq!(runtime::active_theme(), before_theme, "Esc restaura los colores");
     }
 
     #[test]
@@ -7281,7 +7282,7 @@ mod tests {
 
     impl Drop for BandsMenuTestGuard {
         fn drop(&mut self) {
-            config::activate_visualizer_style(self.style);
+            runtime::activate_visualizer_style(self.style);
         }
     }
 
@@ -7293,7 +7294,7 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         BandsMenuTestGuard {
             _lock: lock,
-            style: config::active_visualizer_style(),
+            style: runtime::active_visualizer_style(),
         }
     }
 
@@ -7317,7 +7318,7 @@ mod tests {
     #[test]
     fn bands_submodal_navigation_clamps_and_previews_live() {
         let _setup = bands_menu_test_setup();
-        config::activate_visualizer_style(config::VisualizerStyle::Ascii);
+        runtime::activate_visualizer_style(config::VisualizerStyle::Ascii);
         let mut app = test_app();
         open_settings_panel(&mut app);
         open_bands_menu(&mut app);
@@ -7339,11 +7340,11 @@ mod tests {
         // Navegar previsualiza en vivo: el estilo efectivo sigue al cursor
         // (forzados ganan sin importar WT_SESSION, así no depende del env).
         assert_eq!(
-            config::active_visualizer_style(),
+            runtime::active_visualizer_style(),
             config::VisualizerStyle::Unicode
         );
         assert_eq!(
-            config::effective_visualizer_style(),
+            runtime::effective_visualizer_style(),
             config::VisualizerStyle::Unicode,
             "el fondo previsualiza el estilo navegado"
         );
@@ -7353,7 +7354,7 @@ mod tests {
     fn dispatch_routes_to_bands_submodal_when_open() {
         let _setup = bands_menu_test_setup();
         let Some(mut engine) = engine_or_skip() else { return };
-        config::activate_visualizer_style(config::VisualizerStyle::Auto);
+        runtime::activate_visualizer_style(config::VisualizerStyle::Auto);
         let mut app = test_app();
         app.mode = Mode::Player;
         open_settings_panel(&mut app);
@@ -7380,7 +7381,7 @@ mod tests {
         let path = std::env::temp_dir()
             .join(format!("mp3tui_t3_bands_enter_{}.toml", std::process::id()));
         let _ = std::fs::remove_file(&path);
-        config::activate_visualizer_style(config::VisualizerStyle::Auto);
+        runtime::activate_visualizer_style(config::VisualizerStyle::Auto);
         let mut app = test_app();
         open_settings_panel(&mut app);
         open_bands_menu(&mut app);
@@ -7394,7 +7395,7 @@ mod tests {
             "pero VUELVE al panel, no lo cierra"
         );
         assert_eq!(
-            config::active_visualizer_style(),
+            runtime::active_visualizer_style(),
             config::VisualizerStyle::Ascii,
             "el estilo queda aplicado"
         );
@@ -7409,14 +7410,14 @@ mod tests {
     #[test]
     fn bands_submodal_esc_restores_and_returns_to_panel() {
         let _setup = bands_menu_test_setup();
-        config::activate_visualizer_style(config::VisualizerStyle::Ascii);
+        runtime::activate_visualizer_style(config::VisualizerStyle::Ascii);
         let mut app = test_app();
         open_settings_panel(&mut app);
         open_bands_menu(&mut app);
         // Previsualiza otro estilo moviéndose dentro del sub-modal.
         handle_bands_menu_key(theme_menu_key(KeyCode::Down), &mut app, |_| Ok(()));
         assert_eq!(
-            config::active_visualizer_style(),
+            runtime::active_visualizer_style(),
             config::VisualizerStyle::Unicode,
             "navegar previsualiza"
         );
@@ -7427,7 +7428,7 @@ mod tests {
             "y VUELVE al panel, no lo cierra"
         );
         assert_eq!(
-            config::active_visualizer_style(),
+            runtime::active_visualizer_style(),
             config::VisualizerStyle::Ascii,
             "Esc restaura el estilo previo"
         );
@@ -7489,7 +7490,7 @@ mod tests {
 
     impl Drop for ModeMenuTestGuard {
         fn drop(&mut self) {
-            config::activate_visualizer_mode(self.mode);
+            runtime::activate_visualizer_mode(self.mode);
         }
     }
 
@@ -7501,7 +7502,7 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         ModeMenuTestGuard {
             _lock: lock,
-            mode: config::active_visualizer_mode(),
+            mode: runtime::active_visualizer_mode(),
         }
     }
 
@@ -7525,7 +7526,7 @@ mod tests {
     #[test]
     fn mode_submodal_navigation_clamps_and_previews_live() {
         let _setup = mode_menu_test_setup();
-        config::activate_visualizer_mode(config::VisualizerMode::Barras);
+        runtime::activate_visualizer_mode(config::VisualizerMode::Barras);
         let mut app = test_app();
         open_settings_panel(&mut app);
         open_mode_menu(&mut app);
@@ -7544,7 +7545,7 @@ mod tests {
 
         // Navegar previsualiza en vivo: el modo activo sigue al cursor.
         assert_eq!(
-            config::active_visualizer_mode(),
+            runtime::active_visualizer_mode(),
             config::VisualizerMode::Circular
         );
     }
@@ -7553,7 +7554,7 @@ mod tests {
     fn dispatch_routes_to_mode_submodal_when_open() {
         let _setup = mode_menu_test_setup();
         let Some(mut engine) = engine_or_skip() else { return };
-        config::activate_visualizer_mode(config::VisualizerMode::Barras);
+        runtime::activate_visualizer_mode(config::VisualizerMode::Barras);
         let mut app = test_app();
         app.mode = Mode::Player;
         open_settings_panel(&mut app);
@@ -7580,7 +7581,7 @@ mod tests {
         let path = std::env::temp_dir()
             .join(format!("mp3tui_t1_mode_enter_{}.toml", std::process::id()));
         let _ = std::fs::remove_file(&path);
-        config::activate_visualizer_mode(config::VisualizerMode::Barras);
+        runtime::activate_visualizer_mode(config::VisualizerMode::Barras);
         let mut app = test_app();
         open_settings_panel(&mut app);
         open_mode_menu(&mut app);
@@ -7594,7 +7595,7 @@ mod tests {
             "pero VUELVE al panel, no lo cierra"
         );
         assert_eq!(
-            config::active_visualizer_mode(),
+            runtime::active_visualizer_mode(),
             config::VisualizerMode::Onda,
             "el modo queda aplicado"
         );
@@ -7609,14 +7610,14 @@ mod tests {
     #[test]
     fn mode_submodal_esc_restores_and_returns_to_panel() {
         let _setup = mode_menu_test_setup();
-        config::activate_visualizer_mode(config::VisualizerMode::Barras);
+        runtime::activate_visualizer_mode(config::VisualizerMode::Barras);
         let mut app = test_app();
         open_settings_panel(&mut app);
         open_mode_menu(&mut app);
         // Previsualiza otro modo moviéndose dentro del sub-modal.
         handle_mode_menu_key(theme_menu_key(KeyCode::Down), &mut app, |_| Ok(()));
         assert_eq!(
-            config::active_visualizer_mode(),
+            runtime::active_visualizer_mode(),
             config::VisualizerMode::Onda,
             "navegar previsualiza"
         );
@@ -7627,7 +7628,7 @@ mod tests {
             "y VUELVE al panel, no lo cierra"
         );
         assert_eq!(
-            config::active_visualizer_mode(),
+            runtime::active_visualizer_mode(),
             config::VisualizerMode::Barras,
             "Esc restaura el modo previo"
         );
