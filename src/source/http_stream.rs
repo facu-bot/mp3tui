@@ -64,10 +64,42 @@ impl CancelHandle {
     }
 }
 
+/// Tope de datos sin consumir que el productor secuencial mantiene en memoria.
+/// Al alcanzarlo, `StreamProducer::push` deja de leer del socket hasta que el
+/// lector avance, evitando acumular el archivo completo en RAM.
+const SEQUENTIAL_READ_AHEAD_CAP: usize = 4 * 1024 * 1024; // 4 MiB
+
+/// Cuánto prefijo ya consumido se acumula antes de recortar `data`. La poda se
+/// hace en lotes para no recorrer el buffer entero en cada lectura.
+const SEQUENTIAL_PRUNE_BATCH: usize = 512 * 1024; // 512 KiB
+
 struct BufferState {
     data: Vec<u8>,
+    /// Offset absoluto del primer byte conservado en `data` (lo anterior ya se podó).
+    data_start: u64,
+    /// Offset absoluto hasta donde llegó el lector; base para calcular lo no consumido.
+    consumed: u64,
     finished: bool,
     error: Option<String>,
+}
+
+impl BufferState {
+    /// Bytes de `data` que el lector todavía no consumió.
+    fn unconsumed_len(&self) -> u64 {
+        (self.data_start + self.data.len() as u64).saturating_sub(self.consumed)
+    }
+
+    /// Descarta el prefijo ya consumido en lotes: mantiene acotada la memoria
+    /// sin recorrer todo el buffer en cada lectura.
+    fn prune_consumed_prefix(&mut self) {
+        let prunable = self.consumed.saturating_sub(self.data_start);
+        if prunable < SEQUENTIAL_PRUNE_BATCH as u64 {
+            return;
+        }
+        let prunable = prunable as usize;
+        self.data.drain(..prunable);
+        self.data_start += prunable as u64;
+    }
 }
 
 struct SequentialShared {
@@ -99,6 +131,8 @@ impl StreamProducer {
         let shared = Arc::new(SequentialShared {
             state: Mutex::new(BufferState {
                 data: Vec::new(),
+                data_start: 0,
+                consumed: 0,
                 finished: false,
                 error: None,
             }),
@@ -128,9 +162,29 @@ impl StreamProducer {
         if bytes.is_empty() {
             return;
         }
-        if let Ok(mut state) = self.shared.state.lock() {
-            state.data.extend_from_slice(bytes);
+        let mut state = match self.shared.state.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        loop {
+            if self.shared.canceled.load(Ordering::SeqCst) {
+                return;
+            }
+            if state.error.is_some() || state.finished {
+                return;
+            }
+            if state.unconsumed_len() < SEQUENTIAL_READ_AHEAD_CAP as u64 {
+                break;
+            }
+            // Se espera sin retener el `Mutex` (patrón del `Condvar`), y se
+            // vuelve a evaluar el predicado al despertar.
+            state = match self.shared.condvar.wait(state) {
+                Ok(g) => g,
+                Err(_) => return,
+            };
         }
+        state.data.extend_from_slice(bytes);
+        drop(state);
         self.shared.condvar.notify_all();
     }
 
@@ -304,13 +358,25 @@ fn read_sequential(
             return Err(io::Error::other(err.clone()));
         }
 
-        let cur_len = state.data.len() as u64;
-        if *pos < cur_len {
-            let avail = (cur_len - *pos) as usize;
+        let end = state.data_start + state.data.len() as u64;
+        if *pos < state.data_start {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "lectura de bytes ya podados del buffer secuencial",
+            ));
+        }
+        if *pos < end {
+            let start = (*pos - state.data_start) as usize;
+            let avail = (end - *pos) as usize;
             let to_copy = avail.min(buf.len());
-            let start = *pos as usize;
             buf[..to_copy].copy_from_slice(&state.data[start..start + to_copy]);
             *pos += to_copy as u64;
+            if *pos > state.consumed {
+                state.consumed = *pos;
+            }
+            state.prune_consumed_prefix();
+            // Despierta al productor que pueda estar esperando espacio.
+            shared.condvar.notify_all();
             return Ok(to_copy);
         }
 
@@ -1347,6 +1413,165 @@ mod tests {
         let mut data = Vec::new();
         stream.read_to_end(&mut data).unwrap();
         assert_eq!(&data, b"plain sequential stream");
+    }
+
+    /// El modo secuencial no puede bajarse el archivo entero a RAM: con el
+    /// lector detenido, el productor tiene que dejar de leer del socket en vez
+    /// de acumular. Se observa de punta a punta: si el cliente frena, el
+    /// servidor no logra escribir mucho más que el tope de adelanto.
+    #[test]
+    fn test_sequential_stream_bounds_read_ahead_when_reader_stalls() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // Cuerpo enorme: si el cliente no frena, el servidor lo escribe todo.
+        let total: usize = 64 * 1024 * 1024;
+        let written = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let written_server = Arc::clone(&written);
+
+        thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut req_buf = [0u8; 1024];
+            let _ = socket.read(&mut req_buf);
+
+            let response =
+                format!("HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nConnection: close\r\n\r\n");
+            if socket.write_all(response.as_bytes()).is_err() {
+                return;
+            }
+            let block = [0x5au8; 32 * 1024];
+            let mut sent = 0usize;
+            while sent < total {
+                let n = (total - sent).min(block.len());
+                if socket.write_all(&block[..n]).is_err() {
+                    return;
+                }
+                sent += n;
+                written_server.store(sent, Ordering::SeqCst);
+            }
+        });
+
+        let url = format!("http://127.0.0.1:{port}/stream.mp3");
+        let (mut stream, _) = open(&url).expect("open stream");
+
+        // El lector consume apenas un poco y después se queda quieto.
+        let mut buf = [0u8; 64 * 1024];
+        stream.read_exact(&mut buf).unwrap();
+        thread::sleep(Duration::from_millis(500));
+
+        let sent = written.load(Ordering::SeqCst);
+        assert!(
+            sent < 12 * 1024 * 1024,
+            "con el lector detenido el productor siguió bajando: {sent} bytes escritos"
+        );
+    }
+
+    /// Un stream más grande que el tope de adelanto tiene que poder leerse
+    /// completo y correcto: la poda del prefijo ya consumido no puede perder ni
+    /// corromper bytes, y el productor no puede quedarse trabado esperando
+    /// espacio que nunca llega.
+    #[test]
+    fn test_sequential_stream_reads_more_than_the_read_ahead_cap() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let total: usize = 10 * 1024 * 1024;
+
+        thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut req_buf = [0u8; 1024];
+            let _ = socket.read(&mut req_buf);
+
+            let response =
+                format!("HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nConnection: close\r\n\r\n");
+            if socket.write_all(response.as_bytes()).is_err() {
+                return;
+            }
+            // Patrón dependiente de la posición, para detectar corrimientos.
+            let mut block = vec![0u8; 32 * 1024];
+            let mut offset = 0usize;
+            while offset < total {
+                let n = (total - offset).min(block.len());
+                for (j, byte) in block[..n].iter_mut().enumerate() {
+                    *byte = ((offset + j) % 251) as u8;
+                }
+                if socket.write_all(&block[..n]).is_err() {
+                    return;
+                }
+                offset += n;
+            }
+        });
+
+        let url = format!("http://127.0.0.1:{port}/stream.mp3");
+        let (mut stream, _) = open(&url).expect("open stream");
+
+        let mut data = Vec::new();
+        stream
+            .read_to_end(&mut data)
+            .expect("el stream se cortó antes de terminar");
+
+        assert_eq!(data.len(), total, "tiene que llegar el archivo completo");
+        for (i, byte) in data.iter().enumerate() {
+            assert_eq!(*byte, (i % 251) as u8, "byte {i} incorrecto tras la poda");
+        }
+    }
+
+    /// El productor puede quedar esperando espacio cuando el lector se detiene:
+    /// esa espera tiene que salir también al cancelar. Si no, el hilo de red
+    /// quedaría tomado para siempre y el socket abierto.
+    #[test]
+    fn test_sequential_producer_waiting_for_space_releases_on_cancel() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let total: usize = 64 * 1024 * 1024;
+        let saw_cut = Arc::new(AtomicBool::new(false));
+        let saw_cut_server = Arc::clone(&saw_cut);
+
+        thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut req_buf = [0u8; 1024];
+            let _ = socket.read(&mut req_buf);
+
+            let response =
+                format!("HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nConnection: close\r\n\r\n");
+            if socket.write_all(response.as_bytes()).is_err() {
+                saw_cut_server.store(true, Ordering::SeqCst);
+                return;
+            }
+            let block = [0x5au8; 32 * 1024];
+            let mut sent = 0usize;
+            while sent < total {
+                let n = (total - sent).min(block.len());
+                if socket.write_all(&block[..n]).is_err() {
+                    saw_cut_server.store(true, Ordering::SeqCst);
+                    return;
+                }
+                sent += n;
+            }
+        });
+
+        let url = format!("http://127.0.0.1:{port}/stream.mp3");
+        let (mut stream, _) = open(&url).expect("open stream");
+        let cancel = stream.cancel_handle();
+
+        // Lee un poco: al productor le alcanza para llenar el tope y quedar
+        // esperando espacio (100 ms es mucho menos que los 64 MiB que tardaría
+        // el servidor en terminar de escribir).
+        let mut buf = [0u8; 64 * 1024];
+        stream.read_exact(&mut buf).unwrap();
+        thread::sleep(Duration::from_millis(100));
+        cancel.cancel();
+
+        // Cancelar tiene que despertar al productor y cerrar el socket: el
+        // corte de la conexión tiene que llegar en un plazo acotado.
+        for _ in 0..40 {
+            if saw_cut.load(Ordering::SeqCst) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        panic!("el productor no se liberó al cancelar: la conexión siguió abierta");
     }
 
     #[test]
