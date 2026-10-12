@@ -515,6 +515,18 @@ pub(crate) fn parse_content_range_total(header: &str) -> Option<u64> {
     total_str.parse::<u64>().ok()
 }
 
+/// Primer byte del rango en un `Content-Range: bytes START-END/TOTAL`.
+fn parse_content_range_start(header: &str) -> Option<u64> {
+    let s = header.trim();
+    let after_bytes = if s.len() >= 6 && s[..6].eq_ignore_ascii_case("bytes ") {
+        &s[6..]
+    } else {
+        return None;
+    };
+    let range = after_bytes.split('/').next()?.trim();
+    range.split('-').next()?.trim().parse::<u64>().ok()
+}
+
 enum RangeFetchError {
     Canceled,
     HttpStatus(u16, String),
@@ -525,13 +537,19 @@ fn fetch_range(
     agent: &ureq::Agent,
     url: &str,
     user_agent: &str,
-    range_header: &str,
+    range_start: u64,
     expected_len: usize,
     canceled: &AtomicBool,
 ) -> Result<Vec<u8>, RangeFetchError> {
     if canceled.load(Ordering::SeqCst) {
         return Err(RangeFetchError::Canceled);
     }
+
+    let range_header = format!(
+        "bytes={}-{}",
+        range_start,
+        range_start + expected_len as u64 - 1
+    );
 
     let resp = agent
         .get(url)
@@ -559,10 +577,31 @@ fn fetch_range(
         return Err(RangeFetchError::HttpStatus(status, reason.to_string()));
     }
 
-    if let Some(cr) = response.headers().get("content-range").and_then(|v| v.to_str().ok())
-        && !cr.trim_start().to_ascii_lowercase().starts_with("bytes ")
+    // Un chunk pedido con `Range` solo sirve si el servidor responde 206 con el
+    // rango exacto. Un 200 significa que ignoró el `Range` y mandó el archivo
+    // entero: aceptarlo dejaría pasar sus primeros `expected_len` bytes como si
+    // fueran el chunk pedido, o sea audio corrupto en silencio.
+    if status != 206 {
+        return Err(RangeFetchError::HttpStatus(
+            status,
+            "el servidor ignoró el rango pedido".to_string(),
+        ));
+    }
+
+    // `Content-Range: bytes START-END/TOTAL` tiene que empezar en el offset
+    // pedido: si no, los bytes recibidos no son los de ese chunk.
+    match response
+        .headers()
+        .get("content-range")
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_content_range_start)
     {
-        return Err(RangeFetchError::Transient("Content-Range inválido".to_string()));
+        Some(start) if start == range_start => {}
+        _ => {
+            return Err(RangeFetchError::Transient(
+                "Content-Range no coincide con el rango pedido".to_string(),
+            ));
+        }
     }
 
     let mut body_reader = response.into_body().into_reader();
@@ -664,13 +703,12 @@ fn run_ranged_downloader(
             }
         };
 
-        let range_header = format!("bytes={}-{}", range_start, range_end - 1);
         let expected_len = (range_end - range_start) as usize;
         let result = fetch_range(
             &agent,
             &url,
             &user_agent,
-            &range_header,
+            range_start,
             expected_len,
             &shared.canceled,
         );
@@ -1506,6 +1544,176 @@ mod tests {
         let mut buf = [0u8; 200];
         stream.read_exact(&mut buf).unwrap();
         assert_eq!(&buf, &payload[150_000..150_200]);
+    }
+
+    /// Un servidor que honra el `Range` del probe (206) y después lo ignora
+    /// (200 con el cuerpo completo) no debe hacer pasar bytes del comienzo del
+    /// archivo por el chunk pedido. Antes, `fetch_range` aceptaba cualquier
+    /// status < 400, truncaba el cuerpo a `expected_len` y esa corrupción
+    /// llegaba al decoder en silencio.
+    #[test]
+    fn test_range_server_ignoring_range_midstream_never_corrupts_data() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let total_len = 3 * 4096;
+        let payload: Arc<Vec<u8>> =
+            Arc::new((0..total_len).map(|i| (i % 251) as u8).collect());
+        let payload_server = Arc::clone(&payload);
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        thread::spawn(move || {
+            while let Ok((mut socket, _)) = listener.accept() {
+                let payload = Arc::clone(&payload_server);
+                let requests = Arc::clone(&requests);
+                thread::spawn(move || {
+                    let mut req_buf = [0u8; 2048];
+                    let n = match socket.read(&mut req_buf) {
+                        Ok(n) if n > 0 => n,
+                        _ => return,
+                    };
+                    let req_str = String::from_utf8_lossy(&req_buf[..n]);
+                    let range_header = req_str
+                        .lines()
+                        .find(|l| l.to_ascii_lowercase().starts_with("range: bytes="))
+                        .map(|l| l.trim().to_string());
+                    let Some(rh) = range_header else { return };
+                    let after = rh.split('=').nth(1).unwrap_or("0-0");
+                    let parts: Vec<&str> = after.split('-').collect();
+                    let start: usize = parts[0].trim().parse().unwrap_or(0);
+                    let end: usize = parts[1].trim().parse().unwrap_or(total_len - 1);
+
+                    // Solo el primer pedido (el probe) respeta el rango pedido.
+                    let is_probe =
+                        requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+                    if is_probe {
+                        let chunk_data = &payload[start..=end];
+                        let resp = format!(
+                            "HTTP/1.1 206 Partial Content\r\nContent-Type: audio/mp4\r\nContent-Range: bytes {start}-{end}/{total_len}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            chunk_data.len()
+                        );
+                        let _ = socket.write_all(resp.as_bytes());
+                        let _ = socket.write_all(chunk_data);
+                    } else {
+                        // Ignora el `Range` y devuelve el archivo entero con 200.
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: audio/mp4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            payload.len()
+                        );
+                        let _ = socket.write_all(resp.as_bytes());
+                        let _ = socket.write_all(&payload);
+                    }
+                });
+            }
+        });
+
+        let url = format!("http://127.0.0.1:{port}/audio.m4a");
+        let (mut stream, _) =
+            open_with_params(&url, HttpTimeouts::default(), 4096).expect("open stream");
+
+        let mut delivered = Vec::new();
+        let mut buf = [0u8; 4096];
+        let mut failed = false;
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => delivered.extend_from_slice(&buf[..n]),
+                Err(_) => {
+                    failed = true;
+                    break;
+                }
+            }
+        }
+
+        // Lo entregado tiene que ser un prefijo exacto del archivo: aceptar el
+        // 200 hace repetir los primeros bytes y rompe esta comparación.
+        assert!(
+            payload.starts_with(&delivered),
+            "el stream entregó bytes que no son del archivo ({} bytes entregados)",
+            delivered.len()
+        );
+        // Y no puede cortar sin avisar: eso sería un truncado silencioso.
+        assert!(
+            failed || delivered.len() == payload.len(),
+            "el stream cortó en {} de {} bytes sin reportar error",
+            delivered.len(),
+            payload.len()
+        );
+    }
+
+    /// Un 206 que no nace en el offset pedido también es corrupción: si el
+    /// `Content-Range` miente sobre dónde empieza el cuerpo, los bytes
+    /// recibidos no son los del chunk. El `Content-Range` se valida contra el
+    /// offset pedido, no solo su sintaxis.
+    #[test]
+    fn test_range_server_wrong_content_range_offset_never_corrupts_data() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let total_len = 3 * 4096;
+        let payload: Arc<Vec<u8>> =
+            Arc::new((0..total_len).map(|i| (i % 251) as u8).collect());
+        let payload_server = Arc::clone(&payload);
+
+        thread::spawn(move || {
+            while let Ok((mut socket, _)) = listener.accept() {
+                let payload = Arc::clone(&payload_server);
+                thread::spawn(move || {
+                    let mut req_buf = [0u8; 2048];
+                    let n = match socket.read(&mut req_buf) {
+                        Ok(n) if n > 0 => n,
+                        _ => return,
+                    };
+                    let req_str = String::from_utf8_lossy(&req_buf[..n]);
+                    let has_range = req_str
+                        .lines()
+                        .any(|l| l.to_ascii_lowercase().starts_with("range: bytes="));
+                    if !has_range {
+                        return;
+                    }
+
+                    // Miente siempre: dice `bytes 0-4095` y manda el chunk 0,
+                    // aunque el pedido haya sido otro offset.
+                    let body = &payload[0..4096];
+                    let resp = format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Type: audio/mp4\r\nContent-Range: bytes 0-4095/{total_len}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = socket.write_all(resp.as_bytes());
+                    let _ = socket.write_all(body);
+                });
+            }
+        });
+
+        let url = format!("http://127.0.0.1:{port}/audio.m4a");
+        let (mut stream, _) =
+            open_with_params(&url, HttpTimeouts::default(), 4096).expect("open stream");
+
+        let mut delivered = Vec::new();
+        let mut buf = [0u8; 4096];
+        let mut failed = false;
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => delivered.extend_from_slice(&buf[..n]),
+                Err(_) => {
+                    failed = true;
+                    break;
+                }
+            }
+        }
+
+        assert!(
+            payload.starts_with(&delivered),
+            "el stream entregó bytes que no son del archivo ({} bytes entregados)",
+            delivered.len()
+        );
+        assert!(
+            failed || delivered.len() == payload.len(),
+            "el stream cortó en {} de {} bytes sin reportar error",
+            delivered.len(),
+            payload.len()
+        );
     }
 
     #[test]
