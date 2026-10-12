@@ -23,7 +23,7 @@ use crate::audio::{AudioEngine, SPEED_STEP};
 use crate::config::{self, key_labels, Theme};
 use crate::playback::{
     filter_tracks, natural_end_action, next_track, seek_target, shuffle_order, NextAction,
-    RepeatMode,
+    RepeatMode, URL_REPLAY_TOO_SOON_MSG,
 };
 use crate::playlist::{move_selection, scroll_offset, Playlist, Track};
 use crate::visualizer::{SpectrumAnalyzer, NUM_BANDS};
@@ -384,14 +384,7 @@ pub fn run(engine: &mut AudioEngine, start: StartMode) -> io::Result<()> {
                 app.error = None;
                 app.current_url = Some((url.clone(), url_display_label(&url)));
                 app.ytdlp_request_id = 1;
-                let req_id = 1;
-                let (tx, rx) = mpsc::channel();
-                let url_clone = url.clone();
-                thread::spawn(move || {
-                    let result = crate::source::ytdlp::resolve(&url, &crate::source::ytdlp::ProcessCommandRunner);
-                    let _ = tx.send((req_id, url_clone, result));
-                });
-                app.ytdlp_rx = Some(rx);
+                app.ytdlp_rx = Some(spawn_ytdlp_resolution(url, 1));
             }
         }
     }
@@ -933,7 +926,33 @@ fn start_url_playback(
     }
 }
 
+/// Único punto del programa que lanza el proceso yt-dlp para resolver una URL
+/// de página: devuelve el receiver del resultado. Centralizarlo acá permite
+/// que los tests inyecten un doble y nunca toquen el proceso ni la red.
+fn spawn_ytdlp_resolution(url: String, req_id: u64) -> Receiver<YtDlpMessage> {
+    let (tx, rx) = mpsc::channel();
+    let url_clone = url.clone();
+    thread::spawn(move || {
+        let result =
+            crate::source::ytdlp::resolve(&url, &crate::source::ytdlp::ProcessCommandRunner);
+        let _ = tx.send((req_id, url_clone, result));
+    });
+    rx
+}
+
 fn submit_url_prompt(input: String, app: &mut App, engine: &mut AudioEngine) {
+    submit_url_prompt_with(input, app, engine, spawn_ytdlp_resolution)
+}
+
+/// Seam inyectable de [`submit_url_prompt`]: la rama de página recibe el
+/// resolver (`FnOnce(url, req_id) -> receiver`), que en producción es
+/// [`spawn_ytdlp_resolution`] y en tests un doble que no lanza yt-dlp.
+fn submit_url_prompt_with(
+    input: String,
+    app: &mut App,
+    engine: &mut AudioEngine,
+    resolve_page: impl FnOnce(String, u64) -> Receiver<YtDlpMessage>,
+) {
     match classify_submit_input(&input) {
         SubmitAction::Empty => {}
         SubmitAction::Local(path) => {
@@ -968,13 +987,7 @@ fn submit_url_prompt(input: String, app: &mut App, engine: &mut AudioEngine) {
             app.current_url = Some((url.clone(), url_display_label(&url)));
 
             let req_id = app.ytdlp_request_id;
-            let (tx, rx) = mpsc::channel();
-            let url_clone = url.clone();
-            thread::spawn(move || {
-                let result = crate::source::ytdlp::resolve(&url, &crate::source::ytdlp::ProcessCommandRunner);
-                let _ = tx.send((req_id, url_clone, result));
-            });
-            app.ytdlp_rx = Some(rx);
+            app.ytdlp_rx = Some(resolve_page(url, req_id));
         }
     }
 }
@@ -1175,10 +1188,37 @@ fn current_track_duration(app: &App) -> Option<Duration> {
     library.get(index)?.duration
 }
 
+/// Orden pura de relanzamiento de URL que pide el fin natural con repetir
+/// «una»: la URL original de la sesión. La ejecuta el dispatcher inyectable
+/// de [`handle_natural_end_with`] (en producción, [`dispatch_url_replay`]);
+/// los tests la capturan sin lanzar yt-dlp ni tocar la red.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UrlReplayRequest {
+    original_url: String,
+}
+
 /// Fin natural de la pista (transición Playing → Ended): decide el repeat
 /// sin esperar que el usuario apriete espacio. La regla única de avance vive
 /// en [`natural_end_action`] y vale igual para pistas locales y para URL.
 fn handle_natural_end(app: &mut App, engine: &mut AudioEngine) {
+    handle_natural_end_with(app, engine, dispatch_url_replay)
+}
+
+/// Efecto real del replay de URL: re-lanza la URL ORIGINAL por el camino
+/// normal de URL (las páginas se resuelven de nuevo con yt-dlp porque las
+/// URLs resueltas vencen).
+fn dispatch_url_replay(app: &mut App, engine: &mut AudioEngine, request: UrlReplayRequest) {
+    submit_url_prompt(request.original_url, app, engine);
+}
+
+/// Seam inyectable del fin natural: el replay de URL pasa por `replay` en
+/// lugar de disparar yt-dlp directamente, de modo que un test puede capturar
+/// la orden y verificarla sin procesos ni red.
+fn handle_natural_end_with(
+    app: &mut App,
+    engine: &mut AudioEngine,
+    mut replay: impl FnMut(&mut App, &mut AudioEngine, UrlReplayRequest),
+) {
     let track_positions = track_positions_in_view(app);
     let current = current_track_index(app, &track_positions);
 
@@ -1189,14 +1229,20 @@ fn handle_natural_end(app: &mut App, engine: &mut AudioEngine) {
         current,
         &app.shuffle_order,
         app.is_url,
+        engine.position(),
     ) {
         NextAction::Replay => {
             if app.is_url {
                 // Re-lanza la URL ORIGINAL por el camino normal de URL: las
                 // páginas se resuelven de nuevo con yt-dlp porque las URLs
-                // resueltas vencen. Sin URL original guardada no hay qué repetir.
-                if let Some((url, _label)) = app.current_url.clone() {
-                    submit_url_prompt(url, app, engine);
+                // resueltas vencen. Sin URL original guardada no hay qué
+                // repetir.
+                if let Some((original_url, _label)) = app.current_url.clone() {
+                    replay(
+                        app,
+                        engine,
+                        UrlReplayRequest { original_url },
+                    );
                 }
             } else if let Some(path) = app.current_path.clone() {
                 start_local_playback(app, engine, path);
@@ -1208,6 +1254,11 @@ fn handle_natural_end(app: &mut App, engine: &mut AudioEngine) {
             }
         }
         NextAction::Stop => {}
+        NextAction::StopTooSoon => {
+            // URL repetir «una» que terminó bajo el mínimo: no se re-lanza
+            // (evita el bucle yt-dlp + red) y se avisa en la línea de estado.
+            app.error = Some(URL_REPLAY_TOO_SOON_MSG.to_string());
+        }
     }
 }
 
@@ -3446,6 +3497,35 @@ mod tests {
         wav
     }
 
+    /// Servidor HTTP local de un solo uso que sirve `wav` y devuelve la URL
+    /// (`http://127.0.0.1:<puerto>/<filename>`). Permite que las pruebas de la
+    /// ruta de URL dialen SOLO loopback, nunca un host externo. El thread
+    /// acepta reconexiones del precargador y termina con el proceso.
+    fn local_wav_url(filename: &str, wav: &[u8]) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("local_addr");
+        let wav = wav.to_vec();
+        std::thread::spawn(move || {
+            for socket in listener.incoming() {
+                let Ok(mut socket) = socket else {
+                    break;
+                };
+                let mut request = [0u8; 1024];
+                let _ = socket.read(&mut request);
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    wav.len()
+                );
+                if socket.write_all(header.as_bytes()).is_err() {
+                    continue;
+                }
+                let _ = socket.write_all(&wav);
+            }
+        });
+        format!("http://{addr}/{filename}")
+    }
+
     fn track_with_path(path: PathBuf, name: &str) -> Track {
         Track {
             path,
@@ -3560,8 +3640,35 @@ mod tests {
     }
 
     #[test]
-    fn test_url_natural_end_repeat_one_replays_the_original_url() {
+    fn test_url_natural_end_repeat_one_dispatches_replay_without_spawning() {
         let mut app = test_app();
+        let mut engine = match AudioEngine::new() {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+
+        // Sesión URL con posición por encima del mínimo: wav local de 6 s y
+        // seek instantáneo (los archivos son seekables y el seek guarda
+        // played_frames sincrónicamente, sin esperar reproducción real).
+        let t6 = std::env::temp_dir().join(format!(
+            "mp3tui_t11_urlok_{}.wav",
+            std::process::id()
+        ));
+        let _ = std::fs::write(&t6, make_test_wav(44100 * 6));
+        if engine.play(&t6).is_err() {
+            let _ = std::fs::remove_file(&t6);
+            return;
+        }
+        assert!(
+            engine.seek(Duration::from_secs(6)).is_ok(),
+            "setup: el seek en archivo local debe funcionar"
+        );
+        assert!(
+            engine.position() >= crate::playback::MIN_URL_REPLAY,
+            "setup: la posición debe superar el mínimo ({:?})",
+            engine.position()
+        );
+
         app.is_url = true;
         app.status = Status::Playing;
         app.repeat = RepeatMode::One;
@@ -3569,24 +3676,127 @@ mod tests {
         app.current_url = Some((original.clone(), "Video".to_string()));
         app.track_label = "Video".to_string();
 
-        let mut engine = match AudioEngine::new() {
-            Ok(e) => e,
-            Err(_) => return,
-        };
+        let mut dispatched: Option<UrlReplayRequest> = None;
+        handle_natural_end_with(&mut app, &mut engine, |_app, _engine, request| {
+            dispatched = Some(request);
+        });
 
-        handle_natural_end(&mut app, &mut engine);
-
-        assert!(
-            app.ytdlp_rx.is_some(),
-            "One con URL de página debe re-lanzar la URL original por yt-dlp"
+        assert_eq!(
+            dispatched.as_ref().map(|r| r.original_url.as_str()),
+            Some(original.as_str()),
+            "One con URL larga debe pedir re-lanzar la URL original"
         );
-        assert_eq!(app.status, Status::Resolving, "vuelve a resolver");
-        assert!(app.is_url, "la sesión sigue siendo de URL");
+        assert!(
+            app.ytdlp_rx.is_none(),
+            "el test no debe lanzar yt-dlp: la orden va por el dispatcher"
+        );
+        assert_ne!(app.status, Status::Resolving, "sin resolución pendiente");
+        assert!(
+            app.is_url,
+            "la sesión sigue siendo de URL"
+        );
         assert_eq!(
             app.current_url.as_ref().map(|(u, _)| u.as_str()),
             Some(original.as_str()),
             "la URL original debe conservarse para el próximo replay"
         );
+
+        let _ = std::fs::remove_file(&t6);
+    }
+
+    #[test]
+    fn test_url_natural_end_repeat_one_too_short_stops_with_message() {
+        let mut app = test_app();
+        let mut engine = match AudioEngine::new() {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        // Motor recién creado: posición 0, por debajo del mínimo.
+        assert_eq!(engine.position(), Duration::ZERO);
+
+        app.is_url = true;
+        app.status = Status::Playing;
+        app.repeat = RepeatMode::One;
+        app.current_url = Some((
+            "https://www.youtube.com/watch?v=short".to_string(),
+            "Short".to_string(),
+        ));
+        app.track_label = "Short".to_string();
+
+        let mut dispatched: Option<UrlReplayRequest> = None;
+        handle_natural_end_with(&mut app, &mut engine, |_app, _engine, request| {
+            dispatched = Some(request);
+        });
+
+        assert_eq!(
+            dispatched, None,
+            "una URL que duró menos del mínimo no se re-lanza"
+        );
+        assert_eq!(
+            app.error.as_deref(),
+            Some("La canción terminó enseguida; no se repite"),
+            "debe mostrar el aviso de corte"
+        );
+        assert!(app.ytdlp_rx.is_none(), "sin yt-dlp en el test");
+    }
+
+    #[test]
+    fn test_local_natural_end_filtered_out_of_view_stops_without_restarting() {
+        let mut app = test_app();
+        let dir = std::env::temp_dir();
+        let t1 = dir.join(format!("mp3tui_t11_hide1_{}.wav", std::process::id()));
+        let t2 = dir.join(format!("mp3tui_t11_hide2_{}.wav", std::process::id()));
+        let wav = make_test_wav(4410);
+        let _ = std::fs::write(&t1, &wav);
+        let _ = std::fs::write(&t2, &wav);
+        app.library = Some(crate::playlist::from_tracks_for_test(vec![
+            track_with_path(t1.clone(), "track_1"),
+            track_with_path(t2.clone(), "track_2"),
+        ]));
+        refresh_view(&mut app);
+        app.repeat = RepeatMode::Off;
+
+        let mut engine = match AudioEngine::new() {
+            Ok(e) => e,
+            Err(_) => {
+                let _ = std::fs::remove_file(&t1);
+                let _ = std::fs::remove_file(&t2);
+                return;
+            }
+        };
+
+        // La pista 1 está sonando...
+        app.selected = 0;
+        play_selected(&mut app, &mut engine);
+        assert_eq!(app.current_path.as_ref(), Some(&t1));
+
+        // ...y un filtro la deja FUERA de la vista visible.
+        app.filter = Some("track_2".to_string());
+        refresh_view(&mut app);
+        assert_eq!(app.view.len(), 1, "setup: solo track_2 visible");
+        assert_eq!(
+            app.current_path.as_ref(),
+            Some(&t1),
+            "setup: sigue sonando track_1 aunque esté oculto"
+        );
+        let selected_before = app.selected;
+
+        handle_natural_end(&mut app, &mut engine);
+
+        assert_eq!(
+            app.current_path.as_ref(),
+            Some(&t1),
+            "fuera de la vista no debe reiniciar desde la primera pista visible"
+        );
+        assert_eq!(
+            app.selected, selected_before,
+            "la selección no debe moverse"
+        );
+        assert!(app.error.is_none(), "{:?}", app.error);
+        assert!(app.ytdlp_rx.is_none(), "sin yt-dlp en el test");
+
+        let _ = std::fs::remove_file(&t1);
+        let _ = std::fs::remove_file(&t2);
     }
 
     #[test]
@@ -3662,8 +3872,21 @@ mod tests {
             }
         };
 
-        // 1. Submit a page URL: resolution is now pending
-        submit_url_prompt("https://youtube.com/watch?v=abc".to_string(), &mut app, &mut engine);
+        // 1. Submit a page URL: resolution is now pending. El resolver se
+        // inyecta como doble: captura la orden pero NO lanza yt-dlp ni toca
+        // la red desde el test.
+        let page_url = "https://youtube.com/watch?v=abc".to_string();
+        let mut resolved_url: Option<String> = None;
+        submit_url_prompt_with(page_url.clone(), &mut app, &mut engine, |url, _req_id| {
+            resolved_url = Some(url);
+            let (_tx, rx) = mpsc::channel();
+            rx
+        });
+        assert_eq!(
+            resolved_url.as_deref(),
+            Some(page_url.as_str()),
+            "el resolver debe recibir la URL de la página"
+        );
         assert!(app.ytdlp_rx.is_some(), "resolution should be pending");
         let initial_req_id = app.ytdlp_request_id;
         assert_eq!(app.status, Status::Resolving);
@@ -3756,7 +3979,10 @@ mod tests {
     #[test]
     fn test_enter_on_history_row_dispatches_playback() {
         let mut app = library_with_three();
-        app.history.add("Historial Cancion".to_string(), "https://example.com/stream.mp3".to_string());
+        // URL local vía servidor de loopback: la fila del historial reproduce
+        // sin salir a la red externa (el label sigue siendo el filename).
+        let url = local_wav_url("stream.mp3", &make_test_wav(4410));
+        app.history.add("Historial Cancion".to_string(), url);
         refresh_view(&mut app);
 
         app.selected = 0;
@@ -3782,11 +4008,14 @@ mod tests {
             Err(_) => return,
         };
 
+        // Reproduce una URL local de loopback: sin red externa, y la entrada
+        // registrada debe ser exactamente esa URL.
+        let url = local_wav_url("audio.mp3", &make_test_wav(4410));
         start_url_playback(
             &mut app,
             &mut engine,
-            "https://example.com/audio.mp3".to_string(),
-            "https://example.com/audio.mp3".to_string(),
+            url.clone(),
+            url.clone(),
             "audio.mp3".to_string(),
         );
 
@@ -3804,7 +4033,11 @@ mod tests {
 
         assert_eq!(app.status, Status::Playing);
         assert_eq!(app.history.len(), 1);
-        assert_eq!(app.history.get(0).unwrap().url, "https://example.com/audio.mp3");
+        assert_eq!(
+            app.history.get(0).unwrap().url,
+            url,
+            "la entrada registrada es la URL local que se reprodujo"
+        );
         assert_eq!(app.history.get(0).unwrap().title, "audio.mp3");
         assert!(app.pending_history.is_none());
     }

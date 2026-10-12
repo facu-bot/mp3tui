@@ -148,13 +148,28 @@ pub enum NextAction {
     Play(usize),
     /// No hay pista siguiente: la sesión queda en «Fin de la pista».
     Stop,
+    /// Una URL con repetir «una» terminó antes de [`MIN_URL_REPLAY`]: no se
+    /// relanza (evita el bucle yt-dlp/red con fuentes que terminan al
+    /// instante) y la UI muestra [`URL_REPLAY_TOO_SOON_MSG`].
+    StopTooSoon,
 }
+
+/// Reproducción mínima (posición de la pista) que debe alcanzar una sesión de
+/// URL para poder repetirse con repetir «una». Fuentes que terminan casi al
+/// instante (cuerpo vacío, truncado, rate limit) no deben poder relanzar
+/// yt-dlp + red en bucle.
+pub const MIN_URL_REPLAY: Duration = Duration::from_secs(5);
+
+/// Aviso mostrado en `app.error` cuando el fin natural de una URL cae por
+/// debajo de [`MIN_URL_REPLAY`] y por eso no se repite.
+pub const URL_REPLAY_TOO_SOON_MSG: &str = "La canción terminó enseguida; no se repite";
 
 /// Regla única de fin natural de pista, igual para local y para URL.
 ///
-/// - `One` siempre repite la misma pista, incluida una URL (el caller re-lanza
-///   la URL original por el camino normal de URL; las páginas se resuelven de
-///   nuevo con yt-dlp porque las URLs resueltas vencen).
+/// - `One` repite la misma pista, incluida una URL, siempre que la sesión de
+///   URL haya durado al menos [`MIN_URL_REPLAY`] (`played`); por debajo del
+///   umbral → `StopTooSoon` (la UI avisa con [`URL_REPLAY_TOO_SOON_MSG`]).
+///   Un archivo local se repite sin mínimo: no hay red que agotar.
 /// - `Off` avanza sin envolver: al final de la lista (o del orden de shuffle,
 ///   donde cada pista suena una vez por ciclo) → `Stop`.
 /// - `All` avanza y envuelve, también dentro del orden de shuffle.
@@ -162,6 +177,9 @@ pub enum NextAction {
 ///   residual de la selección local y el avance entra a la biblioteca desde el
 ///   inicio del orden de navegación (con shuffle, el primer elemento del
 ///   orden mezclado).
+/// - Un tema local que quedó fuera de la vista (filtro/rescann) no tiene
+///   posición: `current == None` sin `finished_url` → `Stop` (no se confunde
+///   con un fin de URL, que sí entra a la biblioteca).
 /// - `One` gobierna aunque la lista esté vacía: la pista terminada es el
 ///   propio objetivo del replay; `Off`/`All` sin lista → `Stop`.
 pub fn natural_end_action(
@@ -171,9 +189,22 @@ pub fn natural_end_action(
     current: Option<usize>,
     order: &[usize],
     finished_url: bool,
+    played: Duration,
 ) -> NextAction {
     if repeat == RepeatMode::One {
+        // Repite una URL solo si la sesión duró al menos MIN_URL_REPLAY: una
+        // fuente que termina al instante no puede armar bucle de yt-dlp + red.
+        // Un archivo local corto sigue repitiendo: no hay red que agotar.
+        if finished_url && played < MIN_URL_REPLAY {
+            return NextAction::StopTooSoon;
+        }
         return NextAction::Replay;
+    }
+    // Un tema local que quedó fuera de la vista (filtro/rescann) no tiene
+    // posición: sin «siguiente» se detiene, sin confundirlo con un fin de
+    // URL (finished_url), que sí entra a la biblioteca.
+    if !finished_url && current.is_none() {
+        return NextAction::Stop;
     }
     // Una URL no ocupa una posición de la lista local.
     let current = if finished_url { None } else { current };
@@ -422,39 +453,40 @@ mod tests {
     // ---- fin natural de pista (regla única local/URL) ----
 
     #[test]
-    fn natural_end_repeat_one_always_replays() {
+    fn natural_end_repeat_one_replays_local_and_played_url() {
         let order = [2usize, 0, 3, 1];
         // Local en el medio, sin shuffle.
         assert_eq!(
-            natural_end_action(RepeatMode::One, false, 4, Some(1), &order, false),
+            natural_end_action(RepeatMode::One, false, 4, Some(1), &order, false, Duration::ZERO),
             NextAction::Replay
         );
         // Local en la última pista.
         assert_eq!(
-            natural_end_action(RepeatMode::One, false, 4, Some(3), &order, false),
+            natural_end_action(RepeatMode::One, false, 4, Some(3), &order, false, Duration::ZERO),
             NextAction::Replay
         );
         // Con shuffle (posición en el medio del orden mezclado).
         assert_eq!(
-            natural_end_action(RepeatMode::One, true, 4, Some(2), &order, false),
+            natural_end_action(RepeatMode::One, true, 4, Some(2), &order, false, Duration::ZERO),
             NextAction::Replay
         );
-        // URL, con y sin shuffle: se repite la misma URL.
+        // URL con sesión suficientemente larga, con y sin shuffle: se repite.
+        let played = Duration::from_secs(6);
         assert_eq!(
-            natural_end_action(RepeatMode::One, false, 4, None, &order, true),
+            natural_end_action(RepeatMode::One, false, 4, None, &order, true, played),
             NextAction::Replay
         );
         assert_eq!(
-            natural_end_action(RepeatMode::One, true, 4, None, &order, true),
+            natural_end_action(RepeatMode::One, true, 4, None, &order, true, played),
             NextAction::Replay
         );
         // Lista vacía: la pista terminada es el propio objetivo de repetición.
         assert_eq!(
-            natural_end_action(RepeatMode::One, false, 0, None, &order, false),
+            natural_end_action(RepeatMode::One, false, 0, None, &order, false, Duration::ZERO),
             NextAction::Replay
         );
         assert_eq!(
-            natural_end_action(RepeatMode::One, true, 0, None, &order, true),
+            natural_end_action(RepeatMode::One, true, 0, None, &order, true, played),
             NextAction::Replay
         );
     }
@@ -463,22 +495,22 @@ mod tests {
     fn natural_end_repeat_off_advances_then_stops_at_the_end() {
         let order: [usize; 0] = [];
         assert_eq!(
-            natural_end_action(RepeatMode::Off, false, 4, Some(0), &order, false),
+            natural_end_action(RepeatMode::Off, false, 4, Some(0), &order, false, Duration::ZERO),
             NextAction::Play(1),
             "Off avanza en el medio de la lista"
         );
         assert_eq!(
-            natural_end_action(RepeatMode::Off, false, 4, Some(2), &order, false),
+            natural_end_action(RepeatMode::Off, false, 4, Some(2), &order, false, Duration::ZERO),
             NextAction::Play(3)
         );
         assert_eq!(
-            natural_end_action(RepeatMode::Off, false, 4, Some(3), &order, false),
+            natural_end_action(RepeatMode::Off, false, 4, Some(3), &order, false, Duration::ZERO),
             NextAction::Stop,
             "Off en la última pista: se detiene, no envuelve"
         );
         // Lista vacía: nada que avanzar.
         assert_eq!(
-            natural_end_action(RepeatMode::Off, false, 0, None, &order, false),
+            natural_end_action(RepeatMode::Off, false, 0, None, &order, false, Duration::ZERO),
             NextAction::Stop
         );
     }
@@ -487,14 +519,14 @@ mod tests {
     fn natural_end_repeat_off_after_url_starts_the_library_list() {
         let order: [usize; 0] = [];
         assert_eq!(
-            natural_end_action(RepeatMode::Off, false, 4, None, &order, true),
+            natural_end_action(RepeatMode::Off, false, 4, None, &order, true, Duration::ZERO),
             NextAction::Play(0),
             "URL terminada: el siguiente sale de la biblioteca local"
         );
         // Una selección residual de la lista no cuenta como pista actual de
         // una URL: no hay «siguiente URL», se entra a la biblioteca.
         assert_eq!(
-            natural_end_action(RepeatMode::Off, false, 4, Some(2), &order, true),
+            natural_end_action(RepeatMode::Off, false, 4, Some(2), &order, true, Duration::ZERO),
             NextAction::Play(0)
         );
     }
@@ -503,23 +535,23 @@ mod tests {
     fn natural_end_repeat_all_wraps() {
         let order: [usize; 0] = [];
         assert_eq!(
-            natural_end_action(RepeatMode::All, false, 4, Some(2), &order, false),
+            natural_end_action(RepeatMode::All, false, 4, Some(2), &order, false, Duration::ZERO),
             NextAction::Play(3),
             "All avanza en el medio"
         );
         assert_eq!(
-            natural_end_action(RepeatMode::All, false, 4, Some(3), &order, false),
+            natural_end_action(RepeatMode::All, false, 4, Some(3), &order, false, Duration::ZERO),
             NextAction::Play(0),
             "All envuelve de la última a la primera"
         );
         assert_eq!(
-            natural_end_action(RepeatMode::All, false, 4, None, &order, true),
+            natural_end_action(RepeatMode::All, false, 4, None, &order, true, Duration::ZERO),
             NextAction::Play(0),
             "URL + All: entra a la biblioteca local"
         );
         // Lista vacía: no hay nada que sonar.
         assert_eq!(
-            natural_end_action(RepeatMode::All, false, 0, None, &order, false),
+            natural_end_action(RepeatMode::All, false, 0, None, &order, false, Duration::ZERO),
             NextAction::Stop
         );
     }
@@ -529,37 +561,139 @@ mod tests {
         // Orden mezclado: la lista [A,B,C,D] se navega 2 → 0 → 3 → 1.
         let order = [2usize, 0, 3, 1];
         assert_eq!(
-            natural_end_action(RepeatMode::Off, true, 4, Some(2), &order, false),
+            natural_end_action(RepeatMode::Off, true, 4, Some(2), &order, false, Duration::ZERO),
             NextAction::Play(0)
         );
         assert_eq!(
-            natural_end_action(RepeatMode::Off, true, 4, Some(0), &order, false),
+            natural_end_action(RepeatMode::Off, true, 4, Some(0), &order, false, Duration::ZERO),
             NextAction::Play(3)
         );
         assert_eq!(
-            natural_end_action(RepeatMode::Off, true, 4, Some(3), &order, false),
+            natural_end_action(RepeatMode::Off, true, 4, Some(3), &order, false, Duration::ZERO),
             NextAction::Play(1)
         );
         assert_eq!(
-            natural_end_action(RepeatMode::Off, true, 4, Some(1), &order, false),
+            natural_end_action(RepeatMode::Off, true, 4, Some(1), &order, false, Duration::ZERO),
             NextAction::Stop,
             "agotó el orden mezclado sin repetir: se detiene"
         );
         // URL + shuffle: empieza por el primer elemento del orden (aleatorio).
         assert_eq!(
-            natural_end_action(RepeatMode::Off, true, 4, None, &order, true),
+            natural_end_action(RepeatMode::Off, true, 4, None, &order, true, Duration::ZERO),
             NextAction::Play(2)
         );
         // All + shuffle: envuelve dentro del orden mezclado.
         assert_eq!(
-            natural_end_action(RepeatMode::All, true, 4, Some(1), &order, false),
+            natural_end_action(RepeatMode::All, true, 4, Some(1), &order, false, Duration::ZERO),
             NextAction::Play(2)
         );
         // Orden desactualizado (cambió el filtro): se ignora el shuffle.
         let stale = [1usize, 0];
         assert_eq!(
-            natural_end_action(RepeatMode::Off, true, 4, Some(0), &stale, false),
+            natural_end_action(RepeatMode::Off, true, 4, Some(0), &stale, false, Duration::ZERO),
             NextAction::Play(1)
+        );
+    }
+
+    #[test]
+    fn natural_end_url_repeat_one_requires_minimum_played_duration() {
+        let order: [usize; 0] = [];
+        // Por debajo del umbral: no se relanza — una fuente que termina casi
+        // al instante (cuerpo vacío, truncado, rate limit) no puede armar un
+        // bucle de yt-dlp + red.
+        assert_eq!(
+            natural_end_action(RepeatMode::One, false, 4, None, &order, true, Duration::ZERO),
+            NextAction::StopTooSoon,
+            "URL sin reproducir nada no se repite"
+        );
+        assert_eq!(
+            natural_end_action(
+                RepeatMode::One,
+                false,
+                4,
+                None,
+                &order,
+                true,
+                MIN_URL_REPLAY - Duration::from_millis(1),
+            ),
+            NextAction::StopTooSoon,
+            "un milisegundo bajo el umbral no se repite"
+        );
+        // En el umbral exacto y por encima: se repite.
+        assert_eq!(
+            natural_end_action(
+                RepeatMode::One,
+                false,
+                4,
+                None,
+                &order,
+                true,
+                MIN_URL_REPLAY,
+            ),
+            NextAction::Replay,
+            "en el umbral exacto se repite"
+        );
+        assert_eq!(
+            natural_end_action(
+                RepeatMode::One,
+                true,
+                4,
+                None,
+                &order,
+                true,
+                MIN_URL_REPLAY + Duration::from_secs(10),
+            ),
+            NextAction::Replay
+        );
+        // El freno es solo de URL: un archivo local corto sigue en «una».
+        assert_eq!(
+            natural_end_action(RepeatMode::One, false, 4, Some(1), &order, false, Duration::ZERO),
+            NextAction::Replay,
+            "local corto: sin mínimo de duración"
+        );
+        // Tampoco cambia off/todas con URL corta: avanzan a la biblioteca.
+        assert_eq!(
+            natural_end_action(RepeatMode::Off, false, 4, None, &order, true, Duration::ZERO),
+            NextAction::Play(0)
+        );
+        assert_eq!(
+            natural_end_action(RepeatMode::All, false, 4, None, &order, true, Duration::ZERO),
+            NextAction::Play(0)
+        );
+    }
+
+    #[test]
+    fn natural_end_local_track_out_of_view_stops_instead_of_restarting() {
+        let order = [2usize, 0, 3, 1];
+        // Tema local sonando que quedó fuera de la vista (filtro/rescann):
+        // current = None pero NO es un fin de URL. Sin posición no hay
+        // «siguiente»: se detiene como en la base, no se reinicia la lista.
+        assert_eq!(
+            natural_end_action(RepeatMode::Off, false, 4, None, &order, false, Duration::ZERO),
+            NextAction::Stop,
+            "Off: fuera de la vista no reinicia desde la primera pista"
+        );
+        assert_eq!(
+            natural_end_action(RepeatMode::All, false, 4, None, &order, false, Duration::ZERO),
+            NextAction::Stop,
+            "All: sin posición no se salta a la primera"
+        );
+        assert_eq!(
+            natural_end_action(RepeatMode::Off, true, 4, None, &order, false, Duration::ZERO),
+            NextAction::Stop,
+            "Off + shuffle: sin posición se detiene"
+        );
+        // One no navega la lista: repite el archivo local aunque esté oculto.
+        assert_eq!(
+            natural_end_action(RepeatMode::One, false, 4, None, &order, false, Duration::ZERO),
+            NextAction::Replay
+        );
+        // El caso URL conserva su regla: finished_url sigue entrando a la
+        // biblioteca local (la distinción es exactamente ese flag).
+        assert_eq!(
+            natural_end_action(RepeatMode::Off, false, 4, None, &order, true, Duration::ZERO),
+            NextAction::Play(0),
+            "un fin de URL NO es un local oculto"
         );
     }
 
