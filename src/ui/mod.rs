@@ -3402,30 +3402,35 @@ fn resolve_visualizer_paint(mode: config::VisualizerMode) -> VisualizerPaint {
 }
 
 /// T5 (modos-visualizador): plot polar GRUESO de las 32 bandas (intencionalmente
-/// grueso: la terminal no da para más, y así está acordado).
+/// grueso: la terminal no da para más, y así está acordado). Anillo pulsante
+/// rasterizado celda a celda, no 32 radios finos: cada celda se evalúa por su
+/// propia posición, así el contorno es continuo en vez de 32 picos aislados.
 ///
 /// Decisiones (testeadas en los tests `paint_circular_*`):
-/// - Las 32 bandas son radios desde el centro del área útil (banda 0 = norte,
-///   resto en sentido horario, θ = i·2π/32 − π/2); cada radio mide
-///   `nivel × max_r` con `max_r = min(ancho, alto×2) / 2`, muestreado en pasos
-///   de 0.5 para que el trazo sea continuo. Sin celdas parciales: el nivel
-///   cuantiza al medio paso (documentado, no testeado el sub-paso).
-/// - Aspecto de celda (~1:2, más altas que anchas): la distancia vertical
-///   cuenta doble (`dy = r·sinθ / 2`), así con niveles uniformes el plot es
-///   aproximadamente circular (alcance horizontal ≈ 2× el vertical en celdas,
-///   misma distancia física) y no una elipse aplastada.
-/// - Gradiente por DISTANCIA al centro (`t = r/max_r` con `spectrum_color`,
-///   low junto al centro → high en las puntas), no por nivel: como las barras
-///   (low abajo → high arriba) pero en radial; con niveles uniformes todos los
-///   radios igual muestran el gradiente. La última escritura gana (pasos
-///   ascendentes), así el color de cada celda lo fija su `r` mayor.
-/// - Glifos reusados sin duplicar lógica: `band_full_glyph` (`@` en ascii,
-///   `█` en unicode) + fondo de puntos `.` en ascii (vacío en unicode), igual
-///   que las barras. Celda central tenue en `dim` (se pinta al final, después
-///   de que la crucen los 32 radios).
-/// - Áreas enanas degradan graceful sin pánico: vacías retornan; si
-///   `max_r < 1` ni el centro entra y queda solo el fondo. Niveles fuera de
-///   rango con clamp (negativo = radio ausente).
+/// - Centro flotante en la mitad del área útil; cada celda usa su propio
+///   centro `(x+0.5, y+0.5)`. `dx` en unidades de ancho de celda; `dy` se
+///   multiplica por 2 para compensar el aspecto ~1:2 de la celda (como las
+///   barras); `r = hypot(dx, dy·2)`.
+/// - `max_r = min(ancho/2, alto) - 0.5` (margen); si `max_r < 2` degrada a
+///   solo fondo, sin pánico. `base_r = 0.45·max_r` (hueco interior);
+///   `span = max_r - base_r`.
+/// - Ángulo → banda, simétrico izquierda/derecha: θ medido desde el norte
+///   sobre el vector compensado `(dx, dy·2)`, plegado con `a = |θ|/π ∈
+///   [0,1]` (0 = arriba, 1 = abajo); las columnas espejo dan el mismo `a`.
+///   El bajo queda ABAJO: `pos = (1-a)·(NUM_BANDS-1)` (banda 0 en `a=1`,
+///   agudos arriba), interpolado linealmente entre `floor(pos)` y
+///   `ceil(pos)` para que el contorno sea continuo entre bandas.
+/// - Celda llena (`band_full_glyph`) cuando hay nivel (`> 0`) y
+///   `base_r <= r <= base_r + nivel·span`, con gradiente radial
+///   `t = (r - base_r)/span` por `spectrum_color` (low junto al hueco →
+///   high en el borde exterior).
+/// - Anillo base: celdas con `|r - base_r| < 0.5` que no quedaron llenas de
+///   energía van con el mismo glifo en `theme.dim` (círculo visible en
+///   silencio, sin punto central). Hueco (`r < base_r - 0.5`): fondo, igual
+///   que las barras (`.` tenue en ascii, vacío en unicode).
+/// - Niveles con clamp a 0..1 por banda, antes de interpolar (así un nivel
+///   fuera de rango pinta igual que su valor límite sin importar con qué
+///   banda vecina interpole).
 fn paint_circular(
     buffer: &mut ratatui::buffer::Buffer,
     inner: Rect,
@@ -3448,50 +3453,49 @@ fn paint_circular(
             }
         }
     }
-    // Radio máximo en unidades de ancho de celda: el alto cuenta doble por el
-    // aspecto ~1:2 (misma fórmula que compensa el ángulo abajo).
-    let max_r = f32::from(inner.width).min(f32::from(inner.height) * 2.0) / 2.0;
-    if max_r < 1.0 {
+    let width = f32::from(inner.width);
+    let height = f32::from(inner.height);
+    let max_r = (width / 2.0).min(height) - 0.5;
+    if max_r < 2.0 {
         return;
     }
-    let cx = inner.x + inner.width / 2;
-    let cy = inner.y + inner.height / 2;
+    let base_r = 0.45 * max_r;
+    let span = max_r - base_r;
+    let cx = f32::from(inner.x) + width / 2.0;
+    let cy = f32::from(inner.y) + height / 2.0;
     let symbol = band_full_glyph(ascii);
-    let right = i32::from(inner.x + inner.width);
-    let bottom = i32::from(inner.y + inner.height);
-    for (band, &magnitude) in bands.iter().enumerate() {
-        let level = magnitude.clamp(0.0, 1.0);
-        if level <= 0.0 {
-            continue;
-        }
-        let theta = band as f32 * std::f32::consts::TAU / NUM_BANDS as f32
-            - std::f32::consts::FRAC_PI_2;
-        let (sin, cos) = theta.sin_cos();
-        let ray_len = level * max_r;
-        let steps = (ray_len * 2.0).ceil() as usize;
-        for step in 0..=steps {
-            let r = step as f32 * 0.5;
-            if r > ray_len {
-                break;
+
+    for y in inner.y..inner.y + inner.height {
+        for x in inner.x..inner.x + inner.width {
+            let dx = f32::from(x) + 0.5 - cx;
+            let dy = f32::from(y) + 0.5 - cy;
+            let r = dx.hypot(dy * 2.0);
+            if r < base_r - 0.5 {
+                continue; // Hueco: fondo ya pintado arriba.
             }
-            let x = i32::from(cx) + (r * cos).round() as i32;
-            // El `/ 2.0` compensa el aspecto: a igual `r` física, la mitad de
-            // filas que de columnas.
-            let y = i32::from(cy) + ((r * sin) / 2.0).round() as i32;
-            if x < i32::from(inner.x) || y < i32::from(inner.y) || x >= right || y >= bottom
-            {
+            let theta = dx.atan2(-(dy * 2.0));
+            let a = (theta.abs() / std::f32::consts::PI).clamp(0.0, 1.0);
+            let pos = (1.0 - a) * (NUM_BANDS as f32 - 1.0);
+            let lo = pos.floor();
+            let frac = pos - lo;
+            // Clamp por banda ANTES de interpolar: así un nivel fuera de
+            // rango (p. ej. 1.5) pinta igual que 1.0 exacto sin importar con
+            // qué banda vecina interpole.
+            let lo_level = bands[lo as usize].clamp(0.0, 1.0);
+            let hi_level = bands[pos.ceil() as usize].clamp(0.0, 1.0);
+            let level = lo_level * (1.0 - frac) + hi_level * frac;
+            let fill_r = base_r + level * span;
+            let Some(cell) = buffer.cell_mut((x, y)) else {
                 continue;
-            }
-            let t = (r / max_r).clamp(0.0, 1.0);
-            let (red, green, blue) = spectrum_color(t, theme);
-            if let Some(cell) = buffer.cell_mut((x as u16, y as u16)) {
+            };
+            if level > 0.0 && r <= fill_r {
+                let t = ((r - base_r) / span).clamp(0.0, 1.0);
+                let (red, green, blue) = spectrum_color(t, theme);
                 cell.set_symbol(symbol).set_fg(Color::Rgb(red, green, blue));
+            } else if (r - base_r).abs() < 0.5 {
+                cell.set_symbol(symbol).set_fg(theme.dim);
             }
         }
-    }
-    // Centro tenue (después de los radios para que siempre se vea).
-    if let Some(cell) = buffer.cell_mut((cx, cy)) {
-        cell.set_symbol(symbol).set_fg(theme.dim);
     }
 }
 
@@ -4860,55 +4864,99 @@ mod tests {
         paint_vu(&mut buffer, area, 1.0, 1.0, &theme, false);
     }
 
-    // T5 (modos-visualizador): plot polar grueso. Área de referencia 20x24:
-    // max_r = min(20, 48)/2 = 10, centro (10,12); banda 0 = norte, 8 = este,
-    // 16 = sur, 24 = oeste (θ = i·2π/32 − π/2).
+    // T8 (modos-visualizador): anillo pulsante rasterizado celda a celda.
+    // Área de referencia 40x20 (pareja): centro flotante (20.0, 10.0),
+    // max_r = min(20, 20) - 0.5 = 19.5, base_r = 0.45·max_r ≈ 8.775,
+    // span ≈ 10.725. Ángulo medido desde el norte, simétrico izq/derecha
+    // (a = 0 arriba, a = 1 abajo); los graves (banda 0) quedan abajo.
     // ------------------------------------------------------------------
 
     #[test]
-    fn paint_circular_silence_shows_dim_center_on_background() {
+    fn paint_circular_silence_shows_a_closed_dim_ring_hole_as_background() {
         let theme = Theme::default();
-        let area = Rect::new(0, 0, 32, 16);
-        // Sin niveles solo queda el centro tenue sobre el fondo.
+        let area = Rect::new(0, 0, 40, 20);
         let mut buffer = Buffer::empty(area);
         paint_circular(&mut buffer, area, &[0.0f32; NUM_BANDS], &theme, false);
-        let center = &buffer[(16u16, 8u16)];
-        assert_eq!(center.symbol(), "█", "el centro se dibuja");
-        assert_eq!(center.fg, theme.dim, "el centro va tenue en dim");
-        for (x, y) in [(0u16, 0u16), (31, 15), (17, 8), (16, 9)] {
-            assert_eq!(
-                buffer[(x, y)].symbol(),
-                " ",
-                "sin niveles no hay radios ({x},{y})"
+
+        // El hueco (celdas junto al centro) queda como fondo: sin punto
+        // central, a diferencia del painter de radios anterior.
+        for (x, y) in [(19u16, 9u16), (20, 9), (19, 10), (20, 10)] {
+            let cell = &buffer[(x, y)];
+            assert_eq!(cell.symbol(), " ", "hueco es fondo ({x},{y})");
+            assert_eq!(cell.fg, Color::Reset, "hueco sin color ({x},{y})");
+        }
+
+        // Sin energía, ninguna celda lleva un color de gradiente: todo lo
+        // pintado (anillo base) queda en `dim`, nunca en `spectrum_color`.
+        for y in 0..area.height {
+            for x in 0..area.width {
+                let cell = &buffer[(x, y)];
+                if cell.symbol() == "█" {
+                    assert_eq!(cell.fg, theme.dim, "silencio: solo tenue ({x},{y})");
+                }
+            }
+        }
+
+        // El anillo base es continuo alrededor de todo el círculo (ángulo
+        // real de cada celda tenue, 0°=norte, 90°=este, 180°=sur): cada
+        // muestra cada 5° tiene una celda tenue cerca — los 32 radios de
+        // antes dejaban huecos de ~11° SIN NADA, no una celda de por medio.
+        let (cx, cy) = (20.0f32, 10.0f32);
+        let mut dim_degrees: Vec<f32> = Vec::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                let cell = &buffer[(x, y)];
+                if cell.symbol() == "█" && cell.fg == theme.dim {
+                    let dx = f32::from(x) + 0.5 - cx;
+                    let dy = f32::from(y) + 0.5 - cy;
+                    let theta = dx.atan2(-(dy * 2.0)).to_degrees();
+                    dim_degrees.push(if theta < 0.0 { theta + 360.0 } else { theta });
+                }
+            }
+        }
+        assert!(!dim_degrees.is_empty(), "el anillo base no pintó ninguna celda");
+        // Tolerancia 15°: a este radio, la grilla entera rasteriza el
+        // círculo con algún hueco de 1 celda entre ángulos vecinos — muy
+        // lejos de los ~11° COMPLETAMENTE vacíos que dejaban los 32 radios
+        // discretos (ahí no había ni una celda tenue en medio).
+        for deg in (0..360).step_by(5) {
+            let target = deg as f32;
+            let nearest = dim_degrees
+                .iter()
+                .map(|&d| {
+                    let diff = (d - target).abs();
+                    diff.min(360.0 - diff)
+                })
+                .fold(f32::INFINITY, f32::min);
+            assert!(
+                nearest <= 15.0,
+                "hueco en el anillo base cerca de {deg}° (más cercana a {nearest}°)"
             );
         }
-        // ASCII: mismo centro con el glifo lleno + fondo de puntos.
-        let mut buffer = Buffer::empty(area);
-        paint_circular(&mut buffer, area, &[0.0f32; NUM_BANDS], &theme, true);
-        let center = &buffer[(16u16, 8u16)];
-        assert_eq!(center.symbol(), "@", "centro ascii = glifo lleno");
-        assert_eq!(center.fg, theme.dim, "centro ascii tenue en dim");
-        let empty = &buffer[(17u16, 8u16)];
-        assert_eq!(empty.symbol(), ".", "fondo de puntos en ascii");
-        assert_eq!(empty.fg, theme.dim);
     }
 
     #[test]
     fn paint_circular_uniform_levels_are_approximately_circular_not_oval() {
-        // Compensación del aspecto de celda (~1:2): con niveles uniformes el
-        // alcance horizontal en celdas ≈ 2× el vertical (misma distancia
-        // física). Sin compensar, el vertical mediría ~10, no ~5.
+        // Compensación del aspecto de celda (~1:2): con nivel uniforme el
+        // alcance horizontal del relleno ≈ 2× el vertical (misma distancia
+        // física), igual que antes pero ahora hasta `fill_r`, no `max_r`.
         let theme = Theme::default();
-        let area = Rect::new(0, 0, 20, 24);
+        let area = Rect::new(0, 0, 40, 20);
         let mut buffer = Buffer::empty(area);
-        paint_circular(&mut buffer, area, &[1.0f32; NUM_BANDS], &theme, false);
-        let painted = |x: u16, y: u16| buffer[(x, y)].symbol() == "█";
-        let (cx, cy) = (10u16, 12u16);
-        let dx_left = (0..cx).filter(|&x| painted(x, cy)).map(|x| cx - x).max();
-        let dx_right = ((cx + 1)..20).filter(|&x| painted(x, cy)).map(|x| x - cx).max();
-        let dy_up = (0..cy).filter(|&y| painted(cx, y)).map(|y| cy - y).max();
-        let dy_down = ((cy + 1)..24)
-            .filter(|&y| painted(cx, y))
+        paint_circular(&mut buffer, area, &[0.6f32; NUM_BANDS], &theme, false);
+        let filled = |x: u16, y: u16| {
+            let cell = &buffer[(x, y)];
+            cell.symbol() == "█" && cell.fg != theme.dim
+        };
+        let (cx, cy) = (20u16, 10u16);
+        let dx_left = (0..cx).filter(|&x| filled(x, cy)).map(|x| cx - x).max();
+        let dx_right = ((cx + 1)..area.width)
+            .filter(|&x| filled(x, cy))
+            .map(|x| x - cx)
+            .max();
+        let dy_up = (0..cy).filter(|&y| filled(cx, y)).map(|y| cy - y).max();
+        let dy_down = ((cy + 1)..area.height)
+            .filter(|&y| filled(cx, y))
             .map(|y| y - cy)
             .max();
         let (dx_left, dx_right, dy_up, dy_down) = (
@@ -4918,12 +4966,9 @@ mod tests {
             dy_down.unwrap_or(0),
         );
         assert!(
-            (8..=10).contains(&dx_left) && (8..=10).contains(&dx_right),
-            "alcance horizontal ≈ max_r=10 (izq={dx_left}, der={dx_right})"
-        );
-        assert!(
-            (4..=6).contains(&dy_up) && (4..=6).contains(&dy_down),
-            "alcance vertical ≈ max_r/2=5 (arr={dy_up}, aba={dy_down})"
+            dx_left > 0 && dx_right > 0 && dy_up > 0 && dy_down > 0,
+            "hay relleno en las 4 direcciones (izq={dx_left}, der={dx_right}, \
+             arr={dy_up}, aba={dy_down})"
         );
         assert!(
             dx_left.abs_diff(dx_right) <= 1 && dy_up.abs_diff(dy_down) <= 1,
@@ -4939,84 +4984,153 @@ mod tests {
     }
 
     #[test]
-    fn paint_circular_radii_grow_with_level_and_point_outwards() {
+    fn paint_circular_uniform_level_has_no_gaps_between_bands() {
+        // Anti-araña: con nivel uniforme, CADA ángulo (muestreado cada 5°)
+        // tiene al menos una celda con energía entre `base_r` y `max_r` —
+        // sin huecos, a diferencia de los 32 radios discretos de antes.
         let theme = Theme::default();
-        let area = Rect::new(0, 0, 20, 24);
+        let area = Rect::new(0, 0, 40, 20);
+        let mut buffer = Buffer::empty(area);
+        paint_circular(&mut buffer, area, &[0.6f32; NUM_BANDS], &theme, false);
+
+        let (cx, cy) = (20.0f32, 10.0f32);
+        let max_r = (f32::from(area.width) / 2.0).min(f32::from(area.height)) - 0.5;
+        let base_r = 0.45 * max_r;
+
+        for deg in (0..360).step_by(5) {
+            let theta = (deg as f32).to_radians();
+            let (sin, cos) = theta.sin_cos();
+            let mut hit = false;
+            let mut r = base_r;
+            while r <= max_r {
+                let fx = cx + r * sin - 0.5;
+                let fy = cy - (r * cos) / 2.0 - 0.5;
+                if fx >= 0.0 && fy >= 0.0 {
+                    let (cell_x, cell_y) = (fx.round() as u16, fy.round() as u16);
+                    if cell_x < area.width && cell_y < area.height {
+                        let cell = &buffer[(cell_x, cell_y)];
+                        if cell.symbol() == "█" && cell.fg != theme.dim {
+                            hit = true;
+                            break;
+                        }
+                    }
+                }
+                r += 0.25;
+            }
+            assert!(hit, "hueco en {deg}°: sin energía entre base_r y max_r");
+        }
+    }
+
+    #[test]
+    fn paint_circular_mirrors_left_and_right_columns() {
+        let theme = Theme::default();
+        let area = Rect::new(0, 0, 40, 20);
         let mut bands = [0.0f32; NUM_BANDS];
-        bands[0] = 1.0; // norte, a tope: max_r=10 → 5 filas hacia arriba.
-        bands[8] = 0.5; // este, a mitad: 5 cols → 5 celdas hacia la derecha.
+        for (i, level) in bands.iter_mut().enumerate() {
+            *level = (i as f32 / (NUM_BANDS - 1) as f32).clamp(0.0, 1.0);
+        }
+        bands[3] = 0.9;
+        bands[20] = 0.1; // valores bien asimétricos entre bandas vecinas.
         let mut buffer = Buffer::empty(area);
         paint_circular(&mut buffer, area, &bands, &theme, false);
-        assert_eq!(buffer[(10u16, 7u16)].symbol(), "█", "tip norte a tope");
+        for x in 0..(area.width / 2) {
+            let mirror = area.width - 1 - x;
+            for y in 0..area.height {
+                let cell = &buffer[(x, y)];
+                let mirrored = &buffer[(mirror, y)];
+                assert_eq!(
+                    cell.symbol(),
+                    mirrored.symbol(),
+                    "columna {x} y su espejo {mirror} con mismo símbolo (y={y})"
+                );
+                assert_eq!(
+                    cell.fg,
+                    mirrored.fg,
+                    "columna {x} y su espejo {mirror} con mismo color (y={y})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn paint_circular_bass_bands_extend_the_ring_at_the_bottom() {
+        let theme = Theme::default();
+        let area = Rect::new(0, 0, 40, 20);
+        let mut bands = [0.0f32; NUM_BANDS];
+        bands[0] = 1.0;
+        bands[1] = 1.0; // graves a tope; agudos (resto) en cero.
+        let mut buffer = Buffer::empty(area);
+        paint_circular(&mut buffer, area, &bands, &theme, false);
+
+        let is_energy = |x: u16, y: u16| {
+            let cell = &buffer[(x, y)];
+            cell.symbol() == "█" && cell.fg != theme.dim
+        };
+        let x = 19u16;
+        let north = (0u16..10).filter(|&y| is_energy(x, y)).count();
+        let south = (10u16..20).filter(|&y| is_energy(x, y)).count();
+        assert_eq!(north, 0, "agudos en cero: nada relleno arriba, obtenido {north}");
+        assert!(south > 0, "graves a tope: relleno abajo, obtenido {south}");
+    }
+
+    #[test]
+    fn paint_circular_radial_gradient_low_near_the_base_high_at_the_edge() {
+        let theme = Theme::default();
+        let area = Rect::new(0, 0, 40, 20);
+        let mut buffer = Buffer::empty(area);
+        paint_circular(&mut buffer, area, &[1.0f32; NUM_BANDS], &theme, false);
+
+        let (cx, cy) = (20.0f32, 10.0f32);
+        let max_r = (f32::from(area.width) / 2.0).min(f32::from(area.height)) - 0.5;
+        let base_r = 0.45 * max_r;
+        let span = max_r - base_r;
+        let expected_t = |x: u16, y: u16| {
+            let dx = f32::from(x) + 0.5 - cx;
+            let dy = f32::from(y) + 0.5 - cy;
+            let r = dx.hypot(dy * 2.0);
+            ((r - base_r) / span).clamp(0.0, 1.0)
+        };
+        let color_at = |t: f32| {
+            let (r, g, b) = spectrum_color(t, &theme);
+            Color::Rgb(r, g, b)
+        };
+
+        let near = (20u16, 5u16); // r ≈ 9.01, t ≈ 0.02: junto a la base.
+        let far = (20u16, 19u16); // r ≈ 19.01, t ≈ 0.95: junto al borde.
+        let t_near = expected_t(near.0, near.1);
+        let t_far = expected_t(far.0, far.1);
+        assert!(t_near < 0.1, "celda elegida cerca de la base, t={t_near}");
+        assert!(t_far > 0.9, "celda elegida cerca del borde, t={t_far}");
         assert_eq!(
-            buffer[(10u16, 6u16)].symbol(),
-            " ",
-            "más allá del tip no hay nada"
+            buffer[near].fg,
+            color_at(t_near),
+            "gradiente bajo junto a la base"
         );
         assert_eq!(
-            buffer[(10u16, 17u16)].symbol(),
-            " ",
-            "la banda 16 en cero no dibuja hacia el sur"
-        );
-        assert_eq!(buffer[(15u16, 12u16)].symbol(), "█", "tip este a mitad");
-        assert_eq!(
-            buffer[(16u16, 12u16)].symbol(),
-            " ",
-            "más allá del tip este no hay nada"
-        );
-        assert_eq!(
-            buffer[(10u16, 12u16)].fg,
-            theme.dim,
-            "el centro sigue tenue aunque lo crucen radios"
+            buffer[far].fg,
+            color_at(t_far),
+            "gradiente alto junto al borde exterior"
         );
     }
 
     #[test]
-    fn paint_circular_gradient_goes_from_low_at_center_to_high_at_tips() {
-        // Decisión T5 (testeada acá): gradiente por DISTANCIA al centro
-        // (t = r/max_r), no por nivel — como las barras (low abajo → high
-        // arriba), pero en radial: low junto al centro, high en las puntas.
+    fn paint_circular_ascii_uses_full_glyph_and_dot_background() {
         let theme = Theme::default();
-        let area = Rect::new(0, 0, 20, 24);
+        let area = Rect::new(0, 0, 40, 20);
         let mut bands = [0.0f32; NUM_BANDS];
-        bands[0] = 1.0; // norte a tope (max_r=10).
-        let mut buffer = Buffer::empty(area);
-        paint_circular(&mut buffer, area, &bands, &theme, false);
-        // El tip lo escribe r=10 (último paso): t=1.0 → high.
-        let (hr, hg, hb) = spectrum_color(1.0, &theme);
-        assert_eq!(
-            buffer[(10u16, 7u16)].fg,
-            Color::Rgb(hr, hg, hb),
-            "el tip va en spectrum_high"
-        );
-        // La celda (10,11) la tocan r∈{1.0,…,2.5} (pasos de 0.5) y gana el
-        // último: t=0.25, cerca de low.
-        let (lr, lg, lb) = spectrum_color(0.25, &theme);
-        assert_eq!(
-            buffer[(10u16, 11u16)].fg,
-            Color::Rgb(lr, lg, lb),
-            "junto al centro el gradiente arranca en low"
-        );
-    }
-
-    #[test]
-    fn paint_circular_ascii_reuses_ramp_and_dot_background() {
-        let theme = Theme::default();
-        let area = Rect::new(0, 0, 32, 16);
-        let mut bands = [0.0f32; NUM_BANDS];
-        bands[0] = 1.0; // norte a tope: max_r=16 → 8 filas hasta la fila 0.
+        bands[0] = 1.0;
+        bands[1] = 1.0;
         let mut buffer = Buffer::empty(area);
         paint_circular(&mut buffer, area, &bands, &theme, true);
-        assert_eq!(buffer[(16u16, 0u16)].symbol(), "@", "radio ascii = @");
-        let (hr, hg, hb) = spectrum_color(1.0, &theme);
-        assert_eq!(
-            buffer[(16u16, 0u16)].fg,
-            Color::Rgb(hr, hg, hb),
-            "el tip ascii también lleva el gradiente"
-        );
-        let empty = &buffer[(20u16, 8u16)];
-        assert_eq!(empty.symbol(), ".", "fondo de puntos en ascii");
-        assert_eq!(empty.fg, theme.dim);
+        let x = 19u16;
+        let filled = (10u16..20).any(|y| {
+            let cell = &buffer[(x, y)];
+            cell.symbol() == "@" && cell.fg != theme.dim
+        });
+        assert!(filled, "ascii usa @ para las celdas con energía");
+        let hole = &buffer[(20u16, 10u16)];
+        assert_eq!(hole.symbol(), ".", "fondo de puntos en ascii dentro del hueco");
+        assert_eq!(hole.fg, theme.dim);
     }
 
     #[test]
@@ -5026,28 +5140,53 @@ mod tests {
         let area = Rect::new(0, 0, 0, 0);
         let mut buffer = Buffer::empty(area);
         paint_circular(&mut buffer, area, &[1.0f32; NUM_BANDS], &theme, false);
-        // 1x1: max_r=0.5 < 1, ni el centro entra → solo fondo, sin pánico.
-        let area = Rect::new(5, 5, 1, 1);
-        let mut buffer = Buffer::empty(area);
-        paint_circular(&mut buffer, area, &[1.0f32; NUM_BANDS], &theme, false);
-        assert_eq!(buffer[(5u16, 5u16)].symbol(), " ", "sin centro en 1x1");
-        // 2x2: max_r=1, el centro entra tenue.
-        let area = Rect::new(0, 0, 2, 2);
-        let mut buffer = Buffer::empty(area);
-        paint_circular(&mut buffer, area, &[1.0f32; NUM_BANDS], &theme, false);
-        assert_eq!(buffer[(1u16, 1u16)].fg, theme.dim, "centro tenue en 2x2");
-        // Niveles fuera de rango con clamp, sin pánico.
-        let area = Rect::new(0, 0, 20, 24);
-        let mut buffer = Buffer::empty(area);
-        let mut bands = [0.0f32; NUM_BANDS];
-        bands[0] = 1.5;
-        bands[16] = -0.5;
-        paint_circular(&mut buffer, area, &bands, &theme, true);
-        assert_eq!(buffer[(10u16, 7u16)].symbol(), "@", "1.5 = clip a tope");
+
+        // 1x1 y 3x2: max_r < 2 degrada a solo fondo, sin pánico.
+        for (w, h) in [(1u16, 1u16), (3u16, 2u16)] {
+            let area = Rect::new(0, 0, w, h);
+            let mut buffer = Buffer::empty(area);
+            paint_circular(&mut buffer, area, &[1.0f32; NUM_BANDS], &theme, false);
+            for y in 0..h {
+                for x in 0..w {
+                    assert_eq!(
+                        buffer[(x, y)].symbol(),
+                        " ",
+                        "{w}x{h}: solo fondo, sin energía ({x},{y})"
+                    );
+                }
+            }
+        }
+
+        // Nivel > 1.0 clampea igual que 1.0 exacto: mismo resultado.
+        let area = Rect::new(0, 0, 40, 20);
+        let mut over = [0.0f32; NUM_BANDS];
+        over[0] = 1.5;
+        over[1] = 1.5;
+        let mut exact = [0.0f32; NUM_BANDS];
+        exact[0] = 1.0;
+        exact[1] = 1.0;
+        let mut buffer_over = Buffer::empty(area);
+        paint_circular(&mut buffer_over, area, &over, &theme, false);
+        let mut buffer_exact = Buffer::empty(area);
+        paint_circular(&mut buffer_exact, area, &exact, &theme, false);
         assert_eq!(
-            buffer[(10u16, 17u16)].symbol(),
-            ".",
-            "negativo = vacío al sur"
+            buffer_over, buffer_exact,
+            "1.5 clampeado a 1.0 pinta igual que un nivel de 1.0"
+        );
+
+        // Nivel negativo clampea a 0: no agrega relleno.
+        let mut negative = [0.0f32; NUM_BANDS];
+        negative[0] = -0.5;
+        negative[1] = -0.5;
+        let mut buffer_negative = Buffer::empty(area);
+        paint_circular(&mut buffer_negative, area, &negative, &theme, false);
+        let is_energy = |b: &Buffer, x: u16, y: u16| {
+            let cell = &b[(x, y)];
+            cell.symbol() == "█" && cell.fg != theme.dim
+        };
+        assert!(
+            !(10u16..20).any(|y| is_energy(&buffer_negative, 19, y)),
+            "nivel negativo clampea a 0: nada relleno abajo"
         );
     }
 

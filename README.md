@@ -186,10 +186,9 @@ vuelve al panel, y `Esc` cancela, restaura el modo anterior y vuelve al
 panel. `onda` dibuja el osciloscopio con las muestras crudas del audio,
 `espejo` las 32 bandas en espejo vertical desde una línea central y `vu` el
 medidor de nivel mono en escala dBFS (-60..0) con marca de pico (decae en
-~800 ms); `circular`
-el plot polar grueso de las 32 bandas (radios desde el centro con el
-gradiente del tema, centro tenue). `barras` es el
-comportamiento actual.
+~800 ms); `circular` un anillo grueso pulsante con las 32 bandas (hueco
+tenue en el centro, grosor y gradiente del tema según el nivel por ángulo).
+`barras` es el comportamiento actual.
 
 Desde el panel (`Ctrl+P` → `Mouse`) `Enter` alterna la captura del mouse en
 el momento (la fila muestra `Mouse: sí` / `Mouse: no`) y guarda su valor en
@@ -275,8 +274,9 @@ Notas del comportamiento de la config:
   vez de quedarse cerca del piso; barra horizontal con gradiente del tema,
   marca de pico en `spectrum_high` que decae en ~800 ms y escala tenue;
   mono porque el tap ya promedia los canales — ver nota T4) o `circular`
-  (plot polar grueso de las 32 bandas como radios desde el centro, con el
-  gradiente del tema por distancia al centro y centro tenue; compensa el
+  (anillo grueso pulsante con las 32 bandas: hueco tenue en el centro,
+  grosor y gradiente del tema según el nivel en cada ángulo — los graves
+  abajo, los agudos arriba —, simétrico izquierda/derecha; compensa el
   aspecto ~1:2 de la celda). Un valor inválido avisa y se usa `barras`. El
   valor `caida` (modo eliminado) avisa específicamente y cae a `barras`,
   autocorrigiendo además el archivo real al cargar.
