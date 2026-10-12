@@ -678,8 +678,22 @@ fn request_quit(app: &mut App) {
     }
 }
 
+/// Estado genérico del sub-modal de selección (Bandas y Modo; Temas usa el
+/// mismo esquema salvo sus dos originales): selección con previsualización en
+/// vivo y el valor con el que se abrió (para el marcador ● y para restaurar
+/// con Esc). Agregar un selector nuevo es instanciar este estado y agregar
+/// data al handler/render genéricos, no copiar el estado.
+struct MenuState<T> {
+    /// Índice en la lista de opciones.
+    selected: usize,
+    /// Valor activo al abrir (fila «actual» marcada con ●).
+    original: T,
+}
+
 /// Estado del menú de temas: selección con previsualización en vivo y
 /// el tema con el que se abrió (para el marcador y para restaurar con Esc).
+/// Conserva su forma concreta (captura dos originales: id + paleta); el
+/// handler, las filas y el render corren por los genéricos.
 struct ThemeMenuState {
     /// Índice en `config::builtin_themes()`.
     selected: usize,
@@ -689,25 +703,42 @@ struct ThemeMenuState {
     original_theme: Theme,
 }
 
-/// Estado del selector de bandas: selección con previsualización en
-/// vivo y el estilo con el que se abrió (para el marcador y para restaurar
-/// con Esc). Espejo de `ThemeMenuState` sobre los 3 valores fijos.
-struct BandsMenuState {
-    /// Índice en `config::VisualizerStyle::options()`.
-    selected: usize,
-    /// Estilo configurado al abrir (fila «actual» marcada con ●).
-    original: config::VisualizerStyle,
+/// Selector de bandas: instancia del estado genérico sobre los 3 valores
+/// fijos de estilo.
+type BandsMenuState = MenuState<config::VisualizerStyle>;
+
+/// Selector de modo: instancia del estado genérico sobre los 5 valores
+/// fijos de modo.
+type ModeMenuState = MenuState<config::VisualizerMode>;
+
+/// Posición de un sub-modal de selección: el único acceso que el handler
+/// genérico necesita del estado (además de la toma del `Option`). Lo
+/// implementan `MenuState<T>` y `ThemeMenuState`, que conserva su forma
+/// concreta para los tests.
+trait MenuSelection {
+    fn selected(&self) -> usize;
+
+    fn set_selected(&mut self, selected: usize);
 }
 
-/// Estado del selector de modo: selección con
-/// previsualización en vivo y el modo con el que se abrió (para el marcador
-/// y para restaurar con Esc). Espejo de `BandsMenuState` sobre los 5 valores
-/// fijos.
-struct ModeMenuState {
-    /// Índice en `config::VisualizerMode::options()`.
-    selected: usize,
-    /// Modo configurado al abrir (fila «actual» marcada con ●).
-    original: config::VisualizerMode,
+impl<T> MenuSelection for MenuState<T> {
+    fn selected(&self) -> usize {
+        self.selected
+    }
+
+    fn set_selected(&mut self, selected: usize) {
+        self.selected = selected;
+    }
+}
+
+impl MenuSelection for ThemeMenuState {
+    fn selected(&self) -> usize {
+        self.selected
+    }
+
+    fn set_selected(&mut self, selected: usize) {
+        self.selected = selected;
+    }
 }
 
 /// Filas fijas del panel de configuración: Temas abre su sub-modal,
@@ -1380,6 +1411,61 @@ fn cancel_pending_ytdlp(app: &mut App) {
     app.pending_history = None;
 }
 
+// --- Sub-modal de selección (Temas, Bandas y Modo) --------------------
+
+/// Handler genérico del sub-modal de selección: ↑/↓ mueve y previsualiza
+/// en vivo sin persistir, Enter aplica y persiste a través del closure
+/// recibido (un fallo de guardado solo deja el aviso) y Esc restaura el
+/// valor capturado al abrir (`original`/preview-restore). `slot` localiza
+/// el campo `Option` del estado en la `App`; `len` + `item` resuelven la
+/// lista, `preview`/`apply` (que devuelve el argumento a persistir)/`restore`
+/// son la data de cada selector: agregar uno nuevo es agregar un wrapper
+/// con esa data, no otra copia del handler.
+fn handle_menu_key<T: MenuSelection, I>(
+    app: &mut App,
+    key: KeyEvent,
+    slot: impl Fn(&mut App) -> &mut Option<T>,
+    len: usize,
+    item: impl Fn(usize) -> I,
+    preview: impl Fn(&I),
+    apply: impl Fn(&I) -> String,
+    restore: impl Fn(&T),
+    persist: impl FnOnce(&str) -> Result<(), String>,
+) {
+    match key.code {
+        KeyCode::Up | KeyCode::Down => {
+            let Some(menu) = slot(app).as_mut() else {
+                return;
+            };
+            let delta = if matches!(key.code, KeyCode::Up) { -1 } else { 1 };
+            menu.set_selected(move_selection(menu.selected(), delta, len));
+            let value = item(menu.selected());
+            // Previsualización en vivo: cambia el valor sin persistir.
+            preview(&value);
+        }
+        KeyCode::Enter => {
+            let Some(menu) = slot(app).take() else {
+                return;
+            };
+            let value = item(menu.selected());
+            // Aplica primero (queda en la sesión aunque falle el guardado)
+            // y recién después persiste; un fallo solo deja el aviso.
+            let persist_arg = apply(&value);
+            if let Err(err) = persist(&persist_arg) {
+                app.error = Some(err);
+            }
+        }
+        KeyCode::Esc => {
+            let Some(menu) = slot(app).take() else {
+                return;
+            };
+            // Restaura el valor con el que se abrió.
+            restore(&menu);
+        }
+        _ => {}
+    }
+}
+
 // --- Menú de temas ----------------------------------------------------
 
 fn open_theme_menu(app: &mut App) {
@@ -1400,39 +1486,20 @@ fn handle_theme_menu_key(
     app: &mut App,
     persist: impl FnOnce(&str) -> Result<(), String>,
 ) {
-    let len = config::builtin_themes().len();
-    match key.code {
-        KeyCode::Up | KeyCode::Down => {
-            let Some(menu) = app.theme_menu.as_mut() else {
-                return;
-            };
-            let delta = if matches!(key.code, KeyCode::Up) { -1 } else { 1 };
-            menu.selected = move_selection(menu.selected, delta, len);
-            let (id, _) = config::builtin_themes()[menu.selected];
-            // Previsualización en vivo: cambia los colores sin tocar el id.
-            config::preview_theme(config::resolve_theme(id));
-        }
-        KeyCode::Enter => {
-            let Some(menu) = app.theme_menu.take() else {
-                return;
-            };
-            let (id, _) = config::builtin_themes()[menu.selected];
-            // Aplica primero (queda en la sesión aunque falle el guardado)
-            // y recién después persiste; un fallo solo deja el aviso.
+    handle_menu_key(
+        app,
+        key,
+        |app| &mut app.theme_menu,
+        config::builtin_themes().len(),
+        |i| config::builtin_themes()[i].0,
+        |id| config::preview_theme(config::resolve_theme(id)),
+        |id| {
             config::activate_theme(id, config::resolve_theme(id));
-            if let Err(err) = persist(id) {
-                app.error = Some(err);
-            }
-        }
-        KeyCode::Esc => {
-            let Some(menu) = app.theme_menu.take() else {
-                return;
-            };
-            // Restaura el tema con el que se abrió (colores + id).
-            config::activate_theme(&menu.original_name, menu.original_theme);
-        }
-        _ => {}
-    }
+            (*id).to_string()
+        },
+        |menu| config::activate_theme(&menu.original_name, menu.original_theme.clone()),
+        persist,
+    );
 }
 
 // --- Selector de bandas (sub-modal del panel) ---------------------------
@@ -1454,40 +1521,20 @@ fn handle_bands_menu_key(
     app: &mut App,
     persist: impl FnOnce(&str) -> Result<(), String>,
 ) {
-    let len = config::VisualizerStyle::options().len();
-    match key.code {
-        KeyCode::Up | KeyCode::Down => {
-            let Some(menu) = app.bands_menu.as_mut() else {
-                return;
-            };
-            let delta = if matches!(key.code, KeyCode::Up) { -1 } else { 1 };
-            menu.selected = move_selection(menu.selected, delta, len);
-            let style = config::VisualizerStyle::options()[menu.selected];
-            // Previsualización en vivo: cambia el estilo sin persistir (el
-            // render lo resuelve por frame vía `effective_visualizer_style`).
-            config::preview_visualizer_style(style);
-        }
-        KeyCode::Enter => {
-            let Some(menu) = app.bands_menu.take() else {
-                return;
-            };
-            let style = config::VisualizerStyle::options()[menu.selected];
-            // Aplica primero (queda en la sesión aunque falle el guardado)
-            // y recién después persiste; un fallo solo deja el aviso.
-            config::activate_visualizer_style(style);
-            if let Err(err) = persist(style.as_str()) {
-                app.error = Some(err);
-            }
-        }
-        KeyCode::Esc => {
-            let Some(menu) = app.bands_menu.take() else {
-                return;
-            };
-            // Restaura el estilo con el que se abrió.
-            config::activate_visualizer_style(menu.original);
-        }
-        _ => {}
-    }
+    handle_menu_key(
+        app,
+        key,
+        |app| &mut app.bands_menu,
+        config::VisualizerStyle::options().len(),
+        |i| config::VisualizerStyle::options()[i],
+        |style| config::preview_visualizer_style(*style),
+        |style| {
+            config::activate_visualizer_style(*style);
+            style.as_str().to_string()
+        },
+        |menu| config::activate_visualizer_style(menu.original),
+        persist,
+    );
 }
 
 // --- Selector de modo (sub-modal del panel) ---------
@@ -1509,41 +1556,20 @@ fn handle_mode_menu_key(
     app: &mut App,
     persist: impl FnOnce(&str) -> Result<(), String>,
 ) {
-    let len = config::VisualizerMode::options().len();
-    match key.code {
-        KeyCode::Up | KeyCode::Down => {
-            let Some(menu) = app.mode_menu.as_mut() else {
-                return;
-            };
-            let delta = if matches!(key.code, KeyCode::Up) { -1 } else { 1 };
-            menu.selected = move_selection(menu.selected, delta, len);
-            let mode = config::VisualizerMode::options()[menu.selected];
-            // Previsualización en vivo: cambia el modo sin persistir. Cada
-            // modo tiene su propio pintor, así que el fondo cambia al toque
-            // mientras se navega con ↑/↓.
-            config::preview_visualizer_mode(mode);
-        }
-        KeyCode::Enter => {
-            let Some(menu) = app.mode_menu.take() else {
-                return;
-            };
-            let mode = config::VisualizerMode::options()[menu.selected];
-            // Aplica primero (queda en la sesión aunque falle el guardado)
-            // y recién después persiste; un fallo solo deja el aviso.
-            config::activate_visualizer_mode(mode);
-            if let Err(err) = persist(mode.as_str()) {
-                app.error = Some(err);
-            }
-        }
-        KeyCode::Esc => {
-            let Some(menu) = app.mode_menu.take() else {
-                return;
-            };
-            // Restaura el modo con el que se abrió.
-            config::activate_visualizer_mode(menu.original);
-        }
-        _ => {}
-    }
+    handle_menu_key(
+        app,
+        key,
+        |app| &mut app.mode_menu,
+        config::VisualizerMode::options().len(),
+        |i| config::VisualizerMode::options()[i],
+        |mode| config::preview_visualizer_mode(*mode),
+        |mode| {
+            config::activate_visualizer_mode(*mode);
+            mode.as_str().to_string()
+        },
+        |menu| config::activate_visualizer_mode(menu.original),
+        persist,
+    );
 }
 
 // --- Panel de configuración (shell) -------------------------------------
@@ -1618,16 +1644,17 @@ fn handle_settings_panel_key(
     }
 }
 
-/// Filas del sub-modal: una por estilo; ● marca el estilo activo al abrir y
-/// la selección va resaltada como en el menú de temas.
-fn bands_menu_lines(menu: &BandsMenuState) -> Vec<Line<'static>> {
+/// Filas del sub-modal de selección: una por opción; ● marca la opción
+/// activa al abrir y la selección va resaltada. Compartido por los tres
+/// selectores (Temas, Bandas y Modo): cada wrapper resuelve sus filas como
+/// (etiqueta, es-actual).
+fn menu_lines(rows: impl IntoIterator<Item = (String, bool)>, selected: usize) -> Vec<Line<'static>> {
     let colors = theme(); // snapshot coherente para todas las filas
-    config::VisualizerStyle::options()
-        .iter()
+    rows.into_iter()
         .enumerate()
-        .map(|(i, style)| {
-            let marker = if *style == menu.original { "● " } else { "  " };
-            let row_style = if i == menu.selected {
+        .map(|(i, (label, mark))| {
+            let marker = if mark { "● " } else { "  " };
+            let row_style = if i == selected {
                 Style::default()
                     .bg(colors.select_bg)
                     .fg(colors.accent)
@@ -1635,19 +1662,18 @@ fn bands_menu_lines(menu: &BandsMenuState) -> Vec<Line<'static>> {
             } else {
                 Style::default().fg(colors.text)
             };
-            Line::from(Span::styled(
-                format!(" {marker}{} ", style.as_str()),
-                row_style,
-            ))
+            Line::from(Span::styled(format!(" {marker}{label} "), row_style))
         })
         .collect()
 }
 
-/// Modal centrado del selector de bandas, mismo estilo que el de temas.
-fn render_bands_menu(frame: &mut Frame<'_>, menu: &BandsMenuState) {
+/// Modal centrado del sub-modal de selección, mismo estilo para los tres
+/// selectores: fondo limpio + borde acentuado con título y las filas ya
+/// resueltas (`render_*_menu` son wrappers con título y filas de cada uno).
+fn render_menu(frame: &mut Frame<'_>, title: &'static str, lines: Vec<Line<'static>>) {
     let area = frame.area();
     let width = 44.min(area.width.saturating_sub(4)).max(24);
-    let height = (config::VisualizerStyle::options().len() as u16 + 2)
+    let height = (lines.len() as u16 + 2)
         .min(area.height.saturating_sub(2))
         .max(3);
 
@@ -1660,85 +1686,56 @@ fn render_bands_menu(frame: &mut Frame<'_>, menu: &BandsMenuState) {
     let block = Block::bordered()
         .border_style(Style::default().fg(theme().accent))
         .title(Span::styled(
-            " Bandas ",
+            title,
             Style::default().fg(theme().accent).add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
-    frame.render_widget(Paragraph::new(bands_menu_lines(menu)), inner);
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
-/// Filas del sub-modal: una por modo; ● marca el modo activo al abrir y
-/// la selección va resaltada como en el menú de temas.
+/// Filas del sub-modal: una por estilo; ● marca el estilo activo al abrir.
+fn bands_menu_lines(menu: &BandsMenuState) -> Vec<Line<'static>> {
+    let selected = menu.selected;
+    menu_lines(
+        config::VisualizerStyle::options()
+            .iter()
+            .map(|style| (style.as_str().to_string(), *style == menu.original)),
+        selected,
+    )
+}
+
+/// Modal centrado del selector de bandas, mismo estilo que el de temas.
+fn render_bands_menu(frame: &mut Frame<'_>, menu: &BandsMenuState) {
+    render_menu(frame, " Bandas ", bands_menu_lines(menu));
+}
+
+/// Filas del sub-modal: una por modo; ● marca el modo activo al abrir.
 fn mode_menu_lines(menu: &ModeMenuState) -> Vec<Line<'static>> {
-    let colors = theme(); // snapshot coherente para todas las filas
-    config::VisualizerMode::options()
-        .iter()
-        .enumerate()
-        .map(|(i, mode)| {
-            let marker = if *mode == menu.original { "● " } else { "  " };
-            let row_style = if i == menu.selected {
-                Style::default()
-                    .bg(colors.select_bg)
-                    .fg(colors.accent)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(colors.text)
-            };
-            Line::from(Span::styled(
-                format!(" {marker}{} ", mode.as_str()),
-                row_style,
-            ))
-        })
-        .collect()
+    let selected = menu.selected;
+    menu_lines(
+        config::VisualizerMode::options()
+            .iter()
+            .map(|mode| (mode.as_str().to_string(), *mode == menu.original)),
+        selected,
+    )
 }
 
 /// Modal centrado del selector de modo, mismo estilo
 /// que el de bandas.
 fn render_mode_menu(frame: &mut Frame<'_>, menu: &ModeMenuState) {
-    let area = frame.area();
-    let width = 44.min(area.width.saturating_sub(4)).max(24);
-    let height = (config::VisualizerMode::options().len() as u16 + 2)
-        .min(area.height.saturating_sub(2))
-        .max(3);
-
-    let x = area.x + (area.width.saturating_sub(width)) / 2;
-    let y = area.y + (area.height.saturating_sub(height)) / 2;
-    let rect = Rect::new(x, y, width, height);
-
-    frame.render_widget(Clear, rect);
-
-    let block = Block::bordered()
-        .border_style(Style::default().fg(theme().accent))
-        .title(Span::styled(
-            " Modo ",
-            Style::default().fg(theme().accent).add_modifier(Modifier::BOLD),
-        ));
-    let inner = block.inner(rect);
-    frame.render_widget(block, rect);
-    frame.render_widget(Paragraph::new(mode_menu_lines(menu)), inner);
+    render_menu(frame, " Modo ", mode_menu_lines(menu));
 }
 
-/// Filas del modal: una por tema builtin; ● marca el tema activo al abrir y
-/// la selección va resaltada con los colores vivos del tema previsualizado.
+/// Filas del modal: una por tema builtin; ● marca el tema activo al abrir.
 fn theme_menu_lines(menu: &ThemeMenuState) -> Vec<Line<'static>> {
-    let colors = theme(); // snapshot coherente para todas las filas
-    config::builtin_themes()
-        .iter()
-        .enumerate()
-        .map(|(i, (id, _))| {
-            let marker = if *id == menu.original_name { "● " } else { "  " };
-            let style = if i == menu.selected {
-                Style::default()
-                    .bg(colors.select_bg)
-                    .fg(colors.accent)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(colors.text)
-            };
-            Line::from(Span::styled(format!(" {}{} ", marker, id), style))
-        })
-        .collect()
+    let selected = menu.selected;
+    menu_lines(
+        config::builtin_themes()
+            .iter()
+            .map(|(id, _)| (id.to_string(), *id == menu.original_name)),
+        selected,
+    )
 }
 
 fn start_local_playback(app: &mut App, engine: &mut AudioEngine, path: PathBuf) -> bool {
@@ -2209,27 +2206,7 @@ fn render_url_prompt(frame: &mut Frame<'_>, input: &str) {
 
 /// Modal centrado de temas, al estilo del prompt de URL.
 fn render_theme_menu(frame: &mut Frame<'_>, menu: &ThemeMenuState) {
-    let area = frame.area();
-    let width = 44.min(area.width.saturating_sub(4)).max(24);
-    let height = (config::builtin_themes().len() as u16 + 2)
-        .min(area.height.saturating_sub(2))
-        .max(3);
-
-    let x = area.x + (area.width.saturating_sub(width)) / 2;
-    let y = area.y + (area.height.saturating_sub(height)) / 2;
-    let rect = Rect::new(x, y, width, height);
-
-    frame.render_widget(Clear, rect);
-
-    let block = Block::bordered()
-        .border_style(Style::default().fg(theme().accent))
-        .title(Span::styled(
-            " Temas ",
-            Style::default().fg(theme().accent).add_modifier(Modifier::BOLD),
-        ));
-    let inner = block.inner(rect);
-    frame.render_widget(block, rect);
-    frame.render_widget(Paragraph::new(theme_menu_lines(menu)), inner);
+    render_menu(frame, " Temas ", theme_menu_lines(menu));
 }
 
 /// Modal centrado del panel, con el mismo estilo del modal de temas:
