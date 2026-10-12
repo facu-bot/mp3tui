@@ -5863,11 +5863,24 @@ mod tests {
     #[test]
     fn folder_label_shows_the_single_root_or_the_root_count() {
         let mut app = test_app();
-        app.roots = vec![PathBuf::from(r"C:\musica\rock")];
+        // Ruta armada con componentes para que el separador sea el del sistema:
+        // `folder_label` depende de `Path::file_name`, así que un literal con
+        // backslash solo es una ruta con nombre propio en Windows.
+        app.roots = vec![PathBuf::from("musica").join("rock")];
         assert_eq!(library_folder_label(&app), "rock");
 
-        app.roots = vec![PathBuf::from(r"C:\a"), PathBuf::from(r"C:\b")];
+        app.roots = vec![PathBuf::from("a"), PathBuf::from("b")];
         assert_eq!(library_folder_label(&app), "2 carpetas");
+    }
+
+    /// La forma con backslash solo es una ruta con carpeta propia en Windows;
+    /// se conserva la expectativa original en la plataforma donde aplica.
+    #[cfg(windows)]
+    #[test]
+    fn folder_label_shows_the_last_component_of_a_windows_path() {
+        let mut app = test_app();
+        app.roots = vec![PathBuf::from(r"C:\musica\rock")];
+        assert_eq!(library_folder_label(&app), "rock");
     }
 
     #[test]
