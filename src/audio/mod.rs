@@ -193,9 +193,32 @@ struct SessionState {
     /// is_seekable, error) valida `session.id == session_id` bajo este lock.
     id: u64,
     cancel_handle: Option<crate::source::http_stream::CancelHandle>,
+    download_ranges_handle: Option<crate::source::http_stream::DownloadRangesHandle>,
     is_seekable: bool,
     error: Option<AudioError>,
     is_connecting: bool,
+}
+
+/// Mapea rangos de bytes [inicio, fin) a fracciones de la duración total [0.0, 1.0].
+///
+/// Nota de aproximación:
+/// Se asume proporcionalidad directa entre bytes descargados y duración de la pista.
+/// Para audios con bitrate constante (CBR) o casi constante (CBR-ish en MP3/AAC),
+/// esta aproximación es directa y precisa para la barra de progreso sin requerir
+/// demultiplexar y parsear todos los encabezados del flujo.
+pub fn ranges_to_fractions(ranges: &[(u64, u64)], total_len: u64) -> Vec<(f32, f32)> {
+    if total_len == 0 {
+        return Vec::new();
+    }
+    let mut fractions = Vec::new();
+    for &(start, end) in ranges {
+        let s = (start.min(total_len) as f64 / total_len as f64).clamp(0.0, 1.0) as f32;
+        let e = (end.min(total_len) as f64 / total_len as f64).clamp(0.0, 1.0) as f32;
+        if e > s {
+            fractions.push((s, e));
+        }
+    }
+    fractions
 }
 
 #[cfg(test)]
@@ -284,6 +307,7 @@ impl AudioEngine {
                 session: Mutex::new(SessionState {
                     id: 0,
                     cancel_handle: None,
+                    download_ranges_handle: None,
                     is_seekable: true,
                     error: None,
                     is_connecting: false,
@@ -331,6 +355,7 @@ impl AudioEngine {
             self.shared.session_id.store(session.id, Ordering::Release);
             session.error = None;
             session.cancel_handle = None;
+            session.download_ranges_handle = None;
             session.is_seekable = is_seekable;
             session.is_connecting = matches!(input, MediaInput::Url(_));
             session.id
@@ -549,6 +574,7 @@ impl AudioEngine {
             self.shared.session_id.store(session.id, Ordering::Release);
             session.is_seekable = false;
             session.is_connecting = false;
+            session.download_ranges_handle = None;
             // No se borra `session.error`: el error de una pista que falló debe
             // seguir disponible para que la UI lo drene vía `take_error()`, incluso si
             // se invoca `stop()` antes del drenaje. Se limpia recién al iniciar un nuevo play.
@@ -585,6 +611,21 @@ impl AudioEngine {
             .map(|s| s.is_connecting)
             .unwrap_or(false)
             && self.shared.state.load(Ordering::Acquire) == STATE_PLAYING
+    }
+
+    /// Fracciones precargadas [inicio, fin) en [0.0, 1.0] para la sesión de URL activa.
+    ///
+    /// Retorna `None` para reproducción local (el archivo está disponible en su totalidad
+    /// localmente, la UI dibuja la barra estándar sin secciones de precarga) o para streams
+    /// sin longitud conocida o sin soporte Range.
+    pub fn buffered_fractions(&self) -> Option<Vec<(f32, f32)>> {
+        if self.shared.state.load(Ordering::Acquire) == STATE_STOPPED {
+            return None;
+        }
+        let session = self.shared.session.lock().ok()?;
+        let handle = session.download_ranges_handle.as_ref()?;
+        let (ranges, total_len) = handle.downloaded_ranges();
+        Some(ranges_to_fractions(&ranges, total_len))
     }
 
     pub fn is_paused(&self) -> bool {
@@ -1033,6 +1074,7 @@ fn decode_url_pipeline(
     };
 
     let cancel_handle = http_stream.cancel_handle();
+    let ranges_handle = http_stream.download_ranges_handle();
     #[cfg(test)]
     {
         let hook = shared
@@ -1056,6 +1098,7 @@ fn decode_url_pipeline(
             return;
         }
         session.cancel_handle = Some(cancel_handle.clone());
+        session.download_ranges_handle = ranges_handle;
         session.is_seekable = info.content_length.is_some();
     }
 
@@ -2664,4 +2707,122 @@ mod tests {
         );
         engine.stop();
     }
+
+    #[test]
+    fn test_ranges_to_fractions_pure() {
+        assert_eq!(ranges_to_fractions(&[], 1000), vec![]);
+        assert_eq!(ranges_to_fractions(&[(0, 1000)], 1000), vec![(0.0, 1.0)]);
+        assert_eq!(
+            ranges_to_fractions(&[(0, 250), (500, 750)], 1000),
+            vec![(0.0, 0.25), (0.5, 0.75)]
+        );
+        // Vacíos o clamping
+        assert_eq!(ranges_to_fractions(&[(0, 500)], 0), vec![]);
+        assert_eq!(ranges_to_fractions(&[(500, 500)], 1000), vec![]);
+    }
+
+    #[test]
+    fn test_buffered_fractions_local_returns_none() {
+        let engine = match AudioEngine::new() {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        assert_eq!(engine.buffered_fractions(), None);
+    }
+
+    #[test]
+    fn test_buffered_fractions_sequential_url_without_length_is_none() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let wav_data = make_test_wav(4410); // 0.1 s de audio
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf);
+            // Sin Content-Length ni Range: el stream queda en modo secuencial
+            // sin largo conocido → no hay secciones que pintar.
+            let response =
+                "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nConnection: close\r\n\r\n";
+            let _ = socket.write_all(response.as_bytes());
+            let _ = socket.write_all(&wav_data);
+        });
+
+        let url = format!("http://127.0.0.1:{port}/stream.wav");
+        let mut engine = match AudioEngine::new() {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        engine.play_url(&url).expect("play_url");
+
+        // Esperar a que el hilo de red detecte la ausencia de largo.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while engine.is_seekable() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !engine.is_seekable(),
+            "el stream sin Content-Length debe quedar como no seekable"
+        );
+        assert_eq!(
+            engine.buffered_fractions(),
+            None,
+            "modo secuencial sin largo no debe exponer secciones de precarga"
+        );
+        engine.stop();
+    }
+
+    #[test]
+    fn test_buffered_fractions_stale_session_never_leaks_after_stop() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let wav_data = make_test_wav(4410);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf);
+            let response =
+                "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nConnection: close\r\n\r\n";
+            let _ = socket.write_all(response.as_bytes());
+            let _ = socket.write_all(&wav_data);
+        });
+
+        let url = format!("http://127.0.0.1:{port}/stream.wav");
+        let mut engine = match AudioEngine::new() {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        let before = engine.shared.session_id.load(Ordering::Acquire);
+        engine.play_url(&url).expect("play_url");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while engine.is_seekable() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_ne!(
+            engine.shared.session_id.load(Ordering::Acquire),
+            before,
+            "play_url debe iniciar una sesión nueva"
+        );
+
+        engine.stop();
+        assert_eq!(
+            engine.buffered_fractions(),
+            None,
+            "tras stop() no debe filtrarse ninguna sesión vieja"
+        );
+
+        // El handle de rangos queda limpio: una sesión cancelada nunca puede
+        // filtrar secciones ajenas a la sesión actual.
+        let session = engine.shared.session.lock().unwrap();
+        assert!(session.download_ranges_handle.is_none());
+        assert!(session.id > before, "stop() debe cerrar la sesión activa");
+    }
 }
+

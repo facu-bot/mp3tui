@@ -1448,12 +1448,17 @@ fn render_player_info(frame: &mut Frame<'_>, area: Rect, app: &App, engine: &Aud
             theme().accent,
             theme().dim,
             inner.width as usize,
+            theme().buffered,
+            &[],
         )),
         rows[row],
     );
 
     let position = engine.position();
     let duration = engine.duration().or_else(|| current_track_duration(app));
+    // Secciones precargadas de la sesión de URL actual; se consultan en cada
+    // frame para que la barra se actualice mientras descarga.
+    let buffered: Vec<(f32, f32)> = engine.buffered_fractions().unwrap_or_default();
     match duration.filter(|total| !total.is_zero()) {
         Some(total) => {
             let ratio = (position.as_secs_f64() / total.as_secs_f64()).clamp(0.0, 1.0);
@@ -1466,6 +1471,8 @@ fn render_player_info(frame: &mut Frame<'_>, area: Rect, app: &App, engine: &Aud
                     theme().ok,
                     theme().dim,
                     inner.width as usize,
+                    theme().buffered,
+                    &buffered,
                 )),
                 rows[row + 1],
             );
@@ -1482,11 +1489,71 @@ fn render_player_info(frame: &mut Frame<'_>, area: Rect, app: &App, engine: &Aud
     }
 }
 
+/// Estado de una celda de la barra de progreso (T2 precarga).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BarCellKind {
+    /// Parte ya reproducida (━).
+    Played,
+    /// Punta de la posición actual (╸).
+    Tip,
+    /// Sección descargada pero no reproducida (░ con el color `buffered`).
+    Buffered,
+    /// Track vacío (░ gris).
+    Empty,
+}
+
+/// Mapea (ancho, fracción reproducida, secciones precargadas) a un estilo por
+/// celda, de izquierda a derecha. Función pura: la barra la usa para pintar y
+/// los tests la cubren sin tocar terminales.
+///
+/// Reglas:
+/// - `played` y cada fracción `[s, e)` fuera de `[0,1]` se clampan.
+/// - Un rango degenerado (e <= s tras clampar) no pinta nada.
+/// - La celda `i` cubre el intervalo `[i/ancho, (i+1)/ancho)`: se pinta
+///   `Buffered` si algún rango la toca (overlap no vacío). Un rango diminuto
+///   no vacío pinta al menos la celda que toca; un rango vacío, ninguna.
+/// - Las celdas reproducidas conservan `Played`/`Tip` aunque un rango las cubra.
+/// - `ancho == 0` devuelve un vec vacío (nunca panica).
+fn progress_bar_cells(width: usize, played: f64, buffered: &[(f32, f32)]) -> Vec<BarCellKind> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let played = played.clamp(0.0, 1.0);
+    let filled = (played * width as f64).round() as usize;
+    let have_tip = filled > 0 && filled < width;
+
+    let mut cells = Vec::with_capacity(width);
+    for i in 0..width {
+        if i < filled {
+            cells.push(if have_tip && i == filled - 1 {
+                BarCellKind::Tip
+            } else {
+                BarCellKind::Played
+            });
+            continue;
+        }
+        let covered = buffered.iter().any(|&(s, e)| {
+            let s = (s as f64).clamp(0.0, 1.0);
+            let e = (e as f64).clamp(0.0, 1.0);
+            e > s && s < (i + 1) as f64 / width as f64 && e > i as f64 / width as f64
+        });
+        cells.push(if covered {
+            BarCellKind::Buffered
+        } else {
+            BarCellKind::Empty
+        });
+    }
+    cells
+}
+
 /// Mejora 4: construye una barra de progreso visual con ━, ╸ y ░.
 ///
 /// Formato: `label [━━━━╸░░░░]  suffix`
 /// `filled_ratio` en `[0.0, 1.0]`. `total_width` es el ancho disponible de
-/// la fila completa (en celdas de terminal).
+/// la fila completa (en celdas de terminal). Las secciones `buffered`
+/// (fracciones `[0.0, 1.0]`) se pintan con `buffered_color` sobre el track
+/// vacío, sin tocar la parte ya reproducida.
+#[allow(clippy::too_many_arguments)]
 fn build_bar(
     label: &str,
     filled_ratio: f64,
@@ -1494,6 +1561,8 @@ fn build_bar(
     filled_color: Color,
     empty_color: Color,
     total_width: usize,
+    buffered_color: Color,
+    buffered: &[(f32, f32)],
 ) -> Line<'static> {
     // Ancho de la barra interna: descontar etiqueta + " [" + "] " + sufijo.
     let overhead = label.chars().count() + 2 + 2 + suffix.chars().count();
@@ -1513,32 +1582,32 @@ fn build_bar(
         ]);
     }
 
-    let filled = (filled_ratio.clamp(0.0, 1.0) * bar_chars as f64).round() as usize;
-
-    let (filled_str, tip_str, empty_str) = if filled == 0 {
-        (String::new(), String::new(), "░".repeat(bar_chars))
-    } else if filled >= bar_chars {
-        ("━".repeat(bar_chars), String::new(), String::new())
-    } else {
-        // filled - 1 de ━ + 1 de ╸ + resto de ░
-        let dashes = if filled > 1 { "━".repeat(filled - 1) } else { String::new() };
-        let empty = "░".repeat(bar_chars - filled);
-        (dashes, "╸".to_string(), empty)
-    };
+    // Función pura: decide el estilo de cada celda (reproducida / punta /
+    // precargada / vacía) y agrupa contiguos en spans.
+    let kinds = progress_bar_cells(bar_chars, filled_ratio, buffered);
 
     let mut spans = vec![
         label_span,
         Span::styled(" [", Style::default().fg(empty_color)),
     ];
-    if !filled_str.is_empty() {
-        spans.push(Span::styled(filled_str, Style::default().fg(filled_color)));
+    let mut i = 0;
+    while i < kinds.len() {
+        let kind = kinds[i];
+        let mut j = i + 1;
+        while j < kinds.len() && kinds[j] == kind {
+            j += 1;
+        }
+        let (ch, color) = match kind {
+            BarCellKind::Played => ("━", filled_color),
+            BarCellKind::Tip => ("╸", filled_color),
+            BarCellKind::Buffered => ("░", buffered_color),
+            BarCellKind::Empty => ("░", empty_color),
+        };
+        let count = j - i;
+        spans.push(Span::styled(ch.repeat(count), Style::default().fg(color)));
+        i = j;
     }
-    if !tip_str.is_empty() {
-        spans.push(Span::styled(tip_str, Style::default().fg(filled_color)));
-    }
-    if !empty_str.is_empty() {
-        spans.push(Span::styled(empty_str, Style::default().fg(empty_color)));
-    }
+
     spans.push(Span::styled("] ", Style::default().fg(empty_color)));
     spans.push(Span::styled(suffix.to_string(), Style::default().fg(theme().text)));
 
@@ -3637,5 +3706,108 @@ mod tests {
         record_history_entry(&mut app, "http://user:pass@example.com/secret.mp3", "Secret");
         assert_eq!(app.history.len(), 1);
         assert_eq!(app.history.get(0).unwrap().url, "http://example.com/secret.mp3");
+    }
+
+    #[test]
+    fn progress_cells_keeps_today_played_tip_and_gray_track() {
+        // Sin secciones precargadas: exactamente el look actual de la barra
+        // (Played…, Tip, Empty…), para que lo local no cambie.
+        assert_eq!(
+            progress_bar_cells(10, 0.5, &[]),
+            vec![
+                BarCellKind::Played,
+                BarCellKind::Played,
+                BarCellKind::Played,
+                BarCellKind::Played,
+                BarCellKind::Tip,
+                BarCellKind::Empty,
+                BarCellKind::Empty,
+                BarCellKind::Empty,
+                BarCellKind::Empty,
+                BarCellKind::Empty,
+            ]
+        );
+    }
+
+    #[test]
+    fn progress_cells_paints_buffered_sections_and_keeps_gaps() {
+        // Bounds exactamente representables en f32 para evitar que 0.3/0.7
+        // toquen la celda del borde (0.3f32 > 0.3 → cubre la celda 3).
+        let cells = progress_bar_cells(10, 0.0, &[(0.0, 0.25), (0.75, 1.0)]);
+        assert_eq!(
+            cells,
+            vec![
+                BarCellKind::Buffered,
+                BarCellKind::Buffered,
+                BarCellKind::Buffered,
+                BarCellKind::Empty,
+                BarCellKind::Empty,
+                BarCellKind::Empty,
+                BarCellKind::Empty,
+                BarCellKind::Buffered,
+                BarCellKind::Buffered,
+                BarCellKind::Buffered,
+            ]
+        );
+    }
+
+    #[test]
+    fn progress_cells_played_wins_over_buffered() {
+        // Las celdas ya reproducidas conservan su estilo aunque un rango las cubra.
+        let cells = progress_bar_cells(10, 0.6, &[(0.0, 1.0)]);
+        assert_eq!(
+            cells,
+            vec![
+                BarCellKind::Played,
+                BarCellKind::Played,
+                BarCellKind::Played,
+                BarCellKind::Played,
+                BarCellKind::Played,
+                BarCellKind::Tip,
+                BarCellKind::Buffered,
+                BarCellKind::Buffered,
+                BarCellKind::Buffered,
+                BarCellKind::Buffered,
+            ]
+        );
+    }
+
+    #[test]
+    fn progress_cells_tiny_range_paints_the_cell_it_touches() {
+        // Rango diminuto no vacío: pinta al menos la celda que toca (0.505 cae
+        // dentro de la celda 50 en un ancho 100). Rango degenerado (e <= s): nada.
+        let cells = progress_bar_cells(100, 0.0, &[(0.505, 0.5055)]);
+        let mut expected = vec![BarCellKind::Empty; 100];
+        expected[50] = BarCellKind::Buffered;
+        assert_eq!(cells, expected);
+
+        let cells = progress_bar_cells(100, 0.0, &[(0.5, 0.5)]);
+        assert!(
+            cells.iter().all(|&k| k == BarCellKind::Empty),
+            "un rango vacío no debe pintar ninguna celda"
+        );
+    }
+
+    #[test]
+    fn progress_cells_clamps_and_never_panics() {
+        // Ancho 0 → sin celdas; ancho 1 → una sola celda bien resuelta.
+        assert!(progress_bar_cells(0, 0.5, &[(0.0, 1.0)]).is_empty());
+        assert_eq!(
+            progress_bar_cells(1, 0.0, &[(0.0, 1.0)]),
+            vec![BarCellKind::Buffered]
+        );
+        assert_eq!(progress_bar_cells(1, 1.0, &[]), vec![BarCellKind::Played]);
+
+        // Fracciones fuera de [0,1] se clampan.
+        assert_eq!(
+            progress_bar_cells(10, 1.5, &[(0.0, 1.0)]),
+            vec![BarCellKind::Played; 10],
+            "played > 1 se clampa a barra llena"
+        );
+        let cells = progress_bar_cells(10, 0.0, &[(-0.5, 0.05), (0.95, 1.5)]);
+        let mut expected = vec![BarCellKind::Empty; 10];
+        expected[0] = BarCellKind::Buffered;
+        expected[9] = BarCellKind::Buffered;
+        assert_eq!(cells, expected, "los rangos se clampan a [0,1]");
     }
 }

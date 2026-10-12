@@ -238,6 +238,8 @@ pub struct Theme {
     pub spectrum_mid: Color,
     /// Gradiente del visualizador: pico.
     pub spectrum_high: Color,
+    /// Secciones precargadas en la barra de progreso (estilo franja YouTube).
+    pub buffered: Color,
 }
 
 impl Default for Theme {
@@ -266,6 +268,8 @@ impl Default for Theme {
             spectrum_low: Color::Rgb(0x89, 0x92, 0xA7),  // dragonViolet
             spectrum_mid: Color::Rgb(0x7F, 0xB4, 0xCA),  // springBlue
             spectrum_high: Color::Rgb(0xC4, 0x74, 0x6E), // dragonRed
+            // dragonSilver / dragonGray: franja clara sobre el gris de la barra.
+            buffered: Color::Rgb(0xA6, 0xA6, 0x9C),
         }
     }
 }
@@ -287,6 +291,7 @@ fn parse_theme(
             "spectrum_low" => &mut theme.spectrum_low,
             "spectrum_mid" => &mut theme.spectrum_mid,
             "spectrum_high" => &mut theme.spectrum_high,
+            "buffered" => &mut theme.buffered,
             other => {
                 warnings.push(format!("[theme] clave desconocida «{other}»"));
                 continue;
@@ -1248,4 +1253,19 @@ mod tests {
         assert!(config.warnings[0].contains("open_url"), "{:?}", config.warnings);
         assert!(config.warnings[0].contains("shuffle"), "{:?}", config.warnings);
     }
+
+    #[test]
+    fn test_theme_buffered_color_default_and_custom_parse() {
+        assert_eq!(Theme::default().buffered, Color::Rgb(0xA6, 0xA6, 0x9C));
+
+        let config = parse(
+            r##"
+            [theme]
+            buffered = "#123456"
+            "##,
+        );
+        assert_eq!(config.theme.buffered, Color::Rgb(0x12, 0x34, 0x56));
+        assert!(config.warnings.is_empty(), "warnings: {:?}", config.warnings);
+    }
 }
+

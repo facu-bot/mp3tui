@@ -137,6 +137,7 @@ warn = "#C4B28A"
 spectrum_low = "#8992A7" # gradiente del visualizador (violeta)
 spectrum_mid = "#7FB4CA" # celeste
 spectrum_high = "#C4746E" # rojo (solo en los picos)
+buffered = "#A6A69C"     # secciones precargadas en la barra de progreso
 
 [keybindings]
 quit = "q,esc"           # una tecla o lista separada por comas
@@ -185,7 +186,7 @@ mp3tui permite reproducir música remota directamente desde la terminal o desde 
 - **YouTube y páginas web:** delegación automática en la herramienta opcional `yt-dlp`. Si no está instalada, mp3tui muestra un aviso con instrucciones para instalarla:
   - Windows: `winget install yt-dlp` o `pip install yt-dlp`
   - Linux / macOS: `pip install yt-dlp` o el gestor de paquetes de tu distribución.
-- **Streaming y buffer:** el audio se reproduce en streaming directamente a memoria (nada se guarda en disco). Seek (±5 s) funciona si el servidor reporta tamaño (`Content-Length`) y soporta peticiones de rango (`Range: bytes=...`).
+- **Streaming y buffer:** el audio se reproduce en streaming directamente a memoria (nada se guarda en disco). Seek (±5 s) funciona si el servidor reporta tamaño (`Content-Length`) y soporta peticiones de rango (`Range: bytes=...`). La barra de progreso pinta las secciones ya descargadas (pero aún no reproducidas) con el color `buffered` del tema, a la manera de la franja clara de YouTube; se actualiza en cada frame mientras descarga.
 - **Historial persistente:** las canciones reproducidas por URL con éxito se registran automáticamente en un historial (`history.toml` en el directorio de configuración, ej. `%APPDATA%\mp3tui\history.toml`):
   - Almacena hasta 20 entradas (las más recientes primero, sin duplicados).
   - Solo guarda título y enlace original (nunca URLs temporales expirables de YouTube ni audio en disco).

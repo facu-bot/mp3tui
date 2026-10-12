@@ -202,10 +202,74 @@ impl fmt::Debug for HttpStream {
     }
 }
 
+/// Combina estados contiguos de fragmentos descargados en rangos de bytes [inicio, fin).
+pub fn merge_chunk_ranges(chunks_done: &[bool], chunk_size: usize, total_len: u64) -> Vec<(u64, u64)> {
+    if chunks_done.is_empty() || chunk_size == 0 || total_len == 0 {
+        return Vec::new();
+    }
+
+    let mut ranges = Vec::new();
+    let mut i = 0;
+    while i < chunks_done.len() {
+        if chunks_done[i] {
+            let start_chunk = i;
+            while i < chunks_done.len() && chunks_done[i] {
+                i += 1;
+            }
+            let end_chunk = i;
+            let start_byte = (start_chunk as u64 * chunk_size as u64).min(total_len);
+            let end_byte = (end_chunk as u64 * chunk_size as u64).min(total_len);
+            if end_byte > start_byte {
+                ranges.push((start_byte, end_byte));
+            }
+        } else {
+            i += 1;
+        }
+    }
+    ranges
+}
+
+impl RangedShared {
+    pub fn downloaded_ranges(&self) -> (Vec<(u64, u64)>, u64) {
+        let is_done: Vec<bool> = match self.state.lock() {
+            Ok(state) => state
+                .chunks
+                .iter()
+                .map(|c| matches!(c, ChunkSlot::Done(_)))
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        let ranges = merge_chunk_ranges(&is_done, self.chunk_size, self.total_len);
+        (ranges, self.total_len)
+    }
+}
+
+/// Handle compartible para consultar las secciones descargadas de un stream con soporte Range.
+#[derive(Clone)]
+pub struct DownloadRangesHandle {
+    shared: Arc<RangedShared>,
+}
+
+impl DownloadRangesHandle {
+    pub fn downloaded_ranges(&self) -> (Vec<(u64, u64)>, u64) {
+        self.shared.downloaded_ranges()
+    }
+}
+
 impl HttpStream {
     /// Obtiene un handle clonable para cancelar la descarga asociada a este stream.
     pub fn cancel_handle(&self) -> CancelHandle {
         self.cancel.clone()
+    }
+
+    /// Obtiene un handle compartible para consultar secciones descargadas si el stream soporta Range.
+    pub fn download_ranges_handle(&self) -> Option<DownloadRangesHandle> {
+        match &self.storage {
+            StreamStorage::Ranged { shared } => Some(DownloadRangesHandle {
+                shared: Arc::clone(shared),
+            }),
+            StreamStorage::Sequential { .. } => None,
+        }
     }
 }
 
@@ -1688,4 +1752,57 @@ mod tests {
         assert_eq!(data.len(), expected_payload.len());
         assert_eq!(data, *expected_payload);
     }
+
+    #[test]
+    fn test_merge_chunk_ranges_pure() {
+        assert_eq!(merge_chunk_ranges(&[], 100, 200), vec![]);
+        assert_eq!(merge_chunk_ranges(&[false, false], 100, 200), vec![]);
+        assert_eq!(merge_chunk_ranges(&[true, true], 100, 200), vec![(0, 200)]);
+        assert_eq!(
+            merge_chunk_ranges(&[true, false, true], 100, 300),
+            vec![(0, 100), (200, 300)]
+        );
+        // Último chunk parcial
+        assert_eq!(merge_chunk_ranges(&[true, true], 100, 150), vec![(0, 150)]);
+        assert_eq!(
+            merge_chunk_ranges(&[false, true], 100, 150),
+            vec![(100, 150)]
+        );
+        // Casos borde
+        assert_eq!(merge_chunk_ranges(&[true], 100, 0), vec![]);
+        assert_eq!(merge_chunk_ranges(&[true], 0, 100), vec![]);
+    }
+
+    #[test]
+    fn test_download_ranges_handle_ranged_and_sequential() {
+        let (_prod, seq_stream) = StreamProducer::new_sequential(Some(1000), false);
+        assert!(seq_stream.download_ranges_handle().is_none());
+
+        // Ranged handle
+        let canceled = Arc::new(AtomicBool::new(false));
+        let condvar = Arc::new(Condvar::new());
+        let shared = Arc::new(RangedShared {
+            state: Mutex::new(RangedState {
+                chunks: vec![
+                    ChunkSlot::Done(vec![0; 100]),
+                    ChunkSlot::Missing,
+                    ChunkSlot::Done(vec![0; 50]),
+                ],
+                wanted_offset: None,
+                error: None,
+            }),
+            condvar,
+            canceled,
+            total_len: 250,
+            chunk_size: 100,
+        });
+
+        let handle = DownloadRangesHandle {
+            shared: Arc::clone(&shared),
+        };
+        let (ranges, total) = handle.downloaded_ranges();
+        assert_eq!(total, 250);
+        assert_eq!(ranges, vec![(0, 100), (200, 250)]);
+    }
 }
+
