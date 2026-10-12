@@ -135,6 +135,8 @@ Con el mouse activado (por defecto):
 - **Botones** debajo del progreso: `◀◀` anterior, `▶` / `▮▮` reproducir o pausar,
   `▶▶` siguiente, `aleatorio` y `repetir` (resaltados cuando están activos).
 - **Rueda** sobre el reproductor: sube o baja el volumen.
+- **Footer de atajos:** cada atajo es un chip (la tecla resaltada y su acción);
+  clickearlo hace lo mismo que apretar esa tecla.
 - Con el prompt de URL o el menú de temas abiertos, el mouse no actúa sobre lo
   que queda debajo.
 

@@ -317,6 +317,8 @@ struct HitMap {
     player: Option<Rect>,
     /// Botones de transporte dibujados (área y botón).
     buttons: Vec<(Rect, Button)>,
+    /// Chips del footer: área y tecla que simulan al clickearlos.
+    chips: Vec<(Rect, KeyCode)>,
 }
 
 /// Arrastre en curso: sigue a la barra donde empezó aunque el puntero salga.
@@ -344,6 +346,78 @@ enum MouseAction {
     SetVolume(f64),
     VolumeStep(i8),
     Press(Button),
+    /// Clic en un chip del footer: simula la tecla.
+    Key(KeyCode),
+}
+
+/// Una línea del footer («tecla: acción   tecla: acción») como chips: la tecla
+/// resaltada como keycap y la acción tenue. Devuelve los spans (mismo texto)
+/// y, por entrada, columna inicial, ancho y el texto de las teclas.
+fn footer_chip_spans(text: &str) -> (Vec<Span<'static>>, Vec<(u16, u16, String)>) {
+    const SEPARATOR: &str = "   ";
+    let keycap = Style::default()
+        .fg(theme().accent)
+        .bg(theme().select_bg)
+        .add_modifier(Modifier::BOLD);
+    let label = Style::default().fg(theme().dim);
+
+    let mut spans = Vec::new();
+    let mut entries = Vec::new();
+    let mut rest = text;
+    let mut column: u16 = 0;
+    let push_plain = |spans: &mut Vec<Span<'static>>, piece: &str, column: &mut u16| {
+        if !piece.is_empty() {
+            spans.push(Span::styled(piece.to_string(), label));
+            *column += piece.chars().count() as u16;
+        }
+    };
+
+    let leading = rest.len() - rest.trim_start().len();
+    push_plain(&mut spans, &rest[..leading], &mut column);
+    rest = &rest[leading..];
+
+    while !rest.is_empty() {
+        let (segment, separator, tail) = match rest.find(SEPARATOR) {
+            Some(at) => {
+                let after = &rest[at..];
+                let spaces = after.len() - after.trim_start().len();
+                (&rest[..at], &after[..spaces], &after[spaces..])
+            }
+            None => (rest, "", ""),
+        };
+        match segment.split_once(": ") {
+            Some((keys, action)) => {
+                let width = segment.chars().count() as u16;
+                entries.push((column, width, keys.to_string()));
+                spans.push(Span::styled(keys.to_string(), keycap));
+                spans.push(Span::styled(format!(": {action}"), label));
+                column += width;
+            }
+            None => push_plain(&mut spans, segment, &mut column),
+        }
+        push_plain(&mut spans, separator, &mut column);
+        rest = tail;
+    }
+    (spans, entries)
+}
+
+/// Tecla configurada cuya etiqueta abre el texto de un chip («s», «←/→»,
+/// «Esc×2»): la primera de la lista. `None` si no es un atajo.
+fn key_for_chip(keys_text: &str) -> Option<KeyCode> {
+    let first = keys_text.split(['/', ' ']).next()?.trim_end_matches("×2");
+    let keys = &config::config().keys;
+    [
+        &keys.quit, &keys.play_pause, &keys.volume_up, &keys.volume_down,
+        &keys.seek_back, &keys.seek_fwd, &keys.prev_track, &keys.next_track,
+        &keys.shuffle, &keys.repeat, &keys.search, &keys.speed_up,
+        &keys.speed_down, &keys.explorer, &keys.move_up, &keys.move_down,
+        &keys.page_up, &keys.page_down, &keys.home, &keys.end, &keys.select,
+        &keys.back, &keys.open_url, &keys.theme_menu,
+    ]
+    .into_iter()
+    .flatten()
+    .copied()
+    .find(|code| config::key_label(*code) == first)
 }
 
 /// Fila de controles clickeables: la línea a dibujar y, por botón, la columna
@@ -419,6 +493,8 @@ fn mouse_action(hit: &HitMap, drag: Option<Drag>, event: MouseEvent) -> (MouseAc
             let point = ratatui::layout::Position::new(column, row);
             if let Some((_, button)) = hit.buttons.iter().find(|(area, _)| area.contains(point)) {
                 (MouseAction::Press(*button), None)
+            } else if let Some((_, key)) = hit.chips.iter().find(|(area, _)| area.contains(point)) {
+                (MouseAction::Key(*key), None)
             } else if let Some(bar) = hit.progress.filter(|bar| bar.contains(column, row)) {
                 (MouseAction::SeekRatio(bar.ratio(column)), Some(Drag::Progress(None)))
             } else if let Some(bar) = hit.volume.filter(|bar| bar.contains(column, row)) {
@@ -480,6 +556,7 @@ fn handle_mouse(event: MouseEvent, app: &mut App, engine: &mut AudioEngine) {
         MouseAction::Press(Button::Next) => play_step(app, engine, 1),
         MouseAction::Press(Button::Shuffle) => toggle_shuffle(app),
         MouseAction::Press(Button::Repeat) => app.repeat = app.repeat.cycle(),
+        MouseAction::Key(code) => handle_key(KeyEvent::new(code, KeyModifiers::NONE), app, engine),
     }
 }
 
@@ -3042,8 +3119,41 @@ fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
 }
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App, compact: bool) {
+    // Mismo texto que `footer_lines`, dibujado como chips; cada chip que es un
+    // atajo queda clickeable (simula su tecla).
+    let inner = Rect::new(
+        area.x.saturating_add(1),
+        area.y.saturating_add(1),
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(2),
+    );
+    let mut lines = Vec::new();
+    {
+        let mut hit = app.hit.borrow_mut();
+        for (index, line) in footer_lines(app, compact).into_iter().enumerate() {
+            let text: String = line.spans.iter().map(|span| span.content.as_ref()).collect();
+            let (spans, entries) = footer_chip_spans(&text);
+            lines.push(Line::from(spans));
+            let Ok(index) = u16::try_from(index) else { continue };
+            if index >= inner.height {
+                continue;
+            }
+            let line_width = text.chars().count() as u16;
+            let x0 = inner.x + inner.width.saturating_sub(line_width) / 2;
+            let right = inner.x + inner.width;
+            for (start, width, keys) in entries {
+                let Some(code) = key_for_chip(&keys) else { continue };
+                let x = x0.saturating_add(start);
+                if x >= right {
+                    continue;
+                }
+                let width = width.min(right - x);
+                hit.chips.push((Rect::new(x, inner.y + index, width, 1), code));
+            }
+        }
+    }
     frame.render_widget(
-        Paragraph::new(footer_lines(app, compact))
+        Paragraph::new(lines)
             .block(
                 Block::bordered()
                     .border_style(Style::default().fg(theme().dim))
@@ -3880,6 +3990,7 @@ mod tests {
             volume: Some(BarHit { x: 20, y: 5, width: 11 }),
             player: Some(Rect::new(0, 0, 100, 20)),
             buttons: Vec::new(),
+            chips: Vec::new(),
         }
     }
 
@@ -4102,6 +4213,87 @@ mod tests {
             &mut engine,
         );
         assert!(app.shuffle, "el clic activa el aleatorio");
+    }
+
+    #[test]
+    fn footer_chips_keep_the_text_and_highlight_keys() {
+        let text = " s: shuffle   ←/→: ±5s   volumen ↑/↓: con el panel cerrado";
+        let (spans, entries) = footer_chip_spans(text);
+        let joined: String = spans.iter().map(|span| span.content.as_ref()).collect();
+        assert_eq!(joined, text, "el texto no cambia");
+        let keycap = spans
+            .iter()
+            .find(|span| span.content == "s")
+            .expect("la tecla es un span propio");
+        assert_eq!(keycap.style.bg, Some(theme().select_bg), "keycap con fondo");
+        let keys: Vec<&str> = entries.iter().map(|(_, _, k)| k.as_str()).collect();
+        assert_eq!(keys, vec!["s", "←/→", "volumen ↑/↓"]);
+        let (start, width, _) = &entries[0];
+        assert_eq!((*start, *width), (1, "s: shuffle".chars().count() as u16));
+    }
+
+    #[test]
+    fn chip_keys_resolve_to_configured_shortcuts() {
+        assert_eq!(key_for_chip("s"), Some(KeyCode::Char('s')));
+        assert_eq!(key_for_chip("←/→"), Some(KeyCode::Left));
+        assert_eq!(key_for_chip("Esc×2"), Some(KeyCode::Esc));
+        assert_eq!(key_for_chip("espacio"), Some(KeyCode::Char(' ')));
+        assert_eq!(key_for_chip("volumen ↑/↓"), None, "texto suelto, no es un atajo");
+    }
+
+    #[test]
+    fn click_on_a_footer_chip_sends_its_key() {
+        let mut hit = sample_hit();
+        hit.chips = vec![(Rect::new(40, 25, 10, 1), KeyCode::Char('s'))];
+        let (action, drag) =
+            mouse_action(&hit, None, mouse(MouseEventKind::Down(MouseButton::Left), 42, 25));
+        assert_eq!((action, drag), (MouseAction::Key(KeyCode::Char('s')), None));
+    }
+
+    #[test]
+    fn clicking_the_shuffle_chip_in_the_footer_toggles_shuffle() {
+        let Some(mut engine) = engine_or_skip() else { return };
+        let mut app = library_with_three();
+        app.mode = Mode::Player;
+        app.has_player = true;
+        let buffer = render_player_frame(&app, &engine);
+        let chip = app
+            .hit
+            .borrow()
+            .chips
+            .iter()
+            .find(|(_, key)| *key == KeyCode::Char('s'))
+            .map(|(rect, _)| *rect)
+            .expect("chip «s: shuffle» registrado");
+        let row: String = (chip.x..chip.x + chip.width)
+            .map(|x| buffer[(x, chip.y)].symbol().to_string())
+            .collect();
+        assert!(row.starts_with("s: shuffle"), "el área es la del chip dibujado: {row:?}");
+        handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), chip.x, chip.y),
+            &mut app,
+            &mut engine,
+        );
+        assert!(app.shuffle);
+    }
+
+    #[test]
+    fn registered_buttons_are_actually_drawn_on_small_terminals() {
+        let Some(engine) = engine_or_skip() else { return };
+        let mut app = library_with_three();
+        app.mode = Mode::Player;
+        app.has_player = true;
+        for height in [8u16, 10, 12, 14] {
+            let backend = ratatui::backend::TestBackend::new(100, height);
+            let mut terminal = ratatui::Terminal::new(backend).expect("terminal de prueba");
+            terminal.draw(|frame| render(frame, &app, &engine)).expect("dibuja");
+            let buffer = terminal.backend().buffer().clone();
+            for (rect, button) in app.hit.borrow().buttons.iter() {
+                assert!(rect.y < height, "{height}: {button:?} fuera del frame");
+                let cell = buffer[(rect.x + 1, rect.y)].symbol().to_string();
+                assert!(!cell.trim().is_empty(), "{height}: {button:?} registrado pero no dibujado");
+            }
+        }
     }
 
     fn find_search_box(line: &Line<'_>) -> Option<Span<'static>> {
