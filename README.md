@@ -178,6 +178,12 @@ aplica el estilo y guarda su `style` en la sección `[visualizer]` de este
 archivo (creándola si no existe) y vuelve al panel, y `Esc` cancela, restaura
 el estilo anterior y vuelve al panel.
 
+Desde el panel (`Ctrl+P` → `Mouse`) `Enter` alterna la captura del mouse en
+el momento (la fila muestra `Mouse: sí` / `Mouse: no`) y guarda su valor en
+la clave `mouse` de la sección `[ui]` de este archivo (creándola si no
+existe); el panel sigue abierto. Cerrar el panel no reactiva la captura: el
+toggle manda sobre el estado previo.
+
 ```toml
 [theme]
 name = "kanagawa-dragon" # paleta de partida; ver IDs abajo

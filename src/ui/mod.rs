@@ -283,6 +283,10 @@ struct App {
     bands_menu: Option<BandsMenuState>,
     /// Panel de configuración abierto (T1): `Some` mientras el modal está activo.
     settings_panel: Option<SettingsPanelState>,
+    /// Captura del mouse en vivo (T4): arranca con el valor de `[ui] mouse`
+    /// y el toggle del panel la cambia en el momento (+ persiste).
+    /// `handle_mouse` la respeta por encima del chequeo de modales.
+    mouse_enabled: bool,
     /// Doble Esc para salir: el primer Esc arma, el segundo sale.
     quit_guard: QuitGuard,
     /// Zonas clickeables del último frame (las anota el render).
@@ -561,10 +565,11 @@ fn mouse_action(hit: &HitMap, drag: Option<Drag>, event: MouseEvent) -> (MouseAc
     }
 }
 
-/// Aplica un evento de mouse (clic/arrastre en barras, rueda) si `[ui] mouse`
-/// está activado.
+/// Aplica un evento de mouse (clic/arrastre en barras, rueda) si el estado
+/// vivo `mouse_enabled` (T4: arranca con `[ui] mouse`, el toggle lo cambia)
+/// lo permite.
 fn handle_mouse(event: MouseEvent, app: &mut App, engine: &mut AudioEngine) {
-    if !config::config().mouse {
+    if !app.mouse_enabled {
         return;
     }
     // Con un modal abierto (prompt de URL, menú de temas, selector de
@@ -815,6 +820,9 @@ pub fn run(engine: &mut AudioEngine, start: StartMode) -> io::Result<()> {
         theme_menu: None,
         bands_menu: None,
         settings_panel: None,
+        // El estado vivo arranca con lo configurado (el toggle lo cambia en
+        // el momento y lo persiste para el próximo arranque).
+        mouse_enabled: config::config().mouse,
         quit_guard: QuitGuard::default(),
         hit: RefCell::new(HitMap::default()),
         drag: None,
@@ -1050,7 +1058,7 @@ fn dispatch_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine) {
     // Panel de configuración (T1): con el panel abierto las teclas van al
     // panel (los modales son excluyentes: el primero que está abierto gana).
     if app.settings_panel.is_some() {
-        handle_settings_panel_key(key, app);
+        handle_settings_panel_key(key, app, config::persist_mouse_enabled);
         return;
     }
 
@@ -1472,11 +1480,37 @@ fn handle_bands_menu_key(
 
 // --- Panel de configuración (T1: shell) -------------------------------------
 
+/// Aplica la captura del mouse en la terminal en el momento (efecto
+/// inmediato del toggle; el cierre del panel no la toca: el toggle manda).
+fn apply_mouse_capture(enabled: bool) {
+    if enabled {
+        let _ = crossterm::execute!(io::stdout(), crossterm::event::EnableMouseCapture);
+    } else {
+        let _ = crossterm::execute!(io::stdout(), crossterm::event::DisableMouseCapture);
+    }
+}
+
+/// Alterna el mouse en vivo (T4): cambia el estado, aplica la captura en el
+/// momento y persiste `[ui] mouse`. Como Temas/Bandas, se aplica primero y
+/// un fallo de guardado solo deja el aviso; el panel sigue abierto.
+fn toggle_mouse(app: &mut App, persist: impl FnOnce(bool) -> Result<(), String>) {
+    let enabled = !app.mouse_enabled;
+    app.mouse_enabled = enabled;
+    apply_mouse_capture(enabled);
+    if let Err(err) = persist(enabled) {
+        app.error = Some(err);
+    }
+}
+
 fn open_settings_panel(app: &mut App) {
     app.settings_panel = Some(SettingsPanelState { selected: 0 });
 }
 
-fn handle_settings_panel_key(key: KeyEvent, app: &mut App) {
+fn handle_settings_panel_key(
+    key: KeyEvent,
+    app: &mut App,
+    persist_mouse: impl FnOnce(bool) -> Result<(), String>,
+) {
     match key.code {
         KeyCode::Up | KeyCode::Down => {
             let Some(panel) = app.settings_panel.as_mut() else {
@@ -1486,10 +1520,11 @@ fn handle_settings_panel_key(key: KeyEvent, app: &mut App) {
             let delta = if matches!(key.code, KeyCode::Up) { -1 } else { 1 };
             panel.selected = move_selection(panel.selected, delta, SETTINGS_ROWS.len());
         }
-        // T2/T3: Enter en «Temas» abre el ThemeMenuState existente como
-        // sub-modal y Enter en «Bandas» abre el selector de estilos (el
+        // T2/T3/T4: Enter en «Temas» abre el ThemeMenuState existente como
+        // sub-modal, Enter en «Bandas» abre el selector de estilos (el
         // panel sigue abierto debajo; el dispatch prioriza al sub-modal y
-        // su Enter/Esc vuelven al panel). «Mouse» (T4) sigue NO-OP.
+        // su Enter/Esc vuelven al panel) y Enter en «Mouse» alterna la
+        // captura en el momento + persiste (el panel sigue abierto).
         KeyCode::Enter => {
             let selected = match app.settings_panel.as_ref() {
                 Some(panel) => panel.selected,
@@ -1497,6 +1532,8 @@ fn handle_settings_panel_key(key: KeyEvent, app: &mut App) {
             };
             if selected == 0 {
                 open_theme_menu(app);
+            } else if selected == 1 {
+                toggle_mouse(app, persist_mouse);
             } else if selected == 2 {
                 open_bands_menu(app);
             }
@@ -2013,7 +2050,7 @@ fn render(frame: &mut Frame<'_>, app: &App, engine: &AudioEngine) {
     }
 
     if let Some(panel) = &app.settings_panel {
-        render_settings_panel(frame, panel);
+        render_settings_panel(frame, panel, app.mouse_enabled);
     }
 
     // El sub-modal de bandas (T3) va encima del panel.
@@ -2079,7 +2116,11 @@ fn render_theme_menu(frame: &mut Frame<'_>, menu: &ThemeMenuState) {
 
 /// Modal centrado del panel (T1), con el mismo estilo del modal de temas:
 /// fondo limpio + borde acentuado con título.
-fn render_settings_panel(frame: &mut Frame<'_>, panel: &SettingsPanelState) {
+fn render_settings_panel(
+    frame: &mut Frame<'_>,
+    panel: &SettingsPanelState,
+    mouse_enabled: bool,
+) {
     let area = frame.area();
     let width = 44.min(area.width.saturating_sub(4)).max(24);
     let height = (SETTINGS_ROWS.len() as u16 + 2)
@@ -2100,17 +2141,25 @@ fn render_settings_panel(frame: &mut Frame<'_>, panel: &SettingsPanelState) {
         ));
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
-    frame.render_widget(Paragraph::new(settings_panel_lines(panel)), inner);
+    frame.render_widget(Paragraph::new(settings_panel_lines(panel, mouse_enabled)), inner);
 }
 
-/// Filas del panel (T1: fijas; T2/T3/T4 les dan contenido): la selección va
-/// resaltada como en el menú de temas.
-fn settings_panel_lines(panel: &SettingsPanelState) -> Vec<Line<'static>> {
+/// Filas del panel (T4: «Mouse» muestra el estado vivo; el resto fijas): la
+/// selección va resaltada como en el menú de temas.
+fn settings_panel_lines(
+    panel: &SettingsPanelState,
+    mouse_enabled: bool,
+) -> Vec<Line<'static>> {
     let colors = theme(); // snapshot coherente para todas las filas
     SETTINGS_ROWS
         .iter()
         .enumerate()
         .map(|(i, row)| {
+            let label = if i == 1 {
+                format!("Mouse: {}", if mouse_enabled { "sí" } else { "no" })
+            } else {
+                (*row).to_string()
+            };
             let style = if i == panel.selected {
                 Style::default()
                     .bg(colors.select_bg)
@@ -2119,7 +2168,7 @@ fn settings_panel_lines(panel: &SettingsPanelState) -> Vec<Line<'static>> {
             } else {
                 Style::default().fg(colors.text)
             };
-            Line::from(Span::styled(format!(" {row} "), style))
+            Line::from(Span::styled(format!(" {label} "), style))
         })
         .collect()
 }
@@ -3322,8 +3371,9 @@ fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
         )];
     }
 
-    // Panel de configuración (T2/T3): Enter abre el sub-modal de Temas en la
-    // primera fila y el de Bandas en la tercera («Mouse» sigue NO-OP, T4).
+    // Panel de configuración (T2/T3/T4): Enter abre el sub-modal de Temas en
+    // la primera fila y el de Bandas en la tercera; en «Mouse» alterna la
+    // captura en vivo.
     if app.settings_panel.is_some() {
         return vec![Line::from(" ↑/↓: mover   Enter: abrir   Esc: cerrar ")];
     }
@@ -3778,6 +3828,10 @@ mod tests {
             theme_menu: None,
             bands_menu: None,
             settings_panel: None,
+            // Los tests existentes asumen captura habilitada (clics que
+            // actúan, guards de modal que frenan lo demás): default
+            // habilitado, igual que la config por defecto.
+            mouse_enabled: true,
             quit_guard: QuitGuard::default(),
             hit: RefCell::new(HitMap::default()),
             drag: None,
@@ -5188,27 +5242,19 @@ mod tests {
         };
 
         // Como el menú de temas (move_selection con clamp): no envuelve.
-        handle_settings_panel_key(theme_menu_key(KeyCode::Up), &mut app);
+        handle_settings_panel_key(theme_menu_key(KeyCode::Up), &mut app, |_| Ok(()));
         assert_eq!(selected(&app), 0, "↑ en la primera fila no se mueve");
-        handle_settings_panel_key(theme_menu_key(KeyCode::Down), &mut app);
-        handle_settings_panel_key(theme_menu_key(KeyCode::Down), &mut app);
-        handle_settings_panel_key(theme_menu_key(KeyCode::Down), &mut app);
+        handle_settings_panel_key(theme_menu_key(KeyCode::Down), &mut app, |_| Ok(()));
+        handle_settings_panel_key(theme_menu_key(KeyCode::Down), &mut app, |_| Ok(()));
+        handle_settings_panel_key(theme_menu_key(KeyCode::Down), &mut app, |_| Ok(()));
         assert_eq!(selected(&app), 2, "↓ frena en la última fila sin envolver");
-        handle_settings_panel_key(theme_menu_key(KeyCode::Up), &mut app);
+        handle_settings_panel_key(theme_menu_key(KeyCode::Up), &mut app, |_| Ok(()));
         assert_eq!(selected(&app), 1, "↑ vuelve una fila");
     }
 
-    #[test]
-    fn settings_enter_is_noop_that_keeps_state() {
-        // Candado de alcance T2: Enter en la fila Mouse (T4) sigue NO-OP.
-        let mut app = test_app();
-        open_settings_panel(&mut app);
-        app.settings_panel.as_mut().expect("abierto").selected = 1;
-        handle_settings_panel_key(theme_menu_key(KeyCode::Enter), &mut app);
-        let panel = app.settings_panel.as_ref().expect("Enter no cierra el panel");
-        assert_eq!(panel.selected, 1, "Enter no mueve ni resetea la selección");
-    }
-
+    // T4 reemplaza el candado NO-OP de T2 (`settings_enter_is_noop_...`):
+    // Enter en «Mouse» ahora alterna el estado en vivo (ver tests T4 abajo;
+    // el panel sigue abierto y la selección intacta, como antes).
     #[test]
     fn settings_esc_closes_panel_without_arming_quit() {
         let Some(mut engine) = engine_or_skip() else { return };
@@ -5232,7 +5278,7 @@ mod tests {
     fn settings_panel_lists_the_three_fixed_rows_with_highlight() {
         assert_eq!(SETTINGS_ROWS, ["Temas", "Mouse", "Bandas"], "filas fijas de T1");
         let panel = SettingsPanelState { selected: 1 };
-        let lines = settings_panel_lines(&panel);
+        let lines = settings_panel_lines(&panel, true);
         let texts: Vec<String> = lines.iter().map(line_text).collect();
         assert_eq!(texts.len(), 3, "una fila por sección: {texts:?}");
         for row in SETTINGS_ROWS {
@@ -5260,7 +5306,7 @@ mod tests {
             let backend = ratatui::backend::TestBackend::new(w, h);
             let mut terminal = ratatui::Terminal::new(backend).expect("terminal de prueba");
             terminal
-                .draw(|frame| render_settings_panel(frame, &panel))
+                .draw(|frame| render_settings_panel(frame, &panel, true))
                 .unwrap_or_else(|e| panic!("{w}x{h}: {e}"));
         }
     }
@@ -5383,7 +5429,7 @@ mod tests {
             0,
             "la primera fila es Temas"
         );
-        handle_settings_panel_key(theme_menu_key(KeyCode::Enter), &mut app);
+        handle_settings_panel_key(theme_menu_key(KeyCode::Enter), &mut app, |_| Ok(()));
         assert!(
             app.settings_panel.is_some(),
             "el panel sigue abierto debajo del sub-modal"
@@ -5394,27 +5440,152 @@ mod tests {
         );
     }
 
+    // -------------------------------------------------------------------------
+    // T4: toggle de Mouse en vivo + persistencia de `[ui] mouse`
+    // -------------------------------------------------------------------------
+    // (Reemplaza el candado NO-OP de T3 `settings_enter_on_mouse_stays_noop`:
+    // la spec T4 ordena que Enter en «Mouse» alterne el estado + persista.)
+
     #[test]
-    fn settings_enter_on_mouse_stays_noop() {
-        // Candado de alcance T3: el toggle de Mouse es T4; Enter no hace nada
-        // en esa fila (Bandas ya abre su sub-modal: ver tests T3).
+    fn settings_enter_on_mouse_toggles_state_and_persists() {
+        // Enter en «Mouse» alterna el estado en el momento, deja el panel
+        // abierto y persiste `[ui] mouse` (ruta temporal inyectada).
+        let path = std::env::temp_dir()
+            .join(format!("mp3tui_t4_mouse_toggle_{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, "[ui]\nmouse = true\n").unwrap();
+
+        let mut app = test_app();
+        assert!(app.mouse_enabled, "el estado vivo arranca habilitado");
+        open_settings_panel(&mut app);
+        app.settings_panel.as_mut().expect("abierto").selected = 1;
+        handle_settings_panel_key(theme_menu_key(KeyCode::Enter), &mut app, |enabled| {
+            config::persist_mouse_enabled_at(&path, enabled)
+        });
+        assert!(!app.mouse_enabled, "Enter apaga el mouse en el momento");
+        assert!(
+            app.settings_panel.is_some(),
+            "el toggle no cierra el panel"
+        );
+        let text = std::fs::read_to_string(&path).expect("mouse persistido");
+        assert!(
+            text.contains("mouse = false"),
+            "persiste `[ui] mouse`: {text:?}"
+        );
+
+        // Segundo Enter lo vuelve a prender (toggle, no set).
+        handle_settings_panel_key(theme_menu_key(KeyCode::Enter), &mut app, |enabled| {
+            config::persist_mouse_enabled_at(&path, enabled)
+        });
+        assert!(app.mouse_enabled, "otro Enter lo vuelve a prender");
+        let text = std::fs::read_to_string(&path).expect("mouse persistido");
+        assert!(
+            text.contains("mouse = true"),
+            "persiste el re-encendido: {text:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn settings_enter_on_mouse_persist_failure_keeps_toggled_state() {
+        // Como Temas/Bandas: se aplica primero y un fallo de guardado solo
+        // deja el aviso, sin revertir el toggle.
         let mut app = test_app();
         open_settings_panel(&mut app);
         app.settings_panel.as_mut().expect("abierto").selected = 1;
-        handle_settings_panel_key(theme_menu_key(KeyCode::Enter), &mut app);
+        handle_settings_panel_key(theme_menu_key(KeyCode::Enter), &mut app, |_| {
+            Err("sin disco".to_string())
+        });
+        assert!(!app.mouse_enabled, "el toggle aplica aunque falle el guardado");
         assert!(
             app.settings_panel.is_some(),
-            "Enter en Mouse no cierra el panel"
-        );
-        assert!(
-            app.theme_menu.is_none() && app.bands_menu.is_none(),
-            "Enter en Mouse sigue NO-OP en T3"
+            "y el panel sigue abierto"
         );
         assert_eq!(
-            app.settings_panel.as_ref().expect("abierto").selected,
-            1,
-            "Enter en Mouse no mueve la selección"
+            app.error.as_deref(),
+            Some("sin disco"),
+            "el fallo queda como aviso"
         );
+    }
+
+    #[test]
+    fn settings_mouse_row_shows_current_state() {
+        // La fila «Mouse» muestra el estado vivo: «Mouse: sí» / «Mouse: no».
+        let panel = SettingsPanelState { selected: 1 };
+        let on: Vec<String> = settings_panel_lines(&panel, true)
+            .iter()
+            .map(line_text)
+            .collect();
+        assert!(
+            on.iter().any(|t| t.contains("Mouse: sí")),
+            "prendido se lee «Mouse: sí»: {on:?}"
+        );
+        let off: Vec<String> = settings_panel_lines(&panel, false)
+            .iter()
+            .map(line_text)
+            .collect();
+        assert!(
+            off.iter().any(|t| t.contains("Mouse: no")),
+            "apagado se lee «Mouse: no»: {off:?}"
+        );
+        assert_eq!(on.len(), 3, "siguen siendo 3 filas: {on:?}");
+    }
+
+    #[test]
+    fn mouse_toggle_off_stays_off_after_closing_panel() {
+        // El toggle manda sobre el estado previo: apagar con el panel abierto
+        // y cerrarlo no reactiva la captura.
+        let Some(mut engine) = engine_or_skip() else { return };
+        let mut app = test_app();
+        app.mode = Mode::Player;
+        app.has_player = true;
+        open_settings_panel(&mut app);
+        app.settings_panel.as_mut().expect("abierto").selected = 1;
+        handle_settings_panel_key(theme_menu_key(KeyCode::Enter), &mut app, |_| Ok(()));
+        assert!(!app.mouse_enabled, "el toggle apaga en el momento");
+
+        handle_key(theme_menu_key(KeyCode::Esc), &mut app, &mut engine);
+        assert!(app.settings_panel.is_none(), "Esc cierra el panel");
+        assert!(
+            !app.mouse_enabled,
+            "cerrar el panel no reactiva la captura"
+        );
+
+        // Y el handler lo respeta: el clic ya no actúa.
+        *app.hit.borrow_mut() = sample_hit();
+        handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 30, 5),
+            &mut app,
+            &mut engine,
+        );
+        assert_eq!(engine.volume(), 0.0, "apagado, el clic no actúa");
+        assert_eq!(app.drag, None);
+    }
+
+    #[test]
+    fn mouse_disabled_globally_ignores_events_even_without_modals() {
+        // El estado vivo está ENCIMA del chequeo de modales: apagado, el
+        // mouse se ignora aunque no haya ningún modal abierto.
+        let Some(mut engine) = engine_or_skip() else { return };
+        let mut app = test_app();
+        app.mode = Mode::Player;
+        app.has_player = true;
+        app.mouse_enabled = false;
+        assert!(
+            app.url_input.is_none()
+                && app.theme_menu.is_none()
+                && app.bands_menu.is_none()
+                && app.settings_panel.is_none(),
+            "sin modales abiertos"
+        );
+        *app.hit.borrow_mut() = sample_hit();
+        handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 30, 5),
+            &mut app,
+            &mut engine,
+        );
+        assert_eq!(engine.volume(), 0.0, "apagado, el clic no fija volumen");
+        assert_eq!(app.drag, None, "ni arranca arrastre");
     }
 
     #[test]
@@ -5443,7 +5614,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let mut app = test_app();
         open_settings_panel(&mut app);
-        handle_settings_panel_key(theme_menu_key(KeyCode::Enter), &mut app);
+        handle_settings_panel_key(theme_menu_key(KeyCode::Enter), &mut app, |_| Ok(()));
         let menu = app.theme_menu.as_ref().expect("sub-modal abierto");
         let expected = config::builtin_themes()[menu.selected].0;
         handle_theme_menu_key(theme_menu_key(KeyCode::Enter), &mut app, |id| {
@@ -5469,7 +5640,7 @@ mod tests {
         let Some(mut engine) = engine_or_skip() else { return };
         let mut app = test_app();
         open_settings_panel(&mut app);
-        handle_settings_panel_key(theme_menu_key(KeyCode::Enter), &mut app);
+        handle_settings_panel_key(theme_menu_key(KeyCode::Enter), &mut app, |_| Ok(()));
         let before_name = config::active_theme_name();
         let before_theme = config::active_theme();
         // Previsualiza otro tema moviéndose dentro del sub-modal.
@@ -5574,7 +5745,7 @@ mod tests {
         let mut app = test_app();
         open_settings_panel(&mut app);
         app.settings_panel.as_mut().expect("abierto").selected = 2;
-        handle_settings_panel_key(theme_menu_key(KeyCode::Enter), &mut app);
+        handle_settings_panel_key(theme_menu_key(KeyCode::Enter), &mut app, |_| Ok(()));
         assert!(
             app.settings_panel.is_some(),
             "el panel sigue abierto debajo del sub-modal"
@@ -5629,7 +5800,7 @@ mod tests {
         app.mode = Mode::Player;
         open_settings_panel(&mut app);
         app.settings_panel.as_mut().expect("abierto").selected = 2;
-        handle_settings_panel_key(theme_menu_key(KeyCode::Enter), &mut app);
+        handle_settings_panel_key(theme_menu_key(KeyCode::Enter), &mut app, |_| Ok(()));
 
         handle_key(theme_menu_key(KeyCode::Down), &mut app, &mut engine);
 

@@ -1522,6 +1522,183 @@ pub fn persist_visualizer_style(style: &str) -> Result<(), String> {
     persist_visualizer_style_at(&path, style)
 }
 
+// ---------------------------------------------------------------------------
+// Persistencia del toggle de mouse (T4, espejo de la del tema / bandas)
+// ---------------------------------------------------------------------------
+
+/// Actualiza (o inserta) solo la clave `mouse` dentro de `[ui]` de un texto
+/// TOML, preservando el resto — comentarios, otras claves, otras secciones y
+/// los finales de línea CRLF. Sin sección `[ui]`, la agrega al final. Misma
+/// receta que `update_visualizer_style` pero con valor bool sin comillas.
+pub fn update_ui_mouse(text: &str, enabled: bool) -> String {
+    let value = if enabled { "true" } else { "false" };
+    let crlf = text.contains("\r\n");
+    let eol = if crlf { "\r\n" } else { "\n" };
+
+    // Encabezado de sección: `[sección]` (+ comentario opcional). Un
+    // comentario que menciona `[ui]` no abre sección.
+    fn header_section(line: &str) -> Option<&str> {
+        let t = line.trim_start();
+        let rest = t.strip_prefix('[')?;
+        let end = rest.find(']')?;
+        let after = rest[end + 1..].trim();
+        if after.is_empty() || after.starts_with('#') {
+            Some(rest[..end].trim())
+        } else {
+            None
+        }
+    }
+
+    // Cola de comentario de una línea `clave = valor …` respetando comillas.
+    fn line_comment(after_equals: &str) -> &str {
+        let mut quote: Option<char> = None;
+        for (i, c) in after_equals.char_indices() {
+            match quote {
+                Some(q) if c == q => quote = None,
+                Some(_) => {}
+                None => match c {
+                    '"' | '\'' => quote = Some(c),
+                    '#' => return after_equals[i..].trim_end(),
+                    _ => {}
+                },
+            }
+        }
+        ""
+    }
+
+    let mut lines: Vec<String> =
+        text.split('\n').map(str::to_string).collect();
+
+    let Some(start) =
+        lines.iter().position(|l| header_section(l) == Some("ui"))
+    else {
+        // Sin sección: agregarla al final, sin tocar lo existente.
+        let mut out = text.to_string();
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push_str(eol);
+        }
+        out.push_str(&format!("[ui]{eol}mouse = {value}{eol}"));
+        return out;
+    };
+
+    // Fin de la sección: la próxima cabecera (de cualquier sección).
+    let end = lines
+        .iter()
+        .skip(start + 1)
+        .position(|l| header_section(l).is_some())
+        .map(|offset| start + 1 + offset)
+        .unwrap_or(lines.len());
+
+    // ¿Ya hay una clave `mouse` dentro de la sección?
+    for i in (start + 1)..end {
+        let line = &lines[i];
+        let t = line.trim_start();
+        if t.starts_with('#') {
+            continue;
+        }
+        let Some(rest) = t.strip_prefix("mouse") else {
+            continue;
+        };
+        let Some(after) = rest.trim_start().strip_prefix('=') else {
+            // «mouses», «mouse2», etc.: no es la clave.
+            continue;
+        };
+        let indent = &line[..line.len() - t.len()];
+        let comment = line_comment(after);
+        let mut new_line = format!("{indent}mouse = {value}");
+        if !comment.is_empty() {
+            new_line.push(' ');
+            new_line.push_str(comment);
+        }
+        if line.ends_with('\r') {
+            new_line.push('\r');
+        }
+        lines[i] = new_line;
+        return lines.join("\n");
+    }
+
+    // Clave ausente: insertarla justo debajo del encabezado.
+    let mut inserted = format!("mouse = {value}");
+    if crlf {
+        inserted.push('\r');
+    }
+    lines.insert(start + 1, inserted);
+    lines.join("\n")
+}
+
+/// Escribe el estado del mouse en `path` de forma atómica (archivo temporal +
+/// rename). Crea el archivo (y su directorio) si no existe. Nunca toca la
+/// config real: las pruebas usan rutas temporales vía esta función.
+pub(crate) fn persist_mouse_enabled_at(
+    path: &Path,
+    enabled: bool,
+) -> Result<(), String> {
+    let existing = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            String::new()
+        }
+        Err(err) => {
+            return Err(format!("no se pudo leer '{}': {err}", path.display()));
+        }
+    };
+    let updated = update_ui_mouse(&existing, enabled);
+
+    // Igual que con el tema y el estilo: ante formas válidas que el editor
+    // por líneas no reconoce (tabla inline, claves con punto o entre
+    // comillas) podría duplicar claves; se valida el resultado y, si no
+    // queda TOML válido con el valor pedido, no se toca el archivo.
+    let persisted = updated
+        .parse::<toml::Table>()
+        .ok()
+        .and_then(|table| {
+            table
+                .get("ui")?
+                .get("mouse")?
+                .as_bool()
+                .map(|saved| saved == enabled)
+        })
+        .unwrap_or(false);
+    if !persisted {
+        return Err(format!(
+            "no se pudo guardar el mouse sin romper '{}'; agregá `mouse = {enabled}` en [ui] a mano",
+            path.display()
+        ));
+    }
+
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && let Err(err) = fs::create_dir_all(parent)
+    {
+        return Err(format!("no se pudo guardar el mouse: {err}"));
+    }
+
+    let mut tmp_os = path.as_os_str().to_os_string();
+    tmp_os.push(".tmp");
+    let tmp = PathBuf::from(tmp_os);
+    if let Err(err) = fs::write(&tmp, updated.as_bytes()) {
+        return Err(format!("no se pudo guardar el mouse: {err}"));
+    }
+    match fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let _ = fs::remove_file(&tmp);
+            Err(format!("no se pudo guardar el mouse: {err}"))
+        }
+    }
+}
+
+/// Persiste el estado del mouse en la config del usuario (ruta por defecto o
+/// `MP3TUI_CONFIG`).
+pub fn persist_mouse_enabled(enabled: bool) -> Result<(), String> {
+    let Some((path, _)) = resolve_path() else {
+        return Err(
+            "no se pudo guardar el mouse: sin ruta de config".to_string(),
+        );
+    };
+    persist_mouse_enabled_at(&path, enabled)
+}
+
 /// `[visualizer] style`: auto (default), ascii o unicode. Merge campo a campo
 /// como el resto: lo inválido avisa y cae al default sin tocar lo demás.
 fn parse_visualizer(
@@ -2653,6 +2830,139 @@ zoom = 2");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let err = persist_visualizer_style_at(&dir, "ascii")
+            .expect_err("un directorio no es escribible");
+        assert!(!err.is_empty(), "mensaje de error no vacío");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // T4: toggle de Mouse — reescritura y persistencia de `[ui] mouse`
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn update_ui_mouse_creates_section_when_missing() {
+        assert_eq!(
+            update_ui_mouse("", false),
+            "[ui]\nmouse = false\n",
+            "archivo vacío: crea la sección"
+        );
+
+        let existing = "[library]\nroots = []\n";
+        let out = update_ui_mouse(existing, true);
+        assert!(
+            out.starts_with(existing),
+            "el contenido existente se preserva: {out:?}"
+        );
+        assert!(
+            out.ends_with("[ui]\nmouse = true\n"),
+            "se agrega [ui] al final: {out:?}"
+        );
+    }
+
+    #[test]
+    fn update_ui_mouse_replaces_and_inserts_preserving_comments() {
+        let out = update_ui_mouse("[ui]\nmouse = true  # viejo\n", false);
+        assert_eq!(
+            out,
+            "[ui]\nmouse = false # viejo\n",
+            "reemplaza solo el valor y conserva el comentario"
+        );
+
+        let out = update_ui_mouse("[ui]\nvolume = 50\n", true);
+        assert_eq!(
+            out,
+            "[ui]\nmouse = true\nvolume = 50\n",
+            "inserta mouse justo después del encabezado"
+        );
+
+        // Un comentario que menciona [ui] no abre una sección.
+        let out = update_ui_mouse("# [ui]\n[library]\nroots = []\n", false);
+        assert!(
+            out.starts_with("# [ui]\n") && out.ends_with("[ui]\nmouse = false\n"),
+            "{out:?}"
+        );
+
+        let crlf = "[ui]\r\nmouse = true\r\n";
+        assert_eq!(
+            update_ui_mouse(crlf, false),
+            "[ui]\r\nmouse = false\r\n",
+            "reemplazo con CRLF: solo cambia el valor"
+        );
+    }
+
+    #[test]
+    fn persist_mouse_enabled_never_writes_invalid_toml() {
+        // Igual que tema y bandas: formas válidas de TOML que el editor por
+        // líneas no reconoce → el archivo queda intacto, nunca roto.
+        let cases = [
+            ("inline", "ui = { mouse = true }\n"),
+            ("dotted", "ui.mouse = true\n"),
+            ("quoted", "[ui]\n\"mouse\" = true\n"),
+        ];
+        for (label, original) in cases {
+            let path = std::env::temp_dir().join(format!(
+                "mp3tui_mouse_invalid_{label}_{}.toml",
+                std::process::id()
+            ));
+            std::fs::write(&path, original).expect("escribe el original");
+
+            let result = persist_mouse_enabled_at(&path, false);
+            let text = std::fs::read_to_string(&path).expect("sigue existiendo");
+            let parsed = text.parse::<toml::Table>();
+            let _ = std::fs::remove_file(&path);
+
+            match result {
+                Ok(()) => {
+                    let table = parsed.unwrap_or_else(|e| {
+                        panic!("{label}: Ok pero dejó TOML inválido: {e}\n{text}")
+                    });
+                    let mouse = table
+                        .get("ui")
+                        .and_then(|t| t.get("mouse"))
+                        .and_then(|n| n.as_bool());
+                    assert_eq!(mouse, Some(false), "{label}: valor guardado");
+                }
+                Err(_) => assert_eq!(text, original, "{label}: archivo intacto si falla"),
+            }
+        }
+    }
+
+    #[test]
+    fn persist_mouse_enabled_at_updates_or_creates_and_reports_errors() {
+        let path = std::env::temp_dir()
+            .join(format!("mp3tui_mouse_cfg_{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        // 1. No existe: lo crea con la sección mínima.
+        persist_mouse_enabled_at(&path, false).expect("crea el archivo");
+        let text = std::fs::read_to_string(&path).expect("recién creado");
+        assert_eq!(text, "[ui]\nmouse = false\n");
+
+        // 2. Existe: solo cambia mouse; comentarios y otras secciones
+        //    intactos, sin archivo temporal colgando.
+        let original =
+            "# mío\n[ui]\nmouse = true\n[visualizer]\nstyle = \"ascii\"\n";
+        std::fs::write(&path, original).unwrap();
+        persist_mouse_enabled_at(&path, false).expect("actualiza");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            text,
+            "# mío\n[ui]\nmouse = false\n[visualizer]\nstyle = \"ascii\"\n"
+        );
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        assert!(
+            !std::path::PathBuf::from(&tmp).exists(),
+            "sin archivo temporal colgando"
+        );
+
+        // 3. Destino no escribible (directorio): error corto, sin pánico.
+        let dir = std::env::temp_dir()
+            .join(format!("mp3tui_mouse_dir_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = persist_mouse_enabled_at(&dir, true)
             .expect_err("un directorio no es escribible");
         assert!(!err.is_empty(), "mensaje de error no vacío");
 
