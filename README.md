@@ -187,7 +187,8 @@ panel. `onda` dibuja el osciloscopio con las muestras crudas del audio,
 `espejo` las 32 bandas en espejo vertical desde una línea central, `caida`
 las barras con marca de máximo por banda (decae en ~800 ms) y `vu` el medidor
 de nivel mono con RMS y marca de pico (decae en ~800 ms); `circular`
-dibuja las barras (fallback temporal hasta T5). `barras` es el
+el plot polar grueso de las 32 bandas (radios desde el centro con el
+gradiente del tema, centro tenue). `barras` es el
 comportamiento actual.
 
 Desde el panel (`Ctrl+P` → `Mouse`) `Enter` alterna la captura del mouse en
@@ -270,11 +271,12 @@ Notas del comportamiento de la config:
   audio, la más reciente a la derecha), `espejo` (las 32 bandas en espejo
   vertical desde una línea central tenue), `caida` (barras con marca del
   máximo por banda en `spectrum_high`, decae en ~800 ms), `vu` (medidor de
-  nivel mono con RMS, barra horizontal con gradiente del tema, marca de pico
+   nivel mono con RMS, barra horizontal con gradiente del tema, marca de pico
   en `spectrum_high` que decae en ~800 ms y escala tenue; mono porque el tap
-  ya promedia los canales — ver nota T4) o `circular`.
-  Un valor inválido avisa y se usa `barras`. `circular` dibuja las
-  barras (fallback temporal hasta T5).
+  ya promedia los canales — ver nota T4) o `circular` (plot polar grueso de
+   las 32 bandas como radios desde el centro, con el gradiente del tema por
+   distancia al centro y centro tenue; compensa el aspecto ~1:2 de la celda).
+   Un valor inválido avisa y se usa `barras`.
 - Si dos acciones distintas quedan mapeadas a la misma tecla, gana la de
   mayor prioridad en el dispatch y se genera un warning que lo explicita
   (la perdedora vuelve a sus defaults libres).

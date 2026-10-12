@@ -3348,7 +3348,8 @@ fn render_visualizer(frame: &mut Frame<'_>, area: Rect, analyzer: &SpectrumAnaly
     );
     // T2 modos-visualizador: `onda` va a su osciloscopio con las muestras
     // crudas del tap; T3: `espejo` y `caida` van a sus pintores con el dato
-    // de bandas (`barras` byte-a-byte idéntico vía `paint_bands`, sin tocar).
+    // de bandas; T4: `vu` a su medidor con RMS; T5: `circular` a su plot
+    // polar (`barras` byte-a-byte idéntico vía `paint_bands`, sin tocar).
     match resolve_visualizer_paint(config::active_visualizer_mode()) {
         VisualizerPaint::Bars => {
             paint_bands(frame.buffer_mut(), inner, analyzer.bands(), &theme(), ascii)
@@ -3376,11 +3377,19 @@ fn render_visualizer(frame: &mut Frame<'_>, area: Rect, analyzer: &SpectrumAnaly
             &theme(),
             ascii,
         ),
+        VisualizerPaint::Circular => paint_circular(
+            frame.buffer_mut(),
+            inner,
+            analyzer.bands(),
+            &theme(),
+            ascii,
+        ),
     }
 }
 
-/// Destino del dispatch de render por modo (T4 modos-visualizador): barras,
-/// osciloscopio, espejo, caída o VU; T5 agrega circular sin tocar este fallback.
+/// Destino del dispatch de render por modo (T5 modos-visualizador): barras,
+/// osciloscopio, espejo, caída, VU o plot polar (sin fallback: los 6 modos
+/// tienen pintor propio desde T5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VisualizerPaint {
     Bars,
@@ -3388,21 +3397,114 @@ enum VisualizerPaint {
     Mirror,
     Fall,
     Vu,
+    Circular,
 }
 
-/// Dispatch puro del modo al pintor: `onda` va al osciloscopio, `espejo` a su
-/// pintor simétrico, `caida` al de peak-hold y `vu` a su medidor con RMS;
-/// solo `circular` sigue en barras (fallback explícito y temporal hasta T5,
-/// testeado en `visualizer_paint_routes_vu_to_its_painter_and_circular_to_bars`).
+/// Dispatch puro del modo al pintor: cada modo va al suyo (`circular` al plot
+/// polar de T5; el fallback temporal a barras murió en T5, testeado en
+/// `visualizer_paint_routes_all_modes_to_their_painters`).
 fn resolve_visualizer_paint(mode: config::VisualizerMode) -> VisualizerPaint {
     match mode {
+        config::VisualizerMode::Barras => VisualizerPaint::Bars,
         config::VisualizerMode::Onda => VisualizerPaint::Wave,
         config::VisualizerMode::Espejo => VisualizerPaint::Mirror,
         config::VisualizerMode::Caida => VisualizerPaint::Fall,
         config::VisualizerMode::Vu => VisualizerPaint::Vu,
-        config::VisualizerMode::Barras | config::VisualizerMode::Circular => {
-            VisualizerPaint::Bars
+        config::VisualizerMode::Circular => VisualizerPaint::Circular,
+    }
+}
+
+/// T5 (modos-visualizador): plot polar GRUESO de las 32 bandas (intencionalmente
+/// grueso: la terminal no da para más, y así está acordado).
+///
+/// Decisiones (testeadas en los tests `paint_circular_*`):
+/// - Las 32 bandas son radios desde el centro del área útil (banda 0 = norte,
+///   resto en sentido horario, θ = i·2π/32 − π/2); cada radio mide
+///   `nivel × max_r` con `max_r = min(ancho, alto×2) / 2`, muestreado en pasos
+///   de 0.5 para que el trazo sea continuo. Sin celdas parciales: el nivel
+///   cuantiza al medio paso (documentado, no testeado el sub-paso).
+/// - Aspecto de celda (~1:2, más altas que anchas): la distancia vertical
+///   cuenta doble (`dy = r·sinθ / 2`), así con niveles uniformes el plot es
+///   aproximadamente circular (alcance horizontal ≈ 2× el vertical en celdas,
+///   misma distancia física) y no una elipse aplastada.
+/// - Gradiente por DISTANCIA al centro (`t = r/max_r` con `spectrum_color`,
+///   low junto al centro → high en las puntas), no por nivel: como las barras
+///   (low abajo → high arriba) pero en radial; con niveles uniformes todos los
+///   radios igual muestran el gradiente. La última escritura gana (pasos
+///   ascendentes), así el color de cada celda lo fija su `r` mayor.
+/// - Glifos reusados sin duplicar lógica: `band_full_glyph` (`@` en ascii,
+///   `█` en unicode) + fondo de puntos `.` en ascii (vacío en unicode), igual
+///   que las barras. Celda central tenue en `dim` (se pinta al final, después
+///   de que la crucen los 32 radios).
+/// - Áreas enanas degradan graceful sin pánico: vacías retornan; si
+///   `max_r < 1` ni el centro entra y queda solo el fondo. Niveles fuera de
+///   rango con clamp (negativo = radio ausente).
+fn paint_circular(
+    buffer: &mut ratatui::buffer::Buffer,
+    inner: Rect,
+    bands: &[f32; NUM_BANDS],
+    theme: &Theme,
+    ascii: bool,
+) {
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    // Fondo (igual que las barras: puntos tenues en ascii, vacío en unicode).
+    for y in inner.y..inner.y + inner.height {
+        for x in inner.x..inner.x + inner.width {
+            if let Some(cell) = buffer.cell_mut((x, y)) {
+                if ascii {
+                    cell.set_symbol(".").set_fg(theme.dim);
+                } else {
+                    cell.set_symbol(" ").set_fg(Color::Reset);
+                }
+            }
         }
+    }
+    // Radio máximo en unidades de ancho de celda: el alto cuenta doble por el
+    // aspecto ~1:2 (misma fórmula que compensa el ángulo abajo).
+    let max_r = f32::from(inner.width).min(f32::from(inner.height) * 2.0) / 2.0;
+    if max_r < 1.0 {
+        return;
+    }
+    let cx = inner.x + inner.width / 2;
+    let cy = inner.y + inner.height / 2;
+    let symbol = band_full_glyph(ascii);
+    let right = i32::from(inner.x + inner.width);
+    let bottom = i32::from(inner.y + inner.height);
+    for (band, &magnitude) in bands.iter().enumerate() {
+        let level = magnitude.clamp(0.0, 1.0);
+        if level <= 0.0 {
+            continue;
+        }
+        let theta = band as f32 * std::f32::consts::TAU / NUM_BANDS as f32
+            - std::f32::consts::FRAC_PI_2;
+        let (sin, cos) = theta.sin_cos();
+        let ray_len = level * max_r;
+        let steps = (ray_len * 2.0).ceil() as usize;
+        for step in 0..=steps {
+            let r = step as f32 * 0.5;
+            if r > ray_len {
+                break;
+            }
+            let x = i32::from(cx) + (r * cos).round() as i32;
+            // El `/ 2.0` compensa el aspecto: a igual `r` física, la mitad de
+            // filas que de columnas.
+            let y = i32::from(cy) + ((r * sin) / 2.0).round() as i32;
+            if x < i32::from(inner.x) || y < i32::from(inner.y) || x >= right || y >= bottom
+            {
+                continue;
+            }
+            let t = (r / max_r).clamp(0.0, 1.0);
+            let (red, green, blue) = spectrum_color(t, theme);
+            if let Some(cell) = buffer.cell_mut((x as u16, y as u16)) {
+                cell.set_symbol(symbol).set_fg(Color::Rgb(red, green, blue));
+            }
+        }
+    }
+    // Centro tenue (después de los radios para que siempre se vea).
+    if let Some(cell) = buffer.cell_mut((cx, cy)) {
+        cell.set_symbol(symbol).set_fg(theme.dim);
     }
 }
 
@@ -4907,6 +5009,197 @@ mod tests {
         let area = Rect::new(0, 0, 0, 0);
         let mut buffer = Buffer::empty(area);
         paint_vu(&mut buffer, area, 1.0, 1.0, &theme, false);
+    }
+
+    // T5 (modos-visualizador): plot polar grueso. Área de referencia 20x24:
+    // max_r = min(20, 48)/2 = 10, centro (10,12); banda 0 = norte, 8 = este,
+    // 16 = sur, 24 = oeste (θ = i·2π/32 − π/2).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn paint_circular_silence_shows_dim_center_on_background() {
+        let theme = Theme::default();
+        let area = Rect::new(0, 0, 32, 16);
+        // Sin niveles solo queda el centro tenue sobre el fondo.
+        let mut buffer = Buffer::empty(area);
+        paint_circular(&mut buffer, area, &[0.0f32; NUM_BANDS], &theme, false);
+        let center = &buffer[(16u16, 8u16)];
+        assert_eq!(center.symbol(), "█", "el centro se dibuja");
+        assert_eq!(center.fg, theme.dim, "el centro va tenue en dim");
+        for (x, y) in [(0u16, 0u16), (31, 15), (17, 8), (16, 9)] {
+            assert_eq!(
+                buffer[(x, y)].symbol(),
+                " ",
+                "sin niveles no hay radios ({x},{y})"
+            );
+        }
+        // ASCII: mismo centro con el glifo lleno + fondo de puntos.
+        let mut buffer = Buffer::empty(area);
+        paint_circular(&mut buffer, area, &[0.0f32; NUM_BANDS], &theme, true);
+        let center = &buffer[(16u16, 8u16)];
+        assert_eq!(center.symbol(), "@", "centro ascii = glifo lleno");
+        assert_eq!(center.fg, theme.dim, "centro ascii tenue en dim");
+        let empty = &buffer[(17u16, 8u16)];
+        assert_eq!(empty.symbol(), ".", "fondo de puntos en ascii");
+        assert_eq!(empty.fg, theme.dim);
+    }
+
+    #[test]
+    fn paint_circular_uniform_levels_are_approximately_circular_not_oval() {
+        // Compensación del aspecto de celda (~1:2): con niveles uniformes el
+        // alcance horizontal en celdas ≈ 2× el vertical (misma distancia
+        // física). Sin compensar, el vertical mediría ~10, no ~5.
+        let theme = Theme::default();
+        let area = Rect::new(0, 0, 20, 24);
+        let mut buffer = Buffer::empty(area);
+        paint_circular(&mut buffer, area, &[1.0f32; NUM_BANDS], &theme, false);
+        let painted = |x: u16, y: u16| buffer[(x, y)].symbol() == "█";
+        let (cx, cy) = (10u16, 12u16);
+        let dx_left = (0..cx).filter(|&x| painted(x, cy)).map(|x| cx - x).max();
+        let dx_right = ((cx + 1)..20).filter(|&x| painted(x, cy)).map(|x| x - cx).max();
+        let dy_up = (0..cy).filter(|&y| painted(cx, y)).map(|y| cy - y).max();
+        let dy_down = ((cy + 1)..24)
+            .filter(|&y| painted(cx, y))
+            .map(|y| y - cy)
+            .max();
+        let (dx_left, dx_right, dy_up, dy_down) = (
+            dx_left.unwrap_or(0),
+            dx_right.unwrap_or(0),
+            dy_up.unwrap_or(0),
+            dy_down.unwrap_or(0),
+        );
+        assert!(
+            (8..=10).contains(&dx_left) && (8..=10).contains(&dx_right),
+            "alcance horizontal ≈ max_r=10 (izq={dx_left}, der={dx_right})"
+        );
+        assert!(
+            (4..=6).contains(&dy_up) && (4..=6).contains(&dy_down),
+            "alcance vertical ≈ max_r/2=5 (arr={dy_up}, aba={dy_down})"
+        );
+        assert!(
+            dx_left.abs_diff(dx_right) <= 1 && dy_up.abs_diff(dy_down) <= 1,
+            "simetría aproximada (izq={dx_left}, der={dx_right}, \
+             arr={dy_up}, aba={dy_down})"
+        );
+        let dx = dx_left.max(dx_right);
+        let dy = dy_up.max(dy_down);
+        assert!(
+            dx >= 2 * dy - 2 && dx <= 2 * dy + 2,
+            "proporción física ~1:1 en celdas ~1:2 (dx={dx}, dy={dy})"
+        );
+    }
+
+    #[test]
+    fn paint_circular_radii_grow_with_level_and_point_outwards() {
+        let theme = Theme::default();
+        let area = Rect::new(0, 0, 20, 24);
+        let mut bands = [0.0f32; NUM_BANDS];
+        bands[0] = 1.0; // norte, a tope: max_r=10 → 5 filas hacia arriba.
+        bands[8] = 0.5; // este, a mitad: 5 cols → 5 celdas hacia la derecha.
+        let mut buffer = Buffer::empty(area);
+        paint_circular(&mut buffer, area, &bands, &theme, false);
+        assert_eq!(buffer[(10u16, 7u16)].symbol(), "█", "tip norte a tope");
+        assert_eq!(
+            buffer[(10u16, 6u16)].symbol(),
+            " ",
+            "más allá del tip no hay nada"
+        );
+        assert_eq!(
+            buffer[(10u16, 17u16)].symbol(),
+            " ",
+            "la banda 16 en cero no dibuja hacia el sur"
+        );
+        assert_eq!(buffer[(15u16, 12u16)].symbol(), "█", "tip este a mitad");
+        assert_eq!(
+            buffer[(16u16, 12u16)].symbol(),
+            " ",
+            "más allá del tip este no hay nada"
+        );
+        assert_eq!(
+            buffer[(10u16, 12u16)].fg,
+            theme.dim,
+            "el centro sigue tenue aunque lo crucen radios"
+        );
+    }
+
+    #[test]
+    fn paint_circular_gradient_goes_from_low_at_center_to_high_at_tips() {
+        // Decisión T5 (testeada acá): gradiente por DISTANCIA al centro
+        // (t = r/max_r), no por nivel — como las barras (low abajo → high
+        // arriba), pero en radial: low junto al centro, high en las puntas.
+        let theme = Theme::default();
+        let area = Rect::new(0, 0, 20, 24);
+        let mut bands = [0.0f32; NUM_BANDS];
+        bands[0] = 1.0; // norte a tope (max_r=10).
+        let mut buffer = Buffer::empty(area);
+        paint_circular(&mut buffer, area, &bands, &theme, false);
+        // El tip lo escribe r=10 (último paso): t=1.0 → high.
+        let (hr, hg, hb) = spectrum_color(1.0, &theme);
+        assert_eq!(
+            buffer[(10u16, 7u16)].fg,
+            Color::Rgb(hr, hg, hb),
+            "el tip va en spectrum_high"
+        );
+        // La celda (10,11) la tocan r∈{1.0,…,2.5} (pasos de 0.5) y gana el
+        // último: t=0.25, cerca de low.
+        let (lr, lg, lb) = spectrum_color(0.25, &theme);
+        assert_eq!(
+            buffer[(10u16, 11u16)].fg,
+            Color::Rgb(lr, lg, lb),
+            "junto al centro el gradiente arranca en low"
+        );
+    }
+
+    #[test]
+    fn paint_circular_ascii_reuses_ramp_and_dot_background() {
+        let theme = Theme::default();
+        let area = Rect::new(0, 0, 32, 16);
+        let mut bands = [0.0f32; NUM_BANDS];
+        bands[0] = 1.0; // norte a tope: max_r=16 → 8 filas hasta la fila 0.
+        let mut buffer = Buffer::empty(area);
+        paint_circular(&mut buffer, area, &bands, &theme, true);
+        assert_eq!(buffer[(16u16, 0u16)].symbol(), "@", "radio ascii = @");
+        let (hr, hg, hb) = spectrum_color(1.0, &theme);
+        assert_eq!(
+            buffer[(16u16, 0u16)].fg,
+            Color::Rgb(hr, hg, hb),
+            "el tip ascii también lleva el gradiente"
+        );
+        let empty = &buffer[(20u16, 8u16)];
+        assert_eq!(empty.symbol(), ".", "fondo de puntos en ascii");
+        assert_eq!(empty.fg, theme.dim);
+    }
+
+    #[test]
+    fn paint_circular_tiny_and_out_of_range_degrade_without_panic() {
+        let theme = Theme::default();
+        // Área vacía: sin pánico.
+        let area = Rect::new(0, 0, 0, 0);
+        let mut buffer = Buffer::empty(area);
+        paint_circular(&mut buffer, area, &[1.0f32; NUM_BANDS], &theme, false);
+        // 1x1: max_r=0.5 < 1, ni el centro entra → solo fondo, sin pánico.
+        let area = Rect::new(5, 5, 1, 1);
+        let mut buffer = Buffer::empty(area);
+        paint_circular(&mut buffer, area, &[1.0f32; NUM_BANDS], &theme, false);
+        assert_eq!(buffer[(5u16, 5u16)].symbol(), " ", "sin centro en 1x1");
+        // 2x2: max_r=1, el centro entra tenue.
+        let area = Rect::new(0, 0, 2, 2);
+        let mut buffer = Buffer::empty(area);
+        paint_circular(&mut buffer, area, &[1.0f32; NUM_BANDS], &theme, false);
+        assert_eq!(buffer[(1u16, 1u16)].fg, theme.dim, "centro tenue en 2x2");
+        // Niveles fuera de rango con clamp, sin pánico.
+        let area = Rect::new(0, 0, 20, 24);
+        let mut buffer = Buffer::empty(area);
+        let mut bands = [0.0f32; NUM_BANDS];
+        bands[0] = 1.5;
+        bands[16] = -0.5;
+        paint_circular(&mut buffer, area, &bands, &theme, true);
+        assert_eq!(buffer[(10u16, 7u16)].symbol(), "@", "1.5 = clip a tope");
+        assert_eq!(
+            buffer[(10u16, 17u16)].symbol(),
+            ".",
+            "negativo = vacío al sur"
+        );
     }
 
     fn test_app() -> App {
@@ -7262,10 +7555,9 @@ mod tests {
     }
 
     #[test]
-    fn visualizer_paint_routes_vu_to_its_painter_and_circular_to_bars() {
-        // T4: `vu` tiene pintor propio (medidor MONO con RMS); `circular`
-        // sigue en barras (fallback temporal hasta T5, que reescribe este
-        // test al implementar su pintor).
+    fn visualizer_paint_routes_all_modes_to_their_painters() {
+        // T5: los 6 modos tienen pintor propio (`circular` al plot polar);
+        // el fallback temporal a barras muere acá (test T4 reescrito).
         assert_eq!(
             resolve_visualizer_paint(config::VisualizerMode::Barras),
             VisualizerPaint::Bars,
@@ -7293,8 +7585,8 @@ mod tests {
         );
         assert_eq!(
             resolve_visualizer_paint(config::VisualizerMode::Circular),
-            VisualizerPaint::Bars,
-            "fallback a barras para circular"
+            VisualizerPaint::Circular,
+            "circular va a su plot polar, no a las barras"
         );
     }
 
