@@ -272,6 +272,10 @@ struct Shared {
     test_hooks: Mutex<TestHooks>,
 }
 
+/// Volumen con el que arranca el motor. Los tests abren el dispositivo real y
+/// reproducen audio: arrancan mudos para que `cargo test` no suene.
+const INITIAL_VOLUME: f32 = if cfg!(test) { 0.0 } else { 1.0 };
+
 pub struct AudioEngine {
     device: cpal::Device,
     config: cpal::StreamConfig,
@@ -302,7 +306,7 @@ impl AudioEngine {
                 state: AtomicU8::new(STATE_STOPPED),
                 decoder_done: AtomicBool::new(true),
                 finished: AtomicBool::new(true),
-                volume: AtomicU32::new(1.0f32.to_bits()),
+                volume: AtomicU32::new(INITIAL_VOLUME.to_bits()),
                 speed: AtomicU32::new(1.0f32.to_bits()),
                 session: Mutex::new(SessionState {
                     id: 0,
@@ -1634,6 +1638,14 @@ fn push_wait(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Los tests usan el dispositivo real: tienen que arrancar mudos para que
+    /// `cargo test` no suene (la app sigue arrancando al 100%).
+    #[test]
+    fn engine_starts_muted_under_test() {
+        let Ok(engine) = AudioEngine::new() else { return };
+        assert_eq!(engine.volume(), 0.0);
+    }
 
     /// Seek simulado: tras procesar, el resampler arrastra posición
     /// fraccionaria y un buffer parcial; reset() lo deja recién creado.

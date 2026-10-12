@@ -288,3 +288,5 @@ cargo clippy --all-targets
 Algunos tests de audio requieren wav del sistema
 (`C:\Windows\Media\Ring0*.wav`) y se auto-omiten si no existen; dos tests de
 device real están anotados `#[ignore]` (se corren con `cargo test -- --ignored`).
+Bajo `cargo test` el motor arranca con volumen 0, así que los tests que usan el
+dispositivo real no suenan.
