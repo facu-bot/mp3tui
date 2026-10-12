@@ -24,6 +24,11 @@ const F_MAX_CAP: f32 = 16_000.0;
 const ATTACK: f32 = 0.55;
 /// Peso del valor nuevo cuando la barra baja (decay más lento).
 const DECAY: f32 = 0.16;
+/// Caída lineal del peak-hold por `analyze()`: de techo a cero en 48 frames
+/// (≈ 800 ms a 60 fps). Las barras bajan con el DECAY existente (suavizado
+/// attack/decay); solo el pico tiene decay propio (T3 modos-visualizador:
+/// testeado en `peaks_fall_linearly_and_never_drop_below_bands`).
+const PEAK_FALL: f32 = 1.0 / 48.0;
 /// Tamaño del staging de lectura (igual al ring del tap: 8192 muestras).
 const TAP_READ_MAX: usize = 1 << 13;
 /// Ganancia previa a la compensación de potencia: la energía real de una
@@ -47,6 +52,9 @@ pub struct SpectrumAnalyzer {
     staging: Vec<f32>,
     pending: usize,
     bands: [f32; NUM_BANDS],
+    /// Peak-hold por banda para el modo `caida` (T3 modos-visualizador):
+    /// marca del máximo visto; sube con la banda y baja con `PEAK_FALL`.
+    peaks: [f32; NUM_BANDS],
     band_ranges: Vec<(usize, usize)>,
     sample_rate: u32,
 }
@@ -75,6 +83,7 @@ impl SpectrumAnalyzer {
             staging: vec![0.0; TAP_READ_MAX],
             pending: 0,
             bands: [0.0; NUM_BANDS],
+            peaks: [0.0; NUM_BANDS],
             band_ranges: Self::compute_ranges(44_100),
             sample_rate: 0,
         }
@@ -114,6 +123,7 @@ impl SpectrumAnalyzer {
             for band in &mut self.bands {
                 *band *= 1.0 - DECAY;
             }
+            self.update_peaks();
             return;
         }
 
@@ -150,6 +160,7 @@ impl SpectrumAnalyzer {
                 current + (target - current) * DECAY
             };
         }
+        self.update_peaks();
     }
 
     /// Atajo: ingest + analyze. El loop de la TUI usa ingest/analyze por
@@ -162,6 +173,28 @@ impl SpectrumAnalyzer {
     /// Magnitudes por banda normalizadas en 0.0..=1.0.
     pub fn bands(&self) -> &[f32; NUM_BANDS] {
         &self.bands
+    }
+
+    /// Peak-hold por banda (modo `caida` de T3): el máximo visto por banda,
+    /// en 0.0..=1.0. Siempre >= la banda actual.
+    pub fn peaks(&self) -> &[f32; NUM_BANDS] {
+        &self.peaks
+    }
+
+    /// Peak-hold del modo `caida` (T3): el pico sube con la banda en el acto
+    /// y baja linealmente con `PEAK_FALL`, sin quedar nunca debajo de ella.
+    /// Vive en el analizador (acoplamiento mínimo: se actualiza donde se
+    /// actualizan las bandas y el render solo lee con `peaks()`, sin
+    /// interior mutability aunque `render_visualizer` reciba `&Analyzer`).
+    fn update_peaks(&mut self) {
+        for index in 0..NUM_BANDS {
+            let band = self.bands[index];
+            if band >= self.peaks[index] {
+                self.peaks[index] = band;
+            } else {
+                self.peaks[index] = (self.peaks[index] - PEAK_FALL).max(band);
+            }
+        }
     }
 
     /// Las `max_points` muestras crudas más recientes del ring, de más vieja
@@ -305,6 +338,50 @@ mod tests {
         analyzer.analyze();
         let after = analyzer.bands()[0];
         assert!(after > 0.0 && after < 0.8, "debe decaer lentamente, obtenido {after}");
+    }
+
+    // T3 (modos-visualizador): peak-hold del modo `caida`.
+    #[test]
+    fn peaks_start_at_zero_and_track_rising_bands() {
+        let mut analyzer = SpectrumAnalyzer::new();
+        assert_eq!(analyzer.peaks(), &[0.0f32; NUM_BANDS]);
+        analyzer.bands[3] = 0.6;
+        analyzer.analyze();
+        // Sin muestras las bandas decaen con DECAY, y el pico registra el
+        // nivel resultante (nunca queda debajo de la banda).
+        assert_eq!(analyzer.peaks()[3], analyzer.bands()[3]);
+        assert!(analyzer.peaks()[3] > 0.0 && analyzer.peaks()[3] < 0.6);
+    }
+
+    #[test]
+    fn peaks_fall_linearly_and_never_drop_below_bands() {
+        let mut analyzer = SpectrumAnalyzer::new();
+        analyzer.peaks[0] = 1.0;
+        analyzer.bands[0] = 0.0;
+        for _ in 0..24 {
+            analyzer.analyze();
+        }
+        assert!(
+            (analyzer.peaks()[0] - 0.5).abs() < 1e-5,
+            "24 frames ≈ mitad del recorrido, obtenido {}",
+            analyzer.peaks()[0]
+        );
+        for _ in 0..24 {
+            analyzer.analyze();
+        }
+        assert!(
+            analyzer.peaks()[0] < 1e-5,
+            "48 frames ≈ 800 ms a 60 fps: el pico llegó a cero, obtenido {}",
+            analyzer.peaks()[0]
+        );
+        assert!(
+            analyzer.peaks()[0] >= analyzer.bands()[0],
+            "el pico nunca baja de la banda"
+        );
+        // Y con la banda subiendo, el pico la sigue en el acto.
+        analyzer.bands[1] = 0.9;
+        analyzer.analyze();
+        assert_eq!(analyzer.peaks()[1], analyzer.bands()[1]);
     }
 
     #[test]

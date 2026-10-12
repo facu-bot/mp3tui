@@ -3347,8 +3347,8 @@ fn render_visualizer(frame: &mut Frame<'_>, area: Rect, analyzer: &SpectrumAnaly
         config::VisualizerStyle::Ascii
     );
     // T2 modos-visualizador: `onda` va a su osciloscopio con las muestras
-    // crudas del tap; el resto cae a las barras (`barras` byte-a-byte
-    // idéntico vía `paint_bands`, sin tocar).
+    // crudas del tap; T3: `espejo` y `caida` van a sus pintores con el dato
+    // de bandas (`barras` byte-a-byte idéntico vía `paint_bands`, sin tocar).
     match resolve_visualizer_paint(config::active_visualizer_mode()) {
         VisualizerPaint::Bars => {
             paint_bands(frame.buffer_mut(), inner, analyzer.bands(), &theme(), ascii)
@@ -3357,28 +3357,247 @@ fn render_visualizer(frame: &mut Frame<'_>, area: Rect, analyzer: &SpectrumAnaly
             let samples = analyzer.waveform(inner.width as usize);
             paint_wave(frame.buffer_mut(), inner, &samples, &theme(), ascii);
         }
+        VisualizerPaint::Mirror => {
+            paint_mirror(frame.buffer_mut(), inner, analyzer.bands(), &theme(), ascii)
+        }
+        VisualizerPaint::Fall => paint_fall(
+            frame.buffer_mut(),
+            inner,
+            analyzer.bands(),
+            analyzer.peaks(),
+            &theme(),
+            ascii,
+        ),
     }
 }
 
-/// Destino del dispatch de render por modo (T2 modos-visualizador): barras u
-/// osciloscopio; T3–T5 agregan variantes sin tocar este fallback.
+/// Destino del dispatch de render por modo (T3 modos-visualizador): barras,
+/// osciloscopio, espejo o caída; T4–T5 agregan variantes sin tocar este fallback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VisualizerPaint {
     Bars,
     Wave,
+    Mirror,
+    Fall,
 }
 
-/// Dispatch puro del modo al pintor: `onda` va al osciloscopio; el resto cae
-/// a las barras (fallback explícito y temporal hasta T3–T5, testeado en
-/// `visualizer_paint_routes_onda_to_wave_and_rest_to_bars`).
+/// Dispatch puro del modo al pintor: `onda` va al osciloscopio, `espejo` a su
+/// pintor simétrico y `caida` al de peak-hold; `vu`/`circular` siguen en
+/// barras (fallback explícito y temporal hasta T4–T5, testeado en
+/// `visualizer_paint_routes_mirror_and_fall_to_their_painters`).
 fn resolve_visualizer_paint(mode: config::VisualizerMode) -> VisualizerPaint {
     match mode {
         config::VisualizerMode::Onda => VisualizerPaint::Wave,
+        config::VisualizerMode::Espejo => VisualizerPaint::Mirror,
+        config::VisualizerMode::Caida => VisualizerPaint::Fall,
         config::VisualizerMode::Barras
-        | config::VisualizerMode::Espejo
-        | config::VisualizerMode::Caida
         | config::VisualizerMode::Vu
         | config::VisualizerMode::Circular => VisualizerPaint::Bars,
+    }
+}
+
+/// T3 (modos-visualizador): espejo vertical de las 32 bandas desde una línea
+/// central tenue (`-` en ascii, `─` en unicode, color `dim`, como el eje de
+/// la onda). Cada banda crece arriba Y abajo con los mismos niveles y glifos
+/// de `paint_bands` (helpers `band_slot`/`band_full_glyph`/`band_frac_glyph`,
+/// sin lógica duplicada); el gradiente va de `spectrum_low` junto al eje a
+/// `spectrum_high` en las puntas, simétrico en ambos lados. Fondo de puntos
+/// `.` en ascii, vacío en unicode (igual que las barras). Alturas de 1–2
+/// filas degradan graceful (solo el eje / un lado de 1 fila) sin pánico.
+fn paint_mirror(
+    buffer: &mut ratatui::buffer::Buffer,
+    inner: Rect,
+    bands: &[f32; NUM_BANDS],
+    theme: &Theme,
+    ascii: bool,
+) {
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let total = u32::from(inner.width);
+    // Fondo (igual que las barras: puntos tenues en ascii, vacío en unicode).
+    for y in inner.y..inner.y + inner.height {
+        for x in inner.x..inner.x + inner.width {
+            if let Some(cell) = buffer.cell_mut((x, y)) {
+                if ascii {
+                    cell.set_symbol(".").set_fg(theme.dim);
+                } else {
+                    cell.set_symbol(" ").set_fg(Color::Reset);
+                }
+            }
+        }
+    }
+    // Eje central: misma fila que el cero de la onda.
+    let axis_rel = wave_sample_row(0.0, inner.height);
+    let axis_symbol = if ascii { "-" } else { "─" };
+    for dx in 0..inner.width {
+        if let Some(cell) = buffer.cell_mut((inner.x + dx, inner.y + axis_rel)) {
+            cell.set_symbol(axis_symbol).set_fg(theme.dim);
+        }
+    }
+    let top_h = axis_rel;
+    let bottom_h = inner.height - axis_rel - 1;
+    for (band, &magnitude) in bands.iter().enumerate() {
+        let Some((slot_start, width)) = band_slot(band, total) else {
+            break;
+        };
+        let level = magnitude.clamp(0.0, 1.0);
+        for (above, side_h) in [(true, top_h), (false, bottom_h)] {
+            if side_h == 0 {
+                continue;
+            }
+            // Nivel continuo → celdas completas + fracción (igual que
+            // `paint_bandas`, pero medido desde el eje hacia afuera).
+            let height_f = level * f32::from(side_h);
+            let full_cells = (height_f.floor() as u16).min(side_h);
+            let frac = height_f - height_f.floor();
+            // Fila junto al eje: hacia arriba resta, hacia abajo suma (en
+            // rango por construcción: arriba `i <= axis_rel - 1`, abajo
+            // `edge + i <= inner.y + alto - 1`).
+            let edge = if above {
+                inner.y + axis_rel - 1
+            } else {
+                inner.y + axis_rel + 1
+            };
+            for i in 0..full_cells {
+                let y = if above { edge - i } else { edge + i };
+                let t = if side_h > 1 {
+                    f32::from(i) / f32::from(side_h - 1)
+                } else {
+                    1.0
+                };
+                let (red, green, blue) = spectrum_color(t, theme);
+                let color = Color::Rgb(red, green, blue);
+                let symbol = band_full_glyph(ascii);
+                for dx in 0..width {
+                    if let Some(cell) = buffer.cell_mut((inner.x + slot_start + dx, y)) {
+                        cell.set_symbol(symbol).set_fg(color);
+                    }
+                }
+            }
+            if frac > 0.0 && full_cells < side_h {
+                let y = if above {
+                    edge - full_cells
+                } else {
+                    edge + full_cells
+                };
+                let symbol = band_frac_glyph(frac, ascii);
+                let t = if side_h > 1 {
+                    f32::from(full_cells) / f32::from(side_h - 1)
+                } else {
+                    1.0
+                };
+                let (red, green, blue) = spectrum_color(t, theme);
+                let color = Color::Rgb(red, green, blue);
+                for dx in 0..width {
+                    if let Some(cell) = buffer.cell_mut((inner.x + slot_start + dx, y)) {
+                        cell.set_symbol(symbol).set_fg(color);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// T3 (modos-visualizador): barras normales (`paint_bands`, byte-a-byte
+/// idénticas: sin picos el buffer es indistinguible, testeado en
+/// `paint_fall_without_peaks_matches_plain_bars`) + marca de peak-hold por
+/// banda en `spectrum_high`.
+///
+/// Decisiones (testeadas en los tests `paint_fall_*` y `peaks_*`):
+/// - Las barras bajan con el DECAY existente del analizador (suavizado
+///   attack/decay de `analyze`): sin decay propio para la barra.
+/// - El pico vive en el analizador (`SpectrumAnalyzer::peaks`, actualizado en
+///   `analyze` donde se actualizan las bandas: acoplamiento mínimo, el render
+///   solo lee sin interior mutability) y baja linealmente con `PEAK_FALL`
+///   (~800 ms de techo a cero a 60 fps), sin quedar nunca debajo de la banda.
+/// - La marca es una celda en el nivel del pico: `█` en unicode (`▇` si el
+///   pico cae a mitad de celda) y `@` en ascii (coherente con la rampa, cuyo
+///   nivel lleno es `@`); tapa la barra donde coincide para que el máximo
+///   siempre se vea. Fondo de puntos `.` en ascii respetado.
+fn paint_fall(
+    buffer: &mut ratatui::buffer::Buffer,
+    inner: Rect,
+    bands: &[f32; NUM_BANDS],
+    peaks: &[f32; NUM_BANDS],
+    theme: &Theme,
+    ascii: bool,
+) {
+    paint_bands(buffer, inner, bands, theme, ascii);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let total = u32::from(inner.width);
+    let bottom = inner.y + inner.height;
+    for (band, &peak) in peaks.iter().enumerate() {
+        let Some((slot_start, width)) = band_slot(band, total) else {
+            break;
+        };
+        let level = peak.clamp(0.0, 1.0) * f32::from(inner.height);
+        if level <= 0.0 {
+            continue;
+        }
+        let full = level.floor() as u16;
+        let frac = level - level.floor();
+        // Filas desde abajo hasta el pico: en borde exacto va la fila del
+        // borde; si cae a mitad de celda, la celda que lo contiene.
+        let rows_up = (if frac <= 0.0 { full } else { full + 1 })
+            .min(inner.height)
+            .max(1);
+        let y = bottom - rows_up;
+        let symbol = if frac <= 0.0 {
+            band_full_glyph(ascii)
+        } else if ascii {
+            "@"
+        } else {
+            "▇"
+        };
+        for dx in 0..width {
+            if let Some(cell) = buffer.cell_mut((inner.x + slot_start + dx, y)) {
+                cell.set_symbol(symbol).set_fg(theme.spectrum_high);
+            }
+        }
+    }
+}
+
+/// Slot horizontal proporcional de la banda `band` en un ancho total de
+/// `total` columnas: `(x0_rel, ancho)` relativos al inicio del área, o `None`
+/// si la banda cae fuera (menos columnas que bandas). Slot >= 2 → barra =
+/// slot - 1 (1 col de gap); slot == 1 → sin gap posible. T3 lo extrae de
+/// `paint_bands` para reusarlo en espejo/caída sin duplicar el reparto.
+fn band_slot(band: usize, total: u32) -> Option<(u16, u16)> {
+    let bands_count = NUM_BANDS as u32;
+    let (slot_start, slot_end) = if total >= bands_count {
+        (
+            (total * band as u32 / bands_count) as u16,
+            (total * (band as u32 + 1) / bands_count) as u16,
+        )
+    } else {
+        (band as u16, band as u16 + 1)
+    };
+    if slot_start >= total as u16 {
+        return None;
+    }
+    let bar_width = (slot_end - slot_start).saturating_sub(1).max(1);
+    Some((slot_start, bar_width.min(total as u16 - slot_start)))
+}
+
+/// Glifo de celda llena de barra: `@` (nivel lleno de la rampa) en ascii,
+/// `█` en unicode. T3 lo extrae de `paint_bands` para reusarlo en espejo.
+fn band_full_glyph(ascii: bool) -> &'static str {
+    if ascii { "@" } else { "█" }
+}
+
+/// Glifo de la celda parcial de una barra con fracción `frac` en 0.0..1.0:
+/// rampa ASCII de 10 niveles o bloques de octavo en unicode (mismo gradiente
+/// que la celda llena). T3 lo extrae de `paint_bands` para reusarlo en espejo.
+fn band_frac_glyph(frac: f32, ascii: bool) -> &'static str {
+    if ascii {
+        let idx = ((frac * 10.0) as usize).min(9);
+        ASCII_RAMP[idx]
+    } else {
+        let idx = ((frac * 8.0) as usize).min(7);
+        EIGHTH_BLOCKS[idx]
     }
 }
 
@@ -3479,30 +3698,18 @@ fn paint_bands(
         return;
     }
 
-    let right = inner.x + inner.width;
     let bottom = inner.y + inner.height;
     let total = u32::from(inner.width);
-    let bands_count = NUM_BANDS as u32;
 
     for (band, &magnitude) in bands.iter().enumerate() {
         // Los slots se reparten proporcionalmente para cubrir todo el ancho
         // (sin dejar el resto de la división entera sin pintar). Si hay menos
-        // columnas que bandas, cada banda ocupa una columna y se corta al llegar.
-        let (slot_start, slot_end) = if total >= bands_count {
-            (
-                (total * band as u32 / bands_count) as u16,
-                (total * (band as u32 + 1) / bands_count) as u16,
-            )
-        } else {
-            (band as u16, band as u16 + 1)
+        // columnas que bandas, cada banda ocupa una columna y `band_slot`
+        // devuelve `None` al llegar al borde.
+        let Some((slot_start, width)) = band_slot(band, total) else {
+            break;
         };
         let x0 = inner.x + slot_start;
-        if x0 >= right {
-            break;
-        }
-        // slot >= 2 → barra = slot - 1 (1 col de gap); slot == 1 → sin gap posible.
-        let bar_width = (slot_end - slot_start).saturating_sub(1).max(1);
-        let width = bar_width.min(right - x0);
 
         // Sub-celda: altura continua → celdas completas + fracción.
         let height_f = magnitude.clamp(0.0, 1.0) * inner.height as f32;
@@ -3519,7 +3726,7 @@ fn paint_bands(
             };
             let (red, green, blue) = spectrum_color(t, theme);
             let color = Color::Rgb(red, green, blue);
-            let symbol = if ascii { "@" } else { "█" };
+            let symbol = band_full_glyph(ascii);
             for dx in 0..width {
                 if let Some(cell) = buffer.cell_mut((x0 + dx, y)) {
                     cell.set_symbol(symbol).set_fg(color);
@@ -3531,13 +3738,7 @@ fn paint_bands(
         // niveles en ascii. El color es el mismo gradiente en ambos modos.
         if frac > 0.0 && full_cells < inner.height {
             let y = bottom - full_cells - 1;
-            let symbol = if ascii {
-                let idx = ((frac * 10.0) as usize).min(9);
-                ASCII_RAMP[idx]
-            } else {
-                let idx = ((frac * 8.0) as usize).min(7);
-                EIGHTH_BLOCKS[idx]
-            };
+            let symbol = band_frac_glyph(frac, ascii);
             // Color: el mismo gradiente que tendría si fuera una celda completa.
             let t = if inner.height > 1 {
                 full_cells as f32 / (inner.height - 1) as f32
@@ -4197,6 +4398,223 @@ mod tests {
         let empty = &buffer[(0u16, 1u16)];
         assert_eq!(empty.symbol(), ".", "celda vacía = punto tenue");
         assert_eq!(empty.fg, theme.dim);
+    }
+
+    // T3 (modos-visualizador): espejo vertical de las 32 bandas.
+    // Área 32x7 → 1 columna por banda; eje central en fila 3 (igual que la
+    // onda: `wave_sample_row(0.0, 7)`), 3 filas por lado.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn paint_mirror_full_bar_grows_both_ways_from_dim_center_axis() {
+        let theme = Theme::default();
+        let area = Rect::new(0, 0, 32, 7);
+        let mut buffer = Buffer::empty(area);
+        let mut bands = [0.0f32; NUM_BANDS];
+        bands[0] = 1.0;
+        paint_mirror(&mut buffer, area, &bands, &theme, false);
+        for y in [0u16, 1, 2, 4, 5, 6] {
+            assert_eq!(
+                buffer[(0u16, y)].symbol(),
+                "█",
+                "barra a ambos lados del eje (y={y})"
+            );
+        }
+        let axis = &buffer[(0u16, 3u16)];
+        assert_eq!(axis.symbol(), "─", "línea central tenue");
+        assert_eq!(axis.fg, theme.dim);
+        // Las demás bandas en cero: solo el eje, resto vacío.
+        for x in 1..32u16 {
+            assert_eq!(
+                buffer[(x, 3u16)].symbol(),
+                "─",
+                "el eje cruza todo el ancho (x={x})"
+            );
+            assert_eq!(
+                buffer[(x, 0u16)].symbol(),
+                " ",
+                "sin barra = vacío en unicode"
+            );
+        }
+    }
+
+    #[test]
+    fn paint_mirror_gradient_goes_from_low_at_center_to_high_at_tips() {
+        let theme = Theme::default();
+        let area = Rect::new(0, 0, 32, 7);
+        let mut buffer = Buffer::empty(area);
+        paint_mirror(&mut buffer, area, &[1.0f32; NUM_BANDS], &theme, false);
+        let low = spectrum_color(0.0, &theme);
+        let high = spectrum_color(1.0, &theme);
+        for (y, label) in [(2u16, "arriba junto al eje"), (4u16, "abajo junto al eje")] {
+            assert_eq!(
+                buffer[(0u16, y)].fg,
+                Color::Rgb(low.0, low.1, low.2),
+                "{label} = spectrum_low"
+            );
+        }
+        for (y, label) in [(0u16, "punta de arriba"), (6u16, "punta de abajo")] {
+            assert_eq!(
+                buffer[(0u16, y)].fg,
+                Color::Rgb(high.0, high.1, high.2),
+                "{label} = spectrum_high"
+            );
+        }
+    }
+
+    #[test]
+    fn paint_mirror_reuses_band_glyph_levels_and_dot_background() {
+        let theme = Theme::default();
+        // Mitad de nivel con lado de 3: 1.5 → 1 llena + parcial 0.5.
+        let area = Rect::new(0, 0, 32, 7);
+        let mut bands = [0.0f32; NUM_BANDS];
+        bands[0] = 0.5;
+        let mut buffer = Buffer::empty(area);
+        paint_mirror(&mut buffer, area, &bands, &theme, false);
+        assert_eq!(buffer[(0u16, 2u16)].symbol(), "█", "llena junto al eje");
+        assert_eq!(
+            buffer[(0u16, 1u16)].symbol(),
+            "▅",
+            "parcial 0.5 = EIGHTH_BLOCKS[4], como paint_bands"
+        );
+        assert_eq!(buffer[(0u16, 4u16)].symbol(), "█", "abajo simétrico");
+        assert_eq!(buffer[(0u16, 5u16)].symbol(), "▅", "parcial simétrico");
+        // ASCII: misma rampa que las barras + fondo de puntos.
+        let mut buffer = Buffer::empty(area);
+        paint_mirror(&mut buffer, area, &bands, &theme, true);
+        assert_eq!(buffer[(0u16, 2u16)].symbol(), "@", "llena ascii = @");
+        assert_eq!(
+            buffer[(0u16, 1u16)].symbol(),
+            ";",
+            "parcial 0.5 = ASCII_RAMP[5], como paint_bands"
+        );
+        let empty = &buffer[(5u16, 0u16)];
+        assert_eq!(empty.symbol(), ".", "fondo de puntos en ascii");
+        assert_eq!(empty.fg, theme.dim);
+        let axis = &buffer[(5u16, 3u16)];
+        assert_eq!(axis.symbol(), "-", "eje ascii");
+        assert_eq!(axis.fg, theme.dim);
+    }
+
+    #[test]
+    fn paint_mirror_tiny_heights_degrade_without_panic() {
+        let theme = Theme::default();
+        let bands = [1.0f32; NUM_BANDS];
+        let area = Rect::new(0, 0, 32, 1);
+        let mut buffer = Buffer::empty(area);
+        paint_mirror(&mut buffer, area, &bands, &theme, false);
+        for x in 0..32u16 {
+            assert_eq!(buffer[(x, 0u16)].symbol(), "─", "1 fila: solo el eje");
+        }
+        let area = Rect::new(0, 0, 32, 2);
+        let mut buffer = Buffer::empty(area);
+        paint_mirror(&mut buffer, area, &bands, &theme, false);
+        for x in 0..32u16 {
+            assert_eq!(buffer[(x, 1u16)].symbol(), "─", "el eje sigue visible");
+            assert_eq!(
+                buffer[(x, 0u16)].symbol(),
+                "█",
+                "arriba de 1 fila pinta sin pánico"
+            );
+        }
+    }
+
+    // T3 (modos-visualizador): caída con peak-hold por banda.
+    // Área 32x10 → 1 columna por banda.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn paint_fall_marks_peak_above_bar_with_spectrum_high() {
+        let theme = Theme::default();
+        let area = Rect::new(0, 0, 32, 10);
+        let mut buffer = Buffer::empty(area);
+        let bands = [0.2f32; NUM_BANDS];
+        let peaks = [0.8f32; NUM_BANDS];
+        paint_fall(&mut buffer, area, &bands, &peaks, &theme, false);
+        // Banda 0.2 → 2 celdas (filas 8–9); pico 0.8 → fila 2.
+        let marker = &buffer[(0u16, 2u16)];
+        assert_eq!(marker.symbol(), "█", "marca del máximo sobre la barra");
+        assert_eq!(marker.fg, theme.spectrum_high, "el pico va en spectrum_high");
+        assert_eq!(
+            buffer[(0u16, 9u16)].symbol(),
+            "█",
+            "la barra sigue normal abajo"
+        );
+        assert_eq!(
+            buffer[(0u16, 5u16)].symbol(),
+            " ",
+            "entre pico y barra no hay nada"
+        );
+    }
+
+    #[test]
+    fn paint_fall_fractional_peak_uses_seven_eighths_block() {
+        let theme = Theme::default();
+        let area = Rect::new(0, 0, 32, 10);
+        let mut buffer = Buffer::empty(area);
+        let peaks = [0.85f32; NUM_BANDS];
+        paint_fall(&mut buffer, area, &[0.0f32; NUM_BANDS], &peaks, &theme, false);
+        // 0.85 * 10 = 8.5 → fila 1 con bloque parcial.
+        assert_eq!(
+            buffer[(0u16, 1u16)].symbol(),
+            "▇",
+            "pico fraccional = ▇ en unicode"
+        );
+        assert_eq!(buffer[(0u16, 1u16)].fg, theme.spectrum_high);
+        // ASCII: el pico es coherente con la rampa (@ = nivel lleno).
+        let mut buffer = Buffer::empty(area);
+        paint_fall(&mut buffer, area, &[0.0f32; NUM_BANDS], &peaks, &theme, true);
+        assert_eq!(buffer[(0u16, 1u16)].symbol(), "@", "pico ascii = @");
+        assert_eq!(buffer[(0u16, 1u16)].fg, theme.spectrum_high);
+        assert_eq!(
+            buffer[(0u16, 5u16)].symbol(),
+            ".",
+            "el fondo de puntos sobrevive"
+        );
+    }
+
+    #[test]
+    fn paint_fall_without_peaks_matches_plain_bars() {
+        // Sin picos el modo es indistinguible de las barras normales.
+        let theme = Theme::default();
+        let area = Rect::new(0, 0, 40, 10);
+        let bands: [f32; NUM_BANDS] = std::array::from_fn(|i| (i as f32 * 0.137) % 1.0);
+        let mut plain = Buffer::empty(area);
+        paint_bands(&mut plain, area, &bands, &theme, false);
+        let mut fall = Buffer::empty(area);
+        paint_fall(&mut fall, area, &bands, &[0.0f32; NUM_BANDS], &theme, false);
+        for y in 0..10u16 {
+            for x in 0..40u16 {
+                assert_eq!(
+                    fall[(x, y)].symbol(),
+                    plain[(x, y)].symbol(),
+                    "celda ({x},{y})"
+                );
+                assert_eq!(fall[(x, y)].fg, plain[(x, y)].fg, "color ({x},{y})");
+            }
+        }
+    }
+
+    #[test]
+    fn paint_fall_tiny_heights_degrade_without_panic() {
+        let theme = Theme::default();
+        let area = Rect::new(0, 0, 32, 1);
+        let mut buffer = Buffer::empty(area);
+        paint_fall(
+            &mut buffer,
+            area,
+            &[0.5f32; NUM_BANDS],
+            &[1.0f32; NUM_BANDS],
+            &theme,
+            false,
+        );
+        for x in 0..32u16 {
+            assert_eq!(
+                buffer[(x, 0u16)].symbol(),
+                "█",
+                "1 fila: pico y barra colapsan sin pánico"
+            );
+        }
     }
 
     fn test_app() -> App {
@@ -6552,10 +6970,10 @@ mod tests {
     }
 
     #[test]
-    fn visualizer_paint_routes_onda_to_wave_and_rest_to_bars() {
-        // T2: `onda` tiene su pintor propio (osciloscopio con muestras crudas);
-        // el resto sigue en barras (fallback temporal hasta T3–T5, que
-        // reescriben este test al implementar su pintor).
+    fn visualizer_paint_routes_mirror_and_fall_to_their_painters() {
+        // T3: `espejo` y `caida` tienen pintor propio; `vu`/`circular`
+        // siguen en barras (fallback temporal hasta T4/T5, que reescriben
+        // este test al implementar su pintor).
         assert_eq!(
             resolve_visualizer_paint(config::VisualizerMode::Barras),
             VisualizerPaint::Bars,
@@ -6566,9 +6984,17 @@ mod tests {
             VisualizerPaint::Wave,
             "onda va al osciloscopio, no a las barras"
         );
+        assert_eq!(
+            resolve_visualizer_paint(config::VisualizerMode::Espejo),
+            VisualizerPaint::Mirror,
+            "espejo va a su pintor simétrico, no a las barras"
+        );
+        assert_eq!(
+            resolve_visualizer_paint(config::VisualizerMode::Caida),
+            VisualizerPaint::Fall,
+            "caida va a su pintor con peak-hold, no a las barras"
+        );
         for mode in [
-            config::VisualizerMode::Espejo,
-            config::VisualizerMode::Caida,
             config::VisualizerMode::Vu,
             config::VisualizerMode::Circular,
         ] {
