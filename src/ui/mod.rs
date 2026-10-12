@@ -3360,22 +3360,26 @@ fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
 
     if app.theme_menu.is_some() {
         return vec![Line::from(
-            " ↑/↓: previsualizar tema   Enter: guardar   Esc: cancelar ",
+            " ↑/↓: previsualizar tema   ·   Enter: guardar   ·   Esc: cancelar ",
         )];
     }
 
     // Selector de bandas (T3): mismo patrón que el menú de temas.
     if app.bands_menu.is_some() {
         return vec![Line::from(
-            " ↑/↓: previsualizar estilo   Enter: guardar   Esc: cancelar ",
+            " ↑/↓: previsualizar estilo   ·   Enter: guardar   ·   Esc: cancelar ",
         )];
     }
 
     // Panel de configuración (T2/T3/T4): Enter abre el sub-modal de Temas en
     // la primera fila y el de Bandas en la tercera; en «Mouse» alterna la
-    // captura en vivo.
+    // captura en vivo (T5: el pie dice `abrir/alternar` por eso). Los `·`
+    // son tramos sueltos entre chips: el parser de chips separa por tres
+    // espacios, así todos los atajos siguen clickeables.
     if app.settings_panel.is_some() {
-        return vec![Line::from(" ↑/↓: mover   Enter: abrir   Esc: cerrar ")];
+        return vec![Line::from(
+            " ↑/↓: mover   ·   Enter: abrir/alternar   ·   Esc: cerrar ",
+        )];
     }
 
     if app.search.is_some() {
@@ -3400,6 +3404,8 @@ fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
     match app.mode {
         // Panel lateral abierto (T13): 3 líneas — lista, reproducción y el
         // recordatorio de que ↑/↓ son volumen solo con el panel cerrado.
+        // T5: `u: URL` también vale con el panel abierto; `sig/ant` se
+        // expande porque entra en 78 reagrupando (`u` pasa a la línea 2).
         Mode::Player if app.explorer_open => vec![
             Line::from(format!(
                 " {}/{}: mover   {}: reproducir   {}: buscar   Ctrl+{}: config   {}/{}: cerrar",
@@ -3412,16 +3418,17 @@ fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
                 key_labels(&keys.explorer),
             )),
             Line::from(format!(
-                " {}: pausa   {}/{}: ±5s   {}: shuffle   {}: repeat   {}×2: salir",
+                " {}: pausa   {}/{}: ±5s   {}: shuffle   {}: repeat   {}: URL   {}×2: salir",
                 key_labels(&keys.play_pause),
                 key_labels(&keys.seek_back),
                 key_labels(&keys.seek_fwd),
                 key_labels(&keys.shuffle),
                 key_labels(&keys.repeat),
+                key_labels(&keys.open_url),
                 key_labels(&keys.quit),
             )),
             Line::from(format!(
-                " {}/{}: pista sig/ant   volumen {}/{}: con el panel cerrado   {}/{}: vel",
+                " {}/{}: pista siguiente/anterior   volumen {}/{}: con el panel cerrado   {}/{}: vel",
                 key_labels(&keys.next_track),
                 key_labels(&keys.prev_track),
                 key_labels(&keys.volume_up),
@@ -3430,10 +3437,16 @@ fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
                 key_labels(&keys.speed_up),
             )),
         ],
+        // T5: `Tab: biblio` vuelve (deuda T1); `b` sube a la línea 1 como
+        // navegación y `↑/↓: vol` abrevia: es la única forma de que los 12
+        // atajos entren en 2×78. Orden: navegación → reproducción → modos →
+        // config/salida.
         Mode::Player => vec![
             Line::from(format!(
-                " {}: pausa   {}/{}: volumen   {}/{}: ±5s   \
-                 {}/{}: pista   {}: buscar   {}: URL",
+                " {}: biblio   {}: buscar   {}: pausa   {}/{}: vol   {}/{}: ±5s   \
+                 {}/{}: pista",
+                key_labels(&keys.explorer),
+                key_labels(&keys.search),
                 key_labels(&keys.play_pause),
                 key_labels(&keys.volume_up),
                 key_labels(&keys.volume_down),
@@ -3441,23 +3454,24 @@ fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
                 key_labels(&keys.seek_fwd),
                 key_labels(&keys.next_track),
                 key_labels(&keys.prev_track),
-                key_labels(&keys.search),
-                key_labels(&keys.open_url),
             )),
             Line::from(format!(
-                " {}: shuffle   {}: repeat   {}/{}: vel   Ctrl+{}: config   {}×2: salir",
+                " {}: shuffle   {}: repeat   {}/{}: vel   {}: URL   Ctrl+{}: config   {}×2: salir",
                 key_labels(&keys.shuffle),
                 key_labels(&keys.repeat),
                 key_labels(&keys.speed_down),
                 key_labels(&keys.speed_up),
+                key_labels(&keys.open_url),
                 settings_key_display(),
                 key_labels(&keys.quit),
             )),
         ],
+        // T5: `sig/ant` expandido (`b` baja a la línea 2 para que entre);
+        // `Inicio/Fin` se documenta y sale el `Esc: volver` inexacto (sin
+        // player Esc arma la salida: lo cubre `Esc×2: salir`).
         Mode::Browser => vec![
             Line::from(format!(
-                " {}/{} {}/{}: mover   {}: reproducir   {}/{}: pista sig/ant   \
-                 {}: buscar",
+                " {}/{} {}/{}: mover   {}: reproducir   {}/{}: pista siguiente/anterior",
                 key_labels(&keys.move_up),
                 key_labels(&keys.move_down),
                 key_labels(&keys.page_up),
@@ -3465,10 +3479,9 @@ fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
                 key_labels(&keys.select),
                 key_labels(&keys.next_track),
                 key_labels(&keys.prev_track),
-                key_labels(&keys.search),
             )),
             Line::from(format!(
-                " {}: pausa   {}/{}: ±5s   {}/{}: vel   {}: shuffle   {}: repeat",
+                " {}: pausa   {}/{}: ±5s   {}/{}: vel   {}: shuffle   {}: repeat   {}: buscar",
                 key_labels(&keys.play_pause),
                 key_labels(&keys.seek_back),
                 key_labels(&keys.seek_fwd),
@@ -3476,12 +3489,14 @@ fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
                 key_labels(&keys.speed_up),
                 key_labels(&keys.shuffle),
                 key_labels(&keys.repeat),
+                key_labels(&keys.search),
             )),
             Line::from(format!(
-                " {}: URL   Ctrl+{}: config   {}: volver   {}×2: salir",
+                " {}/{}: primera/última   {}: URL   Ctrl+{}: config   {}×2: salir",
+                key_labels(&keys.home),
+                key_labels(&keys.end),
                 key_labels(&keys.open_url),
                 settings_key_display(),
-                key_labels(&keys.back),
                 key_labels(&keys.quit),
             )),
         ],
@@ -4129,7 +4144,10 @@ mod tests {
             .map(|line| line_text(line))
             .collect::<Vec<_>>()
             .join("\n");
-        for hint in ["s: shuffle", "r: repeat", "n/p: pista", "b: buscar", "Esc×2: salir", "←/→: ±5s", "[/]: vel"] {
+        // T5: pie del player reequilibrado en 2 líneas — restaura
+        // `Tab: biblio` (deuda T1); `↑/↓: vol` abrevia para que entre en
+        // 78 cols.
+        for hint in ["Tab: biblio", "b: buscar", "espacio: pausa", "↑/↓: vol", "←/→: ±5s", "n/p: pista", "s: shuffle", "r: repeat", "[/]: vel", "u: URL", "Ctrl+P: config", "Esc×2: salir"] {
             assert!(player.contains(hint), "footer del player falta '{hint}': {player}");
         }
 
@@ -4139,9 +4157,16 @@ mod tests {
             .map(|line| line_text(line))
             .collect::<Vec<_>>()
             .join("\n");
-        for hint in ["s: shuffle", "r: repeat", "n/p: pista", "b: buscar", "Esc×2: salir", "←/→: ±5s", "[/]: vel"] {
+        // T5: `sig/ant` expandido (entra en 78 reagrupando), `Inicio/Fin`
+        // documentado y fuera el `Esc: volver` inexacto (sin player Esc arma
+        // la salida, cubierto por `Esc×2: salir`).
+        for hint in ["PgUp/PgDn: mover", "Enter: reproducir", "n/p: pista siguiente/anterior", "espacio: pausa", "←/→: ±5s", "[/]: vel", "s: shuffle", "r: repeat", "b: buscar", "Inicio/Fin: primera/última", "u: URL", "Ctrl+P: config", "Esc×2: salir"] {
             assert!(browser.contains(hint), "footer del explorador falta '{hint}': {browser}");
         }
+        assert!(
+            !browser.contains("Esc: volver"),
+            "sin `Esc: volver` inexacto: {browser}"
+        );
 
         // Panel lateral abierto (T13): lista + playback + aviso de volumen.
         app.mode = Mode::Player;
@@ -4158,7 +4183,8 @@ mod tests {
             "espacio: pausa",
             "←/→: ±5s",
             "[/]: vel",
-            "n/p: pista sig/ant",
+            "n/p: pista siguiente/anterior",
+            "u: URL",
             "Esc×2: salir",
             "volumen ↑/↓: con el panel cerrado",
         ] {
@@ -4170,6 +4196,19 @@ mod tests {
             "el pie con panel usa sus 3 líneas"
         );
         app.explorer_open = false;
+
+        // Pie del panel de configuración (T5: `abrir/alternar` por la deuda
+        // T4 — en «Mouse» Enter alterna, no abre sub-modal).
+        open_settings_panel(&mut app);
+        let settings: String = footer_lines(&app, false)
+            .iter()
+            .map(|line| line_text(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for hint in ["↑/↓: mover", "Enter: abrir/alternar", "Esc: cerrar"] {
+            assert!(settings.contains(hint), "pie del panel falta '{hint}': {settings}");
+        }
+        app.settings_panel = None;
 
         // Ninguna línea del pie puede exceder el ancho útil (78): si no, se
         // trunca en pantalla.

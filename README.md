@@ -43,17 +43,17 @@ Windows.
 
 | Tecla | Acción |
 | --- | --- |
-| `espacio` | Reproducir / pausar |
-| `↑` / `↓` | Volumen |
+| `espacio` | Pausa (reproducir / pausar) |
+| `↑` / `↓` | Volumen (en el pie: `vol`) |
 | `←` / `→` | Seek ±5 s |
-| `n` / `p` | Pista siguiente / anterior |
-| `s` | Aleatorio (shuffle) |
-| `r` | Modo repetir (off → una → todas) |
-| `[` / `]` | Velocidad 0.50x – 2.00x (pasos de 0.25x) |
-| `u` | Abrir diálogo para reproducir URL o archivo |
-| `Ctrl+P` | Abrir el panel de configuración (Temas/Mouse/Bandas) |
-| `Tab` / `Ctrl+Tab` | Abrir o cerrar el panel del explorador |
-| `b` | Abrir el panel del explorador con la búsqueda |
+| `n` / `p` | Pista siguiente / anterior (en el pie: `pista`) |
+| `s` | Aleatorio (`shuffle` en el pie) |
+| `r` | Modo repetir (`repeat` en el pie: off → una → todas) |
+| `[` / `]` | Velocidad (`vel` en el pie) 0.50x – 2.00x (pasos de 0.25x) |
+| `u` | URL: diálogo para reproducir URL o archivo |
+| `Ctrl+P` | Config: panel de configuración (Temas/Mouse/Bandas) |
+| `Tab` / `Ctrl+Tab` | Biblioteca (en el pie: `biblio`): abrir o cerrar el panel del explorador |
+| `b` | Buscar: abre el panel del explorador con la búsqueda |
 | `Esc` `Esc` | Salir: el primer `Esc` muestra «Apretá Esc de nuevo para salir» y el segundo, dentro de 2 segundos, cierra la app (otra tecla lo cancela) |
 
 **Modos de repetir (`r`) al terminar una pista naturalmente:**
@@ -86,10 +86,11 @@ audio (arranque sin archivo) el explorador sigue ocupando toda la pantalla.
 | `espacio` | Reproducir / pausar (el panel sigue abierto) |
 | `←` / `→` | Seek ±5 s |
 | `[` / `]` | Velocidad |
-| `n` / `p` | Pista siguiente / anterior |
-| `s` | Aleatorio |
-| `r` | Modo repetir |
-| `Ctrl+P` | Abrir el panel de configuración |
+| `n` / `p` | Pista siguiente / anterior (en el pie: `pista siguiente/anterior`) |
+| `s` | Aleatorio (`shuffle` en el pie) |
+| `r` | Modo repetir (`repeat` en el pie) |
+| `u` | URL: diálogo para reproducir URL o archivo (igual que en el reproductor) |
+| `Ctrl+P` | Config: panel de configuración |
 | `b` | Búsqueda incremental (vive en el panel) |
 | `Esc` / `Tab` / `Ctrl+Tab` | Cerrar el panel (el reproductor de fondo queda solo) |
 | `Esc` `Esc` | Salir (con el panel cerrado; el primer `Esc` con el panel abierto lo cierra) |
@@ -137,8 +138,8 @@ Con el mouse activado (por defecto):
 - **Rueda** sobre el reproductor: sube o baja el volumen.
 - **Footer de atajos:** cada atajo es un chip (la tecla resaltada y su acción);
   clickearlo hace lo mismo que apretar esa tecla.
-- Con el prompt de URL, el panel de configuración o su submenú de temas
-  abiertos, el mouse no actúa sobre lo que queda debajo.
+- Con el prompt de URL, el panel de configuración o sus submenús
+  (temas/bandas) abiertos, el mouse no actúa sobre lo que queda debajo.
 
 La captura del mouse reemplaza la selección de texto nativa de la terminal (en
 Windows Terminal se sigue pudiendo seleccionar con `Shift` + arrastre). Para
@@ -183,6 +184,16 @@ el momento (la fila muestra `Mouse: sí` / `Mouse: no`) y guarda su valor en
 la clave `mouse` de la sección `[ui]` de este archivo (creándola si no
 existe); el panel sigue abierto. Cerrar el panel no reactiva la captura: el
 toggle manda sobre el estado previo.
+
+### Panel de configuración (`Ctrl+P`)
+
+Espeja el pie del panel:
+
+| Tecla | Acción |
+| --- | --- |
+| `↑` / `↓` | Mover la selección entre Temas / Mouse / Bandas |
+| `Enter` | Abrir el submenú (Temas/Bandas) o alternar (Mouse) |
+| `Esc` | Cerrar el panel |
 
 ```toml
 [theme]
