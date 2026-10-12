@@ -2454,7 +2454,7 @@ fn render_player(frame: &mut Frame<'_>, app: &App, engine: &AudioEngine) {
     let player_focused = !app.explorer_open;
 
     render_player_info(frame, info_area, app, engine, player_focused);
-    render_visualizer(frame, visual_area, app.analyzer.bands(), player_focused);
+    render_visualizer(frame, visual_area, &app.analyzer, player_focused);
     if let Some(panel_area) = panel {
         render_explorer_panel(frame, panel_area, app);
     }
@@ -3335,7 +3335,7 @@ fn format_duration(duration: Duration) -> String {
 }
 
 /// Mejora 5: `focused` controla el color del borde del visualizador.
-fn render_visualizer(frame: &mut Frame<'_>, area: Rect, bands: &[f32; NUM_BANDS], focused: bool) {
+fn render_visualizer(frame: &mut Frame<'_>, area: Rect, analyzer: &SpectrumAnalyzer, focused: bool) {
     let border_color = if focused { theme().accent } else { theme().dim };
     let block = Block::bordered()
         .border_style(Style::default().fg(border_color))
@@ -3346,35 +3346,119 @@ fn render_visualizer(frame: &mut Frame<'_>, area: Rect, bands: &[f32; NUM_BANDS]
         config::effective_visualizer_style(),
         config::VisualizerStyle::Ascii
     );
-    // T1 modos-visualizador: el dispatch por modo existe pero cae a las
-    // barras para los 6 modos; `barras` recorre el path actual byte-a-byte
-    // idéntico (`paint_bands`, sin tocar).
+    // T2 modos-visualizador: `onda` va a su osciloscopio con las muestras
+    // crudas del tap; el resto cae a las barras (`barras` byte-a-byte
+    // idéntico vía `paint_bands`, sin tocar).
     match resolve_visualizer_paint(config::active_visualizer_mode()) {
         VisualizerPaint::Bars => {
-            paint_bands(frame.buffer_mut(), inner, bands, &theme(), ascii)
+            paint_bands(frame.buffer_mut(), inner, analyzer.bands(), &theme(), ascii)
+        }
+        VisualizerPaint::Wave => {
+            let samples = analyzer.waveform(inner.width as usize);
+            paint_wave(frame.buffer_mut(), inner, &samples, &theme(), ascii);
         }
     }
 }
 
-/// Destino del dispatch de render por modo (T1 modos-visualizador): hoy un
-/// solo pintor real; T2–T5 agregan variantes sin tocar el fallback.
+/// Destino del dispatch de render por modo (T2 modos-visualizador): barras u
+/// osciloscopio; T3–T5 agregan variantes sin tocar este fallback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VisualizerPaint {
     Bars,
+    Wave,
 }
 
-/// Dispatch puro del modo al pintor: en T1 TODOS los modos caen a las barras
-/// (fallback explícito y temporal hasta T2–T5, que implementan su render y
-/// reescriben este match junto con `visualizer_paint_falls_back_to_bars_in_t1`).
+/// Dispatch puro del modo al pintor: `onda` va al osciloscopio; el resto cae
+/// a las barras (fallback explícito y temporal hasta T3–T5, testeado en
+/// `visualizer_paint_routes_onda_to_wave_and_rest_to_bars`).
 fn resolve_visualizer_paint(mode: config::VisualizerMode) -> VisualizerPaint {
     match mode {
+        config::VisualizerMode::Onda => VisualizerPaint::Wave,
         config::VisualizerMode::Barras
-        | config::VisualizerMode::Onda
         | config::VisualizerMode::Espejo
         | config::VisualizerMode::Caida
         | config::VisualizerMode::Vu
         | config::VisualizerMode::Circular => VisualizerPaint::Bars,
     }
+}
+
+/// T2 (modos-visualizador): osciloscopio amplitud-vs-tiempo con las muestras
+/// crudas del tap (de más vieja a más nueva; la más reciente a la derecha).
+///
+/// Decisiones (testeadas en los tests `paint_wave_*`):
+/// - Eje cero: fila central tenue (`-` en ascii, `─` en unicode, color `dim`);
+///   la onda lo tapa donde lo cruza y asoma donde se desvía.
+/// - Onda: gradiente del tema por altura (`spectrum_color`, como las barras),
+///   `#` (`ASCII_RAMP[8]`) en ascii y `█` (`EIGHTH_BLOCKS[7]`) en unicode.
+/// - Fondo: puntos tenues en ascii, vacío en unicode (igual que las barras).
+/// - [-1, 1] mapea al alto con clamp; 1–2 filas degradan a línea plana al
+///   centro sin pánico; sin muestras solo se dibuja el eje.
+fn paint_wave(
+    buffer: &mut ratatui::buffer::Buffer,
+    inner: Rect,
+    samples: &[f32],
+    theme: &Theme,
+    ascii: bool,
+) {
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let height = inner.height;
+    let width = inner.width;
+    // Fondo (igual que las barras: puntos tenues en ascii, vacío en unicode).
+    for y in inner.y..inner.y + height {
+        for x in inner.x..inner.x + width {
+            if let Some(cell) = buffer.cell_mut((x, y)) {
+                if ascii {
+                    cell.set_symbol(".").set_fg(theme.dim);
+                } else {
+                    cell.set_symbol(" ").set_fg(Color::Reset);
+                }
+            }
+        }
+    }
+    // Eje cero: fila central tenue.
+    let axis_row = wave_sample_row(0.0, height);
+    let axis_symbol = if ascii { "-" } else { "─" };
+    for x in inner.x..inner.x + width {
+        if let Some(cell) = buffer.cell_mut((x, inner.y + axis_row)) {
+            cell.set_symbol(axis_symbol).set_fg(theme.dim);
+        }
+    }
+    // Onda: ventana con las muestras más recientes (1:1 por columna cuando
+    // alcanzan; reescalado lineal cuando hay menos que columnas).
+    let count = samples.len();
+    if count == 0 {
+        return;
+    }
+    let start = count.saturating_sub(width as usize);
+    let span = count - start;
+    let wave_symbol = if ascii { ASCII_RAMP[8] } else { EIGHTH_BLOCKS[7] };
+    for dx in 0..width {
+        let index = start + (dx as usize * span) / width as usize;
+        let row = wave_sample_row(samples[index], height);
+        let t = if height > 1 {
+            f32::from(height - 1 - row) / f32::from(height - 1)
+        } else {
+            0.5
+        };
+        let (red, green, blue) = spectrum_color(t, theme);
+        if let Some(cell) = buffer.cell_mut((inner.x + dx, inner.y + row)) {
+            cell
+                .set_symbol(wave_symbol)
+                .set_fg(Color::Rgb(red, green, blue));
+        }
+    }
+}
+
+/// Muestra en [-1, 1] → fila desde arriba (0 = arriba), con clamp. El cero
+/// cae en el centro redondeado; con 1 fila todo va a la fila 0.
+fn wave_sample_row(sample: f32, height: u16) -> u16 {
+    if height <= 1 {
+        return 0;
+    }
+    let clamped = sample.clamp(-1.0, 1.0);
+    ((1.0 - clamped) * 0.5 * f32::from(height - 1)).round() as u16
 }
 
 /// Pinta las 32 barras dentro del área interior del bloque, sin widgets.
@@ -3986,6 +4070,133 @@ mod tests {
         let above = &buffer[(0u16, partial_y - 1)];
         assert_eq!(above.symbol(), ".", "sobre la barra = punto tenue");
         assert_eq!(above.fg, theme.dim);
+    }
+
+    // T2 (modos-visualizador): osciloscopio `onda` con muestras crudas.
+    // Área 8x7 → eje cero en fila 3 (0.5 * 6 = 3.0); la onda tapa al eje
+    // donde lo cruza y el eje asoma donde la onda se desvía.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn paint_wave_empty_samples_draws_dim_axis_only() {
+        let theme = Theme::default();
+        let area = Rect::new(0, 0, 8, 7);
+        // ASCII: eje `-` tenue, resto fondo de puntos.
+        let mut buffer = Buffer::empty(area);
+        paint_wave(&mut buffer, area, &[], &theme, true);
+        for x in 0..8u16 {
+            let axis = &buffer[(x, 3u16)];
+            assert_eq!(axis.symbol(), "-", "eje cero en fila 3 (x={x})");
+            assert_eq!(axis.fg, theme.dim);
+            for y in [0u16, 1, 2, 4, 5, 6] {
+                let cell = &buffer[(x, y)];
+                assert_eq!(cell.symbol(), ".", "fondo de puntos en ({x},{y})");
+                assert_eq!(cell.fg, theme.dim);
+            }
+        }
+        // Unicode: eje `─` tenue, resto vacío.
+        let mut buffer = Buffer::empty(area);
+        paint_wave(&mut buffer, area, &[], &theme, false);
+        for x in 0..8u16 {
+            let axis = &buffer[(x, 3u16)];
+            assert_eq!(axis.symbol(), "─", "eje cero unicode en fila 3");
+            assert_eq!(axis.fg, theme.dim);
+            assert_eq!(buffer[(x, 0u16)].symbol(), " ");
+        }
+    }
+
+    #[test]
+    fn paint_wave_silence_is_flat_gradient_line_at_center() {
+        // Sin señal la onda ES el cero: tapa al eje con una línea plana.
+        let theme = Theme::default();
+        let area = Rect::new(0, 0, 8, 7);
+        let mut buffer = Buffer::empty(area);
+        paint_wave(&mut buffer, area, &[0.0f32; 8], &theme, false);
+        for x in 0..8u16 {
+            assert_eq!(buffer[(x, 3u16)].symbol(), "█", "plana en el centro");
+        }
+        // Fila 3 de 7 → t = (6 - 3) / 6 = 0.5 → spectrum_mid.
+        let expected = spectrum_color(0.5, &theme);
+        assert_eq!(
+            buffer[(0u16, 3u16)].fg,
+            Color::Rgb(expected.0, expected.1, expected.2),
+            "la onda usa el gradiente del tema por altura"
+        );
+        assert_eq!(buffer[(0u16, 0u16)].symbol(), " ");
+    }
+
+    #[test]
+    fn paint_wave_newest_sample_at_right() {
+        // La más reciente a la derecha: última muestra = 1.0 → arriba.
+        let theme = Theme::default();
+        let area = Rect::new(0, 0, 8, 7);
+        let mut buffer = Buffer::empty(area);
+        let samples = [0.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+        paint_wave(&mut buffer, area, &samples, &theme, false);
+        assert_eq!(
+            buffer[(7u16, 0u16)].symbol(),
+            "█",
+            "1.0 mapea a la fila de arriba"
+        );
+        assert_eq!(
+            buffer[(0u16, 3u16)].symbol(),
+            "█",
+            "la primera (más vieja) queda a la izquierda, en el centro"
+        );
+        // Pico arriba → t = 1.0 → spectrum_high.
+        let expected = spectrum_color(1.0, &theme);
+        assert_eq!(
+            buffer[(7u16, 0u16)].fg,
+            Color::Rgb(expected.0, expected.1, expected.2)
+        );
+    }
+
+    #[test]
+    fn paint_wave_clamps_out_of_range_without_panic() {
+        let theme = Theme::default();
+        let area = Rect::new(0, 0, 2, 5);
+        let mut buffer = Buffer::empty(area);
+        paint_wave(&mut buffer, area, &[2.0f32, -3.0], &theme, false);
+        assert_eq!(buffer[(0u16, 0u16)].symbol(), "█", "2.0 se clampa arriba");
+        assert_eq!(buffer[(1u16, 4u16)].symbol(), "█", "-3.0 se clampa abajo");
+    }
+
+    #[test]
+    fn paint_wave_tiny_heights_degrade_to_flat_center_line() {
+        // Precedente: los menús no entran en pánico en terminales enanas;
+        // la onda tampoco (1–2 filas → línea plana al centro).
+        let theme = Theme::default();
+        let samples = [0.5f32, -0.5, 1.0, -1.0, 0.25, -0.25, 0.75, -0.75];
+        let area = Rect::new(0, 0, 8, 1);
+        let mut buffer = Buffer::empty(area);
+        paint_wave(&mut buffer, area, &samples, &theme, false);
+        for x in 0..8u16 {
+            assert_eq!(buffer[(x, 0u16)].symbol(), "█", "1 fila: todo al centro");
+        }
+        let area = Rect::new(0, 0, 8, 2);
+        let mut buffer = Buffer::empty(area);
+        paint_wave(&mut buffer, area, &[0.0f32; 8], &theme, false);
+        for x in 0..8u16 {
+            // Eje de alto 2: (0.5 * 1).round() = 1 → fila de abajo.
+            assert_eq!(buffer[(x, 1u16)].symbol(), "█", "2 filas: centro abajo");
+        }
+    }
+
+    #[test]
+    fn paint_wave_ascii_uses_hash_and_axis_shows_where_wave_leaves() {
+        let theme = Theme::default();
+        // Alto 5 → eje en fila 2 (0.5 * 4 = 2.0).
+        let area = Rect::new(0, 0, 4, 5);
+        let mut buffer = Buffer::empty(area);
+        paint_wave(&mut buffer, area, &[1.0f32, -1.0, 0.0, 0.0], &theme, true);
+        assert_eq!(buffer[(0u16, 0u16)].symbol(), "#", "1.0 arriba con #");
+        assert_eq!(buffer[(1u16, 4u16)].symbol(), "#", "-1.0 abajo con #");
+        assert_eq!(buffer[(2u16, 2u16)].symbol(), "#", "el cero tapa al eje");
+        assert_eq!(buffer[(0u16, 2u16)].symbol(), "-", "el eje asoma en x=0");
+        assert_eq!(buffer[(0u16, 2u16)].fg, theme.dim);
+        let empty = &buffer[(0u16, 1u16)];
+        assert_eq!(empty.symbol(), ".", "celda vacía = punto tenue");
+        assert_eq!(empty.fg, theme.dim);
     }
 
     fn test_app() -> App {
@@ -6341,10 +6552,26 @@ mod tests {
     }
 
     #[test]
-    fn visualizer_paint_falls_back_to_bars_in_t1() {
-        // T1: dispatch explícito y temporal — los 6 modos caen al render de
-        // barras (T2–T5 implementan su pintor y este test se reescribe).
-        for mode in config::VisualizerMode::options() {
+    fn visualizer_paint_routes_onda_to_wave_and_rest_to_bars() {
+        // T2: `onda` tiene su pintor propio (osciloscopio con muestras crudas);
+        // el resto sigue en barras (fallback temporal hasta T3–T5, que
+        // reescriben este test al implementar su pintor).
+        assert_eq!(
+            resolve_visualizer_paint(config::VisualizerMode::Barras),
+            VisualizerPaint::Bars,
+            "barras recorre el path actual"
+        );
+        assert_eq!(
+            resolve_visualizer_paint(config::VisualizerMode::Onda),
+            VisualizerPaint::Wave,
+            "onda va al osciloscopio, no a las barras"
+        );
+        for mode in [
+            config::VisualizerMode::Espejo,
+            config::VisualizerMode::Caida,
+            config::VisualizerMode::Vu,
+            config::VisualizerMode::Circular,
+        ] {
             assert_eq!(
                 resolve_visualizer_paint(mode),
                 VisualizerPaint::Bars,

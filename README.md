@@ -262,9 +262,10 @@ Notas del comportamiento de la config:
   elige solo: unicode con `WT_SESSION` (Windows Terminal), ascii sin ella. Un
   valor inválido avisa y se usa `auto`. El gradiente de color no cambia.
 - `[visualizer] mode` elige el modo del visualizador: `barras` (default, el
-  comportamiento actual), `onda`, `espejo`, `caida`, `vu` o `circular`. Un
-  valor inválido avisa y se usa `barras`. En T1 todos los modos dibujan las
-  barras (fallback temporal hasta T2–T5).
+  comportamiento actual), `onda` (osciloscopio con las muestras crudas del
+  audio, la más reciente a la derecha), `espejo`, `caida`, `vu` o `circular`. Un
+  valor inválido avisa y se usa `barras`. `espejo`/`caida`/`vu`/`circular`
+  dibujan las barras (fallback temporal hasta T3–T5).
 - Si dos acciones distintas quedan mapeadas a la misma tecla, gana la de
   mayor prioridad en el dispatch y se genera un warning que lo explicita
   (la perdedora vuelve a sus defaults libres).

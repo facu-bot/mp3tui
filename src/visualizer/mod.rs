@@ -164,6 +164,20 @@ impl SpectrumAnalyzer {
         &self.bands
     }
 
+    /// Las `max_points` muestras crudas más recientes del ring, de más vieja
+    /// a más nueva (para que la más reciente caiga a la derecha del
+    /// osciloscopio de T2). Si hay menos historia, devuelve la que haya;
+    /// sin muestras o con tope 0 devuelve vacío.
+    pub fn waveform(&self, max_points: usize) -> Vec<f32> {
+        let take = self.filled.min(FFT_SIZE).min(max_points);
+        let mut out = Vec::with_capacity(take);
+        let start = (self.ring_pos + FFT_SIZE - take) % FFT_SIZE;
+        for i in 0..take {
+            out.push(self.ring[(start + i) % FFT_SIZE]);
+        }
+        out
+    }
+
     /// Mapeo logarítmico de frecuencias a bins de la FFT (bordes compartidos
     /// entre bandas, sin huecos), como hace cava.
     fn compute_ranges(sample_rate: u32) -> Vec<(usize, usize)> {
@@ -214,6 +228,50 @@ fn shape(energy: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn waveform_returns_most_recent_oldest_first() {
+        let mut analyzer = SpectrumAnalyzer::new();
+        // Ring a medio llenar: las muestras van en orden de llegada.
+        for (i, slot) in analyzer.ring.iter_mut().enumerate().take(100) {
+            *slot = i as f32;
+        }
+        analyzer.filled = 100;
+        analyzer.ring_pos = 100;
+
+        let wave = analyzer.waveform(8);
+        assert_eq!(
+            wave,
+            vec![92.0, 93.0, 94.0, 95.0, 96.0, 97.0, 98.0, 99.0],
+            "las 8 más recientes, de más vieja a más nueva (la última es la más nueva)"
+        );
+
+        // Con wrap-around: el orden cronológico se mantiene.
+        analyzer.filled = FFT_SIZE;
+        analyzer.ring_pos = 3;
+        for (i, slot) in analyzer.ring.iter_mut().enumerate() {
+            *slot = i as f32;
+        }
+        // ring_pos = 3 → la más nueva es ring[2]; pedir 5 devuelve
+        // ring[FFT-2..] ++ ring[..3] en orden cronológico.
+        let wave = analyzer.waveform(5);
+        assert_eq!(
+            wave,
+            vec![
+                (FFT_SIZE - 2) as f32,
+                (FFT_SIZE - 1) as f32,
+                0.0,
+                1.0,
+                2.0,
+            ],
+            "el wrap-around no rompe el orden"
+        );
+
+        // Sin muestras o con tope 0: vacío, sin pánico.
+        let fresh = SpectrumAnalyzer::new();
+        assert!(fresh.waveform(80).is_empty());
+        assert!(analyzer.waveform(0).is_empty());
+    }
 
     #[test]
     fn band_ranges_are_contiguous_and_in_bounds() {
