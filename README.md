@@ -127,6 +127,8 @@ anterior.
 
 ### Búsqueda (cuando está abierta)
 
+El campo aparece como una caja destacada junto a «Buscar:», con el fondo de
+selección del tema activo y el cursor visible; vacía muestra «escribí para buscar».
 Escribir filtra por título, artista, álbum o nombre de archivo.
 `Backspace` borra, `Enter` aplica, `Esc` cancela y devuelve la lista completa.
 

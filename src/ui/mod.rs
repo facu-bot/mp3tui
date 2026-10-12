@@ -46,6 +46,10 @@ fn theme() -> Theme {
 const CURSOR: &str = "\u{258c}"; // ▌ fila seleccionada
 const PLAYING: &str = "\u{25b6}"; // ▶ pista en reproducción
 const SEARCH_CARET: &str = "\u{258f}"; // ▏ cursor de texto en modo búsqueda
+/// Ancho fijo (en columnas) de la caja del campo de búsqueda.
+const SEARCH_BOX_WIDTH: usize = 24;
+/// Texto guía de la caja vacía.
+const SEARCH_PLACEHOLDER: &str = "escribí para buscar";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Status {
@@ -271,8 +275,6 @@ struct App {
     quit_guard: QuitGuard,
 }
 
-/// Estado del menú de temas (T12): selección con previsualización en vivo y
-/// el tema con el que se abrió (para el marcador y para restaurar con Esc).
 /// Ventana para confirmar la salida con un segundo Esc.
 const QUIT_CONFIRM_WINDOW: Duration = Duration::from_secs(2);
 
@@ -324,6 +326,8 @@ fn request_quit(app: &mut App) {
     }
 }
 
+/// Estado del menú de temas (T12): selección con previsualización en vivo y
+/// el tema con el que se abrió (para el marcador y para restaurar con Esc).
 struct ThemeMenuState {
     /// Índice en `config::builtin_themes()`.
     selected: usize,
@@ -2020,10 +2024,7 @@ fn render_library(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
     };
     let block = Block::bordered()
         .border_style(Style::default().fg(border_color))
-        .title(Span::styled(
-            library_title(app, &folder),
-            Style::default().fg(highlight).add_modifier(Modifier::BOLD),
-        ));
+        .title(library_title_line(app, &folder, highlight));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -2276,6 +2277,63 @@ fn folder_header_line(folder: &str, width: u16) -> Line<'static> {
     Line::from(spans)
 }
 
+/// Título del bloque biblioteca como línea con estilos: buscando, «Buscar:»
+/// más una caja de ancho fijo con el fondo `select_bg` del tema, para que el
+/// campo se distinga del borde; si no, el título de siempre.
+fn library_title_line(app: &App, folder: &str, highlight: Color) -> Line<'static> {
+    let title_style = Style::default().fg(highlight).add_modifier(Modifier::BOLD);
+    let Some(query) = &app.search else {
+        return Line::from(Span::styled(library_title(app, folder), title_style));
+    };
+
+    let mut spans = vec![
+        Span::styled(" Buscar: ", title_style),
+        search_box_span(query),
+        Span::styled(format!(" · {} coincidencias ", app.view.len()), title_style),
+    ];
+    let suffix = mode_suffix(app);
+    if !suffix.is_empty() {
+        spans.push(Span::styled(suffix, title_style));
+    }
+    Line::from(spans)
+}
+
+/// Caja del campo de búsqueda: siempre `SEARCH_BOX_WIDTH` columnas sobre el
+/// fondo `select_bg`. Con texto largo muestra el final (donde está el cursor);
+/// vacía muestra un placeholder tenue.
+fn search_box_span(query: &str) -> Span<'static> {
+    let (content, fg) = if query.is_empty() {
+        (format!("{SEARCH_CARET}{SEARCH_PLACEHOLDER}"), theme().dim)
+    } else {
+        let typed = format!("{query}{SEARCH_CARET}");
+        let len = typed.chars().count();
+        let visible = if len > SEARCH_BOX_WIDTH {
+            typed.chars().skip(len - SEARCH_BOX_WIDTH).collect()
+        } else {
+            typed
+        };
+        (visible, theme().text)
+    };
+    let padding = SEARCH_BOX_WIDTH.saturating_sub(content.chars().count());
+    Span::styled(
+        format!("{content}{}", " ".repeat(padding)),
+        Style::default().fg(fg).bg(theme().select_bg),
+    )
+}
+
+/// Indicadores de modo (repeat/shuffle) que se agregan al título solo cuando
+/// están prendidos.
+fn mode_suffix(app: &App) -> String {
+    let mut suffix = String::new();
+    if let Some(label) = app.repeat.label() {
+        suffix.push_str(&format!("· repeat: {label} "));
+    }
+    if app.shuffle {
+        suffix.push_str("· shuffle ");
+    }
+    suffix
+}
+
 /// Título del bloque biblioteca: lista visible, filtro, búsqueda activa y
 /// modos de reproducción (solo cuando están prendidos, para no ensuciar).
 fn library_title(app: &App, folder: &str) -> String {
@@ -2305,12 +2363,7 @@ fn library_title(app: &App, folder: &str) -> String {
             }
         }
     };
-    if let Some(label) = app.repeat.label() {
-        title.push_str(&format!("· repeat: {label} "));
-    }
-    if app.shuffle {
-        title.push_str("· shuffle ");
-    }
+    title.push_str(&mode_suffix(app));
     title
 }
 
@@ -3550,6 +3603,71 @@ mod tests {
 
     fn theme_menu_key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn find_search_box(line: &Line<'_>) -> Option<Span<'static>> {
+        line.spans
+            .iter()
+            .find(|span| span.style.bg == Some(theme().select_bg))
+            .map(|span| Span::styled(span.content.to_string(), span.style))
+    }
+
+    #[test]
+    fn search_title_shows_a_fixed_width_box_with_theme_background() {
+        let mut app = library_with_three();
+        app.search = Some("ab".to_string());
+        let line = library_title_line(&app, "Music", theme().warn);
+        let text = line_text(&line);
+        assert!(text.contains("Buscar:"), "{text}");
+        assert!(text.contains("coincidencias"), "{text}");
+
+        let boxed = find_search_box(&line).expect("la caja usa el fondo select_bg");
+        assert_eq!(boxed.content.chars().count(), SEARCH_BOX_WIDTH, "ancho fijo");
+        assert!(
+            boxed.content.starts_with(&format!("ab{SEARCH_CARET}")),
+            "{:?}",
+            boxed.content
+        );
+    }
+
+    #[test]
+    fn search_box_keeps_the_end_of_long_queries_visible() {
+        let mut app = library_with_three();
+        let long = "abcdefghijklmnopqrstuvwxyz0123456789";
+        app.search = Some(long.to_string());
+        let line = library_title_line(&app, "Music", theme().warn);
+        let boxed = find_search_box(&line).expect("caja");
+        assert_eq!(boxed.content.chars().count(), SEARCH_BOX_WIDTH);
+        assert!(
+            boxed.content.ends_with(&format!("789{SEARCH_CARET}")),
+            "{:?}",
+            boxed.content
+        );
+    }
+
+    #[test]
+    fn empty_search_box_shows_dim_placeholder() {
+        let mut app = library_with_three();
+        app.search = Some(String::new());
+        let line = library_title_line(&app, "Music", theme().warn);
+        let boxed = find_search_box(&line).expect("caja");
+        assert!(boxed.content.contains(SEARCH_PLACEHOLDER), "{:?}", boxed.content);
+        assert_eq!(boxed.style.fg, Some(theme().dim), "placeholder tenue");
+        assert_eq!(boxed.content.chars().count(), SEARCH_BOX_WIDTH);
+    }
+
+    #[test]
+    fn search_title_keeps_mode_indicators_and_plain_title_has_no_box() {
+        let mut app = library_with_three();
+        app.shuffle = true;
+        app.search = Some("x".to_string());
+        let searching = line_text(&library_title_line(&app, "Music", theme().warn));
+        assert!(searching.contains("shuffle"), "{searching}");
+
+        app.search = None;
+        let plain = library_title_line(&app, "Music", theme().accent);
+        assert!(find_search_box(&plain).is_none(), "sin búsqueda no hay caja");
+        assert_eq!(line_text(&plain), library_title(&app, "Music"));
     }
 
     #[test]
