@@ -132,6 +132,8 @@ Con el mouse activado (por defecto):
 - **Barra de progreso:** clic para saltar a ese punto; arrastrar y soltar para
   elegir otro (el salto se hace al soltar).
 - **Barra de volumen:** clic o arrastre para fijar el volumen.
+- **Botones** debajo del progreso: `◀◀` anterior, `▶` / `▮▮` reproducir o pausar,
+  `▶▶` siguiente, `aleatorio` y `repetir` (resaltados cuando están activos).
 - **Rueda** sobre el reproductor: sube o baja el volumen.
 - Con el prompt de URL o el menú de temas abiertos, el mouse no actúa sobre lo
   que queda debajo.

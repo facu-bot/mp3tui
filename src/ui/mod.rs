@@ -315,6 +315,8 @@ struct HitMap {
     volume: Option<BarHit>,
     /// Área del reproductor (info + visualizador): la rueda cambia el volumen.
     player: Option<Rect>,
+    /// Botones de transporte dibujados (área y botón).
+    buttons: Vec<(Rect, Button)>,
 }
 
 /// Arrastre en curso: sigue a la barra donde empezó aunque el puntero salga.
@@ -326,12 +328,72 @@ enum Drag {
     Volume,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Button {
+    Prev,
+    PlayPause,
+    Next,
+    Shuffle,
+    Repeat,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum MouseAction {
     None,
     SeekRatio(f64),
     SetVolume(f64),
     VolumeStep(i8),
+    Press(Button),
+}
+
+/// Fila de controles clickeables: la línea a dibujar y, por botón, la columna
+/// inicial (relativa a la fila) y su ancho.
+fn transport_row(
+    playing: bool,
+    shuffle: bool,
+    repeat: RepeatMode,
+) -> (Line<'static>, Vec<(Button, u16, u16)>) {
+    let transport = Style::default()
+        .fg(theme().text)
+        .bg(theme().select_bg)
+        .add_modifier(Modifier::BOLD);
+    let toggle = |active: bool| {
+        Style::default()
+            .fg(if active { theme().accent } else { theme().dim })
+            .bg(theme().select_bg)
+    };
+    let repeat_label = match repeat.label() {
+        Some(label) => format!("repetir: {label}"),
+        None => "repetir".to_string(),
+    };
+    // (botón, texto, estilo, separación antes). Glifos de ancho simple para
+    // que el área clickeable coincida con lo que se ve.
+    let chips: [(Button, String, Style, &str); 5] = [
+        (Button::Prev, "◀◀".to_string(), transport, "  "),
+        (
+            Button::PlayPause,
+            if playing { "▮▮" } else { "▶" }.to_string(),
+            transport,
+            "  ",
+        ),
+        (Button::Next, "▶▶".to_string(), transport, "  "),
+        (Button::Shuffle, "aleatorio".to_string(), toggle(shuffle), "     "),
+        (Button::Repeat, repeat_label, toggle(repeat.label().is_some()), "  "),
+    ];
+
+    let mut spans = Vec::new();
+    let mut buttons = Vec::new();
+    let mut column: u16 = 0;
+    for (button, label, style, gap) in chips {
+        spans.push(Span::raw(gap));
+        column += gap.chars().count() as u16;
+        let chip = format!(" {label} ");
+        let width = chip.chars().count() as u16;
+        buttons.push((button, column, width));
+        spans.push(Span::styled(chip, style));
+        column += width;
+    }
+    (Line::from(spans), buttons)
 }
 
 /// Columna inicial (relativa) y ancho del tramo interno de una barra hecha
@@ -354,7 +416,10 @@ fn mouse_action(hit: &HitMap, drag: Option<Drag>, event: MouseEvent) -> (MouseAc
     let (column, row) = (event.column, event.row);
     match event.kind {
         MouseEventKind::Down(MouseButton::Left) => {
-            if let Some(bar) = hit.progress.filter(|bar| bar.contains(column, row)) {
+            let point = ratatui::layout::Position::new(column, row);
+            if let Some((_, button)) = hit.buttons.iter().find(|(area, _)| area.contains(point)) {
+                (MouseAction::Press(*button), None)
+            } else if let Some(bar) = hit.progress.filter(|bar| bar.contains(column, row)) {
                 (MouseAction::SeekRatio(bar.ratio(column)), Some(Drag::Progress(None)))
             } else if let Some(bar) = hit.volume.filter(|bar| bar.contains(column, row)) {
                 (MouseAction::SetVolume(bar.ratio(column)), Some(Drag::Volume))
@@ -410,6 +475,11 @@ fn handle_mouse(event: MouseEvent, app: &mut App, engine: &mut AudioEngine) {
         MouseAction::VolumeStep(step) => engine.set_volume(
             (engine.volume() + f32::from(step) * VOLUME_STEP).clamp(0.0, 1.0),
         ),
+        MouseAction::Press(Button::Prev) => play_step(app, engine, -1),
+        MouseAction::Press(Button::PlayPause) => toggle_play(app, engine),
+        MouseAction::Press(Button::Next) => play_step(app, engine, 1),
+        MouseAction::Press(Button::Shuffle) => toggle_shuffle(app),
+        MouseAction::Press(Button::Repeat) => app.repeat = app.repeat.cycle(),
     }
 }
 
@@ -1785,7 +1855,7 @@ fn player_areas(area: Rect, explorer_open: bool) -> (Rect, Rect, Rect, Option<Re
     let zones = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(8),
+            Constraint::Length(9),
             Constraint::Min(4),
             Constraint::Length(footer_height),
         ])
@@ -1808,7 +1878,7 @@ fn player_areas(area: Rect, explorer_open: bool) -> (Rect, Rect, Rect, Option<Re
     let left = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(8),
+            Constraint::Length(9),
             Constraint::Min(4),
         ])
         .split(columns[0]);
@@ -1865,8 +1935,10 @@ fn render_player_info(frame: &mut Frame<'_>, area: Rect, app: &App, engine: &Aud
     // Bloque inicial: archivo + (meta opcional) + estado + error.
     let first_block_lines = if show_meta { 4 } else { 3 };
 
+    // Archivo/estado, volumen, progreso y la fila de controles clickeables.
     let mut constraints = vec![
         Constraint::Length(first_block_lines),
+        Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
     ];
@@ -1933,6 +2005,22 @@ fn render_player_info(frame: &mut Frame<'_>, area: Rect, app: &App, engine: &Aud
             y: rows[row].y,
             width,
         });
+    }
+
+    let controls_area = rows[row + 2];
+    let (controls, buttons) = transport_row(engine.is_playing(), app.shuffle, app.repeat);
+    frame.render_widget(Paragraph::new(controls), controls_area);
+    {
+        let mut hit = app.hit.borrow_mut();
+        for (button, start, width) in buttons {
+            let x = controls_area.x.saturating_add(start);
+            let right = controls_area.x.saturating_add(controls_area.width);
+            if x >= right {
+                continue;
+            }
+            let width = width.min(right - x);
+            hit.buttons.push((Rect::new(x, controls_area.y, width, 1), button));
+        }
     }
 
     let position = engine.position();
@@ -3791,6 +3879,7 @@ mod tests {
             progress: Some(BarHit { x: 20, y: 6, width: 51 }),
             volume: Some(BarHit { x: 20, y: 5, width: 11 }),
             player: Some(Rect::new(0, 0, 100, 20)),
+            buttons: Vec::new(),
         }
     }
 
@@ -3933,6 +4022,86 @@ mod tests {
         assert_eq!(engine.volume(), 1.0, "clic al final = 100%");
         engine.set_volume(0.0);
         assert_eq!(app.drag, Some(Drag::Volume));
+    }
+
+    fn row_text(line: &Line<'_>) -> String {
+        line.spans.iter().map(|span| span.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn transport_row_lists_buttons_in_order_with_play_state() {
+        let (paused, buttons) = transport_row(false, false, RepeatMode::Off);
+        let kinds: Vec<Button> = buttons.iter().map(|(b, _, _)| *b).collect();
+        assert_eq!(
+            kinds,
+            vec![Button::Prev, Button::PlayPause, Button::Next, Button::Shuffle, Button::Repeat]
+        );
+        assert!(row_text(&paused).contains('▶'), "pausado muestra play");
+        let (playing, _) = transport_row(true, false, RepeatMode::Off);
+        assert!(row_text(&playing).contains("▮▮"), "sonando muestra pausa");
+    }
+
+    #[test]
+    fn transport_row_positions_match_the_drawn_text() {
+        let (line, buttons) = transport_row(true, true, RepeatMode::All);
+        let text: Vec<char> = row_text(&line).chars().collect();
+        let mut previous_end = 0;
+        for (button, start, width) in &buttons {
+            assert!(*width > 0, "{button:?} tiene ancho");
+            assert!(*start >= previous_end, "{button:?} no se solapa");
+            let label: String = text[*start as usize..(*start + *width) as usize].iter().collect();
+            assert!(!label.trim().is_empty(), "{button:?} cubre texto visible: {label:?}");
+            previous_end = start + width;
+        }
+        let row = row_text(&line);
+        assert!(row.contains("aleatorio") && row.contains("repetir: todo"), "{row}");
+    }
+
+    #[test]
+    fn active_toggles_are_highlighted() {
+        let style_of = |line: &Line<'_>, needle: &str| {
+            line.spans
+                .iter()
+                .find(|span| span.content.contains(needle))
+                .and_then(|span| span.style.fg)
+        };
+        let (off, _) = transport_row(false, false, RepeatMode::Off);
+        let (on, _) = transport_row(false, true, RepeatMode::One);
+        assert_eq!(style_of(&on, "aleatorio"), Some(theme().accent));
+        assert_ne!(style_of(&off, "aleatorio"), Some(theme().accent));
+        assert_eq!(style_of(&on, "repetir"), Some(theme().accent));
+    }
+
+    #[test]
+    fn click_on_a_button_presses_it() {
+        let mut hit = sample_hit();
+        hit.buttons = vec![(Rect::new(10, 8, 4, 1), Button::Next)];
+        let (action, drag) =
+            mouse_action(&hit, None, mouse(MouseEventKind::Down(MouseButton::Left), 12, 8));
+        assert_eq!((action, drag), (MouseAction::Press(Button::Next), None));
+    }
+
+    #[test]
+    fn clicking_the_shuffle_button_toggles_shuffle() {
+        let Some(mut engine) = engine_or_skip() else { return };
+        let mut app = library_with_three();
+        app.mode = Mode::Player;
+        app.has_player = true;
+        render_player_frame(&app, &engine);
+        let shuffle = app
+            .hit
+            .borrow()
+            .buttons
+            .iter()
+            .find(|(_, b)| *b == Button::Shuffle)
+            .map(|(rect, _)| *rect)
+            .expect("botón aleatorio registrado");
+        handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), shuffle.x, shuffle.y),
+            &mut app,
+            &mut engine,
+        );
+        assert!(app.shuffle, "el clic activa el aleatorio");
     }
 
     fn find_search_box(line: &Line<'_>) -> Option<Span<'static>> {
