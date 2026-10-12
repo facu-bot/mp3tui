@@ -7,6 +7,13 @@ Se maneja por teclado.
 
 [ratatui]: https://github.com/ratatui/ratatui
 
+## Capturas
+
+<p align="center">
+  <img src="assets/mp3tui-1.png" width="820" alt="Captura de mp3tui">
+  <img src="assets/mp3tui-2.png" width="820" alt="Captura de mp3tui">
+</p>
+
 ## Requisitos
 
 - [Rust](https://rustup.rs) (toolchain estable).
@@ -15,8 +22,8 @@ Se maneja por teclado.
 ## Clonar y correr
 
 ```sh
-git clone https://github.com/TU-USUARIO/mp3tui.git
-cd mp3tui
+git clone https://github.com/facu-bot/mp3tui-prototipo.git
+cd mp3tui-prototipo
 
 cargo run "cancion.mp3"        # archivo local
 cargo run "C:/Musica"          # carpeta con la biblioteca
