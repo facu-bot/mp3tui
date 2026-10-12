@@ -183,8 +183,12 @@ Desde el panel (`Ctrl+P` → `Modo`) se abre el selector de modo: `↑`/`↓`
 previsualizan cada modo en vivo, `Enter` aplica el modo y guarda su `mode`
 en la sección `[visualizer]` de este archivo (creándola si no existe) y
 vuelve al panel, y `Esc` cancela, restaura el modo anterior y vuelve al
-panel. `onda` dibuja el osciloscopio con las muestras crudas del audio,
-`espejo` las 32 bandas en espejo vertical desde una línea central y `vu` el
+panel. `onda` dibuja un osciloscopio con disparador (triggered): busca un
+cruce por cero ascendente reciente para que la imagen no salte de fase
+cuadro a cuadro, con ganancia automática (una señal floja se escala para
+usar buena parte del alto) y trazo continuo (sin huecos columna a columna;
+Braille en unicode para más resolución). `espejo` las 32 bandas en espejo
+vertical desde una línea central y `vu` el
 medidor de nivel mono en escala dBFS (-60..0) con marca de pico (decae en
 ~800 ms); `circular` un anillo grueso pulsante con las 32 bandas (hueco
 tenue en el centro, grosor y gradiente del tema según el nivel por ángulo).
@@ -266,8 +270,10 @@ Notas del comportamiento de la config:
   elige solo: unicode con `WT_SESSION` (Windows Terminal), ascii sin ella. Un
   valor inválido avisa y se usa `auto`. El gradiente de color no cambia.
 - `[visualizer] mode` elige el modo del visualizador: `barras` (default, el
-  comportamiento actual), `onda` (osciloscopio con las muestras crudas del
-  audio, la más reciente a la derecha), `espejo` (las 32 bandas en espejo
+  comportamiento actual), `onda` (osciloscopio con disparador de cruce por
+  cero ascendente, ventana de ~20-25 ms con ganancia automática y trazo
+  continuo sin huecos — Braille en unicode, `#` conectado en ascii; la
+  muestra más reciente a la derecha), `espejo` (las 32 bandas en espejo
   vertical desde una línea central tenue), `vu` (medidor de nivel mono en
   escala dBFS: el RMS se mapea de -60 dBFS → 0% a 0 dBFS → 100% con clamp
   en los extremos, así música típica usa un rango visible de la barra en

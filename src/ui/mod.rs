@@ -3346,15 +3346,16 @@ fn render_visualizer(frame: &mut Frame<'_>, area: Rect, analyzer: &SpectrumAnaly
         config::VisualizerStyle::Ascii
     );
     // Cada modo va a su propio pintor con los datos que necesita: `onda` al
-    // osciloscopio con las muestras crudas del tap, `espejo` y `vu` con las
-    // bandas/RMS del analizador, `circular` a su plot polar; `barras` sigue
-    // el path actual byte-a-byte idéntico vía `paint_bands`.
+    // osciloscopio con la ventana triggered y con ganancia automática del
+    // analizador (`scope_window`), `espejo` y `vu` con las bandas/RMS del
+    // analizador, `circular` a su plot polar; `barras` sigue el path actual
+    // byte-a-byte idéntico vía `paint_bands`.
     match resolve_visualizer_paint(config::active_visualizer_mode()) {
         VisualizerPaint::Bars => {
             paint_bands(frame.buffer_mut(), inner, analyzer.bands(), &theme(), ascii)
         }
         VisualizerPaint::Wave => {
-            let samples = analyzer.waveform(inner.width as usize);
+            let samples = analyzer.scope_window();
             paint_wave(frame.buffer_mut(), inner, &samples, &theme(), ascii);
         }
         VisualizerPaint::Mirror => {
@@ -3750,17 +3751,25 @@ fn band_frac_glyph(frac: f32, ascii: bool) -> &'static str {
     }
 }
 
-/// T2 (modos-visualizador): osciloscopio amplitud-vs-tiempo con las muestras
-/// crudas del tap (de más vieja a más nueva; la más reciente a la derecha).
+/// Osciloscopio amplitud-vs-tiempo con la ventana triggered y con ganancia
+/// automática del analizador (`SpectrumAnalyzer::scope_window`): de más
+/// vieja a más nueva, la más reciente queda a la derecha.
 ///
 /// Decisiones (testeadas en los tests `paint_wave_*`):
 /// - Eje cero: fila central tenue (`-` en ascii, `─` en unicode, color `dim`);
 ///   la onda lo tapa donde lo cruza y asoma donde se desvía.
-/// - Onda: gradiente del tema por altura (`spectrum_color`, como las barras),
-///   `#` (`ASCII_RAMP[8]`) en ascii y `█` (`EIGHTH_BLOCKS[7]`) en unicode.
-/// - Fondo: puntos tenues en ascii, vacío en unicode (igual que las barras).
-/// - [-1, 1] mapea al alto con clamp; 1–2 filas degradan a línea plana al
-///   centro sin pánico; sin muestras solo se dibuja el eje.
+/// - Cada columna (o sub-columna Braille en unicode) se pinta con la
+///   envolvente mín/máx de las muestras que le tocan, para no saltarse
+///   ninguna, y se extiende para incluir el último punto de la columna
+///   anterior: así el trazo queda continuo, sin huecos columna a columna.
+/// - Unicode: Braille (U+2800, 2×4 puntos por celda) para el doble de
+///   resolución horizontal y el cuádruple de resolución vertical; cada
+///   celda se colorea con el gradiente del tema por altura
+///   (`spectrum_color`, como las barras).
+/// - Ascii: `#` (`ASCII_RAMP[8]`) relleno en el tramo conectado, fondo de
+///   puntos tenue (igual que las barras) donde no hay trazo.
+/// - [-1, 1] mapea al alto con clamp; áreas enanas (0×0, 1×1, 1–2 filas) y
+///   sin muestras degradan sin pánico (sin muestras solo se dibuja el eje).
 fn paint_wave(
     buffer: &mut ratatui::buffer::Buffer,
     inner: Rect,
@@ -3785,37 +3794,174 @@ fn paint_wave(
             }
         }
     }
-    // Eje cero: fila central tenue.
+    if ascii {
+        paint_wave_ascii(buffer, inner, samples, theme);
+    } else {
+        paint_wave_braille(buffer, inner, samples, theme);
+    }
+}
+
+/// Rama ascii de `paint_wave`: eje tenue en toda la fila central, onda
+/// `#` encima tapándolo donde corresponda (igual que antes: primero el
+/// eje, después la onda).
+fn paint_wave_ascii(
+    buffer: &mut ratatui::buffer::Buffer,
+    inner: Rect,
+    samples: &[f32],
+    theme: &Theme,
+) {
+    let height = inner.height;
+    let width = inner.width;
     let axis_row = wave_sample_row(0.0, height);
-    let axis_symbol = if ascii { "-" } else { "─" };
-    for x in inner.x..inner.x + width {
-        if let Some(cell) = buffer.cell_mut((x, inner.y + axis_row)) {
-            cell.set_symbol(axis_symbol).set_fg(theme.dim);
+    for dx in 0..width {
+        if let Some(cell) = buffer.cell_mut((inner.x + dx, inner.y + axis_row)) {
+            cell.set_symbol("-").set_fg(theme.dim);
         }
     }
-    // Onda: ventana con las muestras más recientes (1:1 por columna cuando
-    // alcanzan; reescalado lineal cuando hay menos que columnas).
-    let count = samples.len();
-    if count == 0 {
-        return;
-    }
-    let start = count.saturating_sub(width as usize);
-    let span = count - start;
-    let wave_symbol = if ascii { ASCII_RAMP[8] } else { EIGHTH_BLOCKS[7] };
+    let spans = wave_column_spans(samples, usize::from(width), height);
     for dx in 0..width {
-        let index = start + (dx as usize * span) / width as usize;
-        let row = wave_sample_row(samples[index], height);
+        let Some((lo, hi)) = spans[dx as usize] else {
+            continue;
+        };
+        for row in lo..=hi {
+            let t = if height > 1 {
+                f32::from(height - 1 - row) / f32::from(height - 1)
+            } else {
+                0.5
+            };
+            let (red, green, blue) = spectrum_color(t, theme);
+            if let Some(cell) = buffer.cell_mut((inner.x + dx, inner.y + row)) {
+                cell.set_symbol(ASCII_RAMP[8]).set_fg(Color::Rgb(red, green, blue));
+            }
+        }
+    }
+}
+
+/// Rama unicode de `paint_wave`: mismo eje tenue en toda la fila central
+/// (`─`) que la rama ascii, con la onda encima en Braille (2×4 puntos por
+/// celda, armados a partir de la envolvente conectada en resolución
+/// `alto*4` × `ancho*2`) tapando el eje donde corresponda. El color de cada
+/// celda con onda es el gradiente por altura de `spectrum_color`.
+fn paint_wave_braille(
+    buffer: &mut ratatui::buffer::Buffer,
+    inner: Rect,
+    samples: &[f32],
+    theme: &Theme,
+) {
+    let height = inner.height;
+    let width = inner.width;
+    let axis_row = wave_sample_row(0.0, height);
+    for dx in 0..width {
+        if let Some(cell) = buffer.cell_mut((inner.x + dx, inner.y + axis_row)) {
+            cell.set_symbol("─").set_fg(theme.dim);
+        }
+    }
+    let rows_v = height.saturating_mul(4);
+    let cols_v = usize::from(width) * 2;
+    let spans = wave_column_spans(samples, cols_v, rows_v);
+    for y in 0..height {
         let t = if height > 1 {
-            f32::from(height - 1 - row) / f32::from(height - 1)
+            f32::from(height - 1 - y) / f32::from(height - 1)
         } else {
             0.5
         };
         let (red, green, blue) = spectrum_color(t, theme);
-        if let Some(cell) = buffer.cell_mut((inner.x + dx, inner.y + row)) {
-            cell
-                .set_symbol(wave_symbol)
-                .set_fg(Color::Rgb(red, green, blue));
+        let wave_color = Color::Rgb(red, green, blue);
+        for x in 0..width {
+            let mut bits = 0u8;
+            for sub_row in 0..4u16 {
+                let row_v = y * 4 + sub_row;
+                for (sub_col, &bit) in BRAILLE_DOT_BITS[sub_row as usize].iter().enumerate() {
+                    let col_v = usize::from(x) * 2 + sub_col;
+                    let span = spans.get(col_v).copied().flatten();
+                    if span.is_some_and(|(lo, hi)| row_v >= lo && row_v <= hi) {
+                        bits |= bit;
+                    }
+                }
+            }
+            if bits == 0 {
+                continue; // Sin onda en esta celda: deja el eje o el fondo.
+            }
+            let Some(cell) = buffer.cell_mut((inner.x + x, inner.y + y)) else {
+                continue;
+            };
+            let glyph = braille_glyph(bits);
+            let mut glyph_buf = [0u8; 4];
+            let symbol = glyph.encode_utf8(&mut glyph_buf);
+            cell.set_symbol(symbol).set_fg(wave_color);
         }
+    }
+}
+
+/// Bits de punto Braille (U+2800 + bits) por posición dentro de la celda
+/// 2×4: `BRAILLE_DOT_BITS[fila_sub][col_sub]`, fila_sub 0..4 (arriba a
+/// abajo), col_sub 0..2 (izquierda a derecha). Mapeo estándar del bloque
+/// Unicode Braille Patterns (puntos 1..8 → bits 0x01..0x80).
+const BRAILLE_DOT_BITS: [[u8; 2]; 4] = [
+    [0x01, 0x08],
+    [0x02, 0x10],
+    [0x04, 0x20],
+    [0x40, 0x80],
+];
+
+/// Carácter Braille (U+2800 + `bits`) para una máscara de puntos encendidos
+/// de una celda 2×4. `bits == 0` es el patrón en blanco (U+2800); quien
+/// pinta evita usarlo para no tapar el fondo con una celda "vacía" visible.
+fn braille_glyph(bits: u8) -> char {
+    char::from_u32(0x2800 + u32::from(bits)).unwrap_or(' ')
+}
+
+/// Para cada una de `columns` columnas (o sub-columnas Braille) virtuales,
+/// en una grilla de `rows` filas virtuales, el rango `[fila_min, fila_max]`
+/// que debe quedar encendido: la envolvente mín/máx propia de las muestras
+/// que le tocan a esa columna (ninguna muestra se salta) MÁS la fila de
+/// salida de la columna anterior (conecta sin huecos entre columnas). Una
+/// columna sin muestras (ventana vacía) devuelve `None`.
+fn wave_column_spans(samples: &[f32], columns: usize, rows: u16) -> Vec<Option<(u16, u16)>> {
+    let mut spans = Vec::with_capacity(columns);
+    let mut prev_exit: Option<u16> = None;
+    let len = samples.len();
+    for col in 0..columns {
+        let (start, end) = wave_column_slice(len, columns, col);
+        if start >= end {
+            spans.push(None);
+            continue;
+        }
+        let slice = &samples[start..end];
+        let mut min_row = u16::MAX;
+        let mut max_row = 0u16;
+        for &sample in slice {
+            let row = wave_sample_row(sample, rows);
+            min_row = min_row.min(row);
+            max_row = max_row.max(row);
+        }
+        let exit_row = wave_sample_row(slice[slice.len() - 1], rows);
+        let (lo, hi) = match prev_exit {
+            Some(prev) => (min_row.min(prev), max_row.max(prev)),
+            None => (min_row, max_row),
+        };
+        spans.push(Some((lo, hi)));
+        prev_exit = Some(exit_row);
+    }
+    spans
+}
+
+/// Reparto de `len` muestras entre `columns` columnas virtuales: proporcional
+/// cuando hay más muestras que columnas (como `band_slot`, sin dejar resto
+/// sin cubrir); con menos muestras que columnas, cada columna cae en la
+/// muestra más cercana (puede repetirse, igual que el reescalado lineal
+/// anterior). `len == 0` o `columns == 0` devuelve un rango vacío.
+fn wave_column_slice(len: usize, columns: usize, col: usize) -> (usize, usize) {
+    if columns == 0 || len == 0 {
+        return (0, 0);
+    }
+    if len >= columns {
+        let start = col * len / columns;
+        let end = ((col + 1) * len / columns).max(start + 1).min(len);
+        (start, end)
+    } else {
+        let idx = (col * len) / columns;
+        (idx, (idx + 1).min(len))
     }
 }
 
@@ -4456,14 +4602,14 @@ mod tests {
     }
 
     #[test]
-    fn paint_wave_silence_is_flat_gradient_line_at_center() {
+    fn paint_wave_ascii_silence_is_flat_hash_line_at_center() {
         // Sin señal la onda ES el cero: tapa al eje con una línea plana.
         let theme = Theme::default();
         let area = Rect::new(0, 0, 8, 7);
         let mut buffer = Buffer::empty(area);
-        paint_wave(&mut buffer, area, &[0.0f32; 8], &theme, false);
+        paint_wave(&mut buffer, area, &[0.0f32; 8], &theme, true);
         for x in 0..8u16 {
-            assert_eq!(buffer[(x, 3u16)].symbol(), "█", "plana en el centro");
+            assert_eq!(buffer[(x, 3u16)].symbol(), "#", "plana en el centro");
         }
         // Fila 3 de 7 → t = (6 - 3) / 6 = 0.5 → spectrum_mid.
         let expected = spectrum_color(0.5, &theme);
@@ -4472,25 +4618,32 @@ mod tests {
             Color::Rgb(expected.0, expected.1, expected.2),
             "la onda usa el gradiente del tema por altura"
         );
-        assert_eq!(buffer[(0u16, 0u16)].symbol(), " ");
+        assert_eq!(buffer[(0u16, 0u16)].symbol(), ".");
     }
 
     #[test]
     fn paint_wave_newest_sample_at_right() {
-        // La más reciente a la derecha: última muestra = 1.0 → arriba.
+        // La más reciente a la derecha: última muestra = 1.0 → arriba, y el
+        // salto brusco desde el centro queda conectado (sin hueco) en esa
+        // misma columna.
         let theme = Theme::default();
         let area = Rect::new(0, 0, 8, 7);
         let mut buffer = Buffer::empty(area);
         let samples = [0.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0];
-        paint_wave(&mut buffer, area, &samples, &theme, false);
+        paint_wave(&mut buffer, area, &samples, &theme, true);
         assert_eq!(
             buffer[(7u16, 0u16)].symbol(),
-            "█",
+            "#",
             "1.0 mapea a la fila de arriba"
         );
         assert_eq!(
+            buffer[(7u16, 3u16)].symbol(),
+            "#",
+            "el salto top-centro queda conectado, sin hueco, en la misma columna"
+        );
+        assert_eq!(
             buffer[(0u16, 3u16)].symbol(),
-            "█",
+            "#",
             "la primera (más vieja) queda a la izquierda, en el centro"
         );
         // Pico arriba → t = 1.0 → spectrum_high.
@@ -4503,32 +4656,104 @@ mod tests {
 
     #[test]
     fn paint_wave_clamps_out_of_range_without_panic() {
+        // El salto de +2.0 (clampa arriba) a -3.0 (clampa abajo) entre dos
+        // columnas consecutivas conecta la columna entera, sin pánico ni
+        // hueco.
         let theme = Theme::default();
         let area = Rect::new(0, 0, 2, 5);
         let mut buffer = Buffer::empty(area);
-        paint_wave(&mut buffer, area, &[2.0f32, -3.0], &theme, false);
-        assert_eq!(buffer[(0u16, 0u16)].symbol(), "█", "2.0 se clampa arriba");
-        assert_eq!(buffer[(1u16, 4u16)].symbol(), "█", "-3.0 se clampa abajo");
+        paint_wave(&mut buffer, area, &[2.0f32, -3.0], &theme, true);
+        assert_eq!(buffer[(0u16, 0u16)].symbol(), "#", "2.0 se clampa arriba");
+        assert_eq!(buffer[(1u16, 0u16)].symbol(), "#", "conectado hasta arriba");
+        assert_eq!(buffer[(1u16, 4u16)].symbol(), "#", "-3.0 se clampa abajo");
     }
 
     #[test]
-    fn paint_wave_tiny_heights_degrade_to_flat_center_line() {
+    fn paint_wave_tiny_and_zero_sized_areas_degrade_without_panic() {
         // Precedente: los menús no entran en pánico en terminales enanas;
-        // la onda tampoco (1–2 filas → línea plana al centro).
+        // la onda tampoco (0×0, 1×1, 1–2 filas).
         let theme = Theme::default();
         let samples = [0.5f32, -0.5, 1.0, -1.0, 0.25, -0.25, 0.75, -0.75];
+
+        // 1 fila: con `height <= 1`, toda muestra mapea a la fila 0.
         let area = Rect::new(0, 0, 8, 1);
         let mut buffer = Buffer::empty(area);
-        paint_wave(&mut buffer, area, &samples, &theme, false);
+        paint_wave(&mut buffer, area, &samples, &theme, true);
         for x in 0..8u16 {
-            assert_eq!(buffer[(x, 0u16)].symbol(), "█", "1 fila: todo al centro");
+            assert_eq!(buffer[(x, 0u16)].symbol(), "#", "1 fila: todo a la fila 0");
         }
+
+        // 2 filas: eje en (0.5 * 1).round() = 1 → fila de abajo.
         let area = Rect::new(0, 0, 8, 2);
         let mut buffer = Buffer::empty(area);
-        paint_wave(&mut buffer, area, &[0.0f32; 8], &theme, false);
+        paint_wave(&mut buffer, area, &[0.0f32; 8], &theme, true);
         for x in 0..8u16 {
-            // Eje de alto 2: (0.5 * 1).round() = 1 → fila de abajo.
-            assert_eq!(buffer[(x, 1u16)].symbol(), "█", "2 filas: centro abajo");
+            assert_eq!(buffer[(x, 1u16)].symbol(), "#", "2 filas: centro abajo");
+        }
+
+        // 1×1 y 0×0, ascii y unicode: no deben entrar en pánico.
+        let area = Rect::new(0, 0, 1, 1);
+        let mut buffer = Buffer::empty(area);
+        paint_wave(&mut buffer, area, &samples, &theme, true);
+        paint_wave(&mut buffer, area, &samples, &theme, false);
+        let area = Rect::new(0, 0, 0, 0);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
+        paint_wave(&mut buffer, area, &samples, &theme, true);
+        paint_wave(&mut buffer, area, &[], &theme, false);
+    }
+
+    #[test]
+    fn paint_wave_unicode_uses_braille_glyphs_for_the_trace() {
+        // El trazo en unicode se compone de caracteres Braille (bloque
+        // U+2800..=U+28FF): 2×4 puntos por celda.
+        let theme = Theme::default();
+        let area = Rect::new(0, 0, 12, 8);
+        let mut buffer = Buffer::empty(area);
+        let samples: Vec<f32> = (0..200)
+            .map(|i| (std::f32::consts::TAU * 3.0 * i as f32 / 200.0).sin())
+            .collect();
+        paint_wave(&mut buffer, area, &samples, &theme, false);
+        let mut saw_braille = false;
+        for y in 0..8u16 {
+            for x in 0..12u16 {
+                let symbol = buffer[(x, y)].symbol();
+                let Some(ch) = symbol.chars().next() else {
+                    continue;
+                };
+                if symbol == " " || symbol == "─" {
+                    continue;
+                }
+                assert!(
+                    ('\u{2800}'..='\u{28FF}').contains(&ch),
+                    "la onda en unicode debe ser Braille, obtenido {symbol:?} en ({x},{y})"
+                );
+                saw_braille = true;
+            }
+        }
+        assert!(saw_braille, "debe haber al menos una celda con trazo Braille");
+    }
+
+    #[test]
+    fn wave_column_spans_has_no_column_to_column_gaps_for_a_full_scale_sine() {
+        // Continuidad: con un seno a escala completa sobre un área 40x10,
+        // toda columna tiene celda pintada y columnas adyacentes se tocan
+        // o se superponen verticalmente (ningún hueco).
+        let samples: Vec<f32> = (0..400)
+            .map(|i| (std::f32::consts::TAU * 7.0 * i as f32 / 400.0).sin())
+            .collect();
+        let spans = wave_column_spans(&samples, 40, 10);
+        assert_eq!(spans.len(), 40);
+        for (col, span) in spans.iter().enumerate() {
+            assert!(span.is_some(), "columna sin celda pintada: {col}");
+        }
+        for col in 1..40 {
+            let (lo_prev, hi_prev) = spans[col - 1].unwrap();
+            let (lo_cur, hi_cur) = spans[col].unwrap();
+            assert!(
+                lo_cur.max(lo_prev) <= hi_cur.min(hi_prev),
+                "hueco entre las columnas {} y {col}: prev=({lo_prev},{hi_prev}) cur=({lo_cur},{hi_cur})",
+                col - 1
+            );
         }
     }
 
