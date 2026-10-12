@@ -74,3 +74,11 @@ mp3tui "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 | `d` | Borrar el ítem seleccionado de la Cola |
 | `Ctrl+P` | Configuración (temas, bandas, modo) |
 | `Esc` `Esc` | Salir |
+
+## Cola de reproducción
+
+Encolá pistas con `a` (Biblioteca) o desde la URL e historial. Los ítems
+encolados se ven en el panel lateral con `c`. Mientras hay cola, el panel del
+reproductor muestra la próxima pista (una línea `Siguiente: …` y, si queda más
+de una, un `(+N)` con cuántas faltan detrás). Con la cola vacía esa línea no
+aparece.

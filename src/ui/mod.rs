@@ -2656,9 +2656,11 @@ fn render_player_info(frame: &mut Frame<'_>, area: Rect, app: &App, engine: &Aud
     // normal el panel conserva su forma y el espacio no muestra ruido.
     let show_speed = (engine.speed() - 1.0).abs() > f32::EPSILON;
     let show_meta = track_meta.is_some();
+    // La cola solo se anuncia cuando tiene ítems; vacía no agrega ruido.
+    let show_queue = !app.queue.is_empty();
 
-    // Bloque inicial: archivo + (meta opcional) + estado + error.
-    let first_block_lines = if show_meta { 4 } else { 3 };
+    // Bloque inicial: archivo + (meta opcional) + estado + (cola opcional) + error.
+    let first_block_lines = if show_meta { 4 } else { 3 } + if show_queue { 1 } else { 0 };
 
     // Archivo/estado, volumen, progreso y la fila de controles clickeables.
     let mut constraints = vec![
@@ -2697,6 +2699,23 @@ fn render_player_info(frame: &mut Frame<'_>, area: Rect, app: &App, engine: &Aud
     }
 
     info_lines.push(status_line(app.status, app.repeat, app.shuffle));
+
+    // Lo próximo que suena: solo cuando hay cola. El título usa `QueueItem::label`
+    // (igual que la lista de la Cola) y el (+N) cuenta cuánto falta detrás.
+    if show_queue {
+        let next = app.queue.front().map(QueueItem::label).unwrap_or_default();
+        let count = app.queue.len() - 1;
+        let value = if count > 0 {
+            format!("{next} (+{count})")
+        } else {
+            next.to_string()
+        };
+        info_lines.push(Line::from(vec![
+            Span::styled("Siguiente: ", Style::default().fg(theme().dim)),
+            Span::styled(value, Style::default().fg(theme().text)),
+        ]));
+    }
+
     info_lines.push(error_line(app));
 
     frame.render_widget(Paragraph::new(info_lines), rows[0]);
@@ -6419,6 +6438,58 @@ mod tests {
             .draw(|frame| render(frame, app, engine))
             .expect("dibuja");
         terminal.backend().buffer().clone()
+    }
+
+    /// Texto del frame de prueba: todas las filas del buffer concatenadas.
+    fn player_screen_text(buffer: &ratatui::buffer::Buffer) -> String {
+        (0..buffer.area.height)
+            .flat_map(|y| {
+                (0..buffer.area.width)
+                    .map(move |x| buffer[(x, y)].symbol().to_string())
+                    .chain(std::iter::once("\n".to_string()))
+            })
+            .collect()
+    }
+
+    /// La cola es visible mientras se reproduce: una línea «Siguiente: <label>»
+    /// aparece solo cuando hay ítems encolados, con el título del próximo.
+    #[test]
+    fn player_info_shows_the_next_queued_item_while_playing() {
+        let Some(engine) = engine_or_skip() else { return };
+        let mut app = library_with_three();
+        app.mode = Mode::Player;
+        app.has_player = true;
+        app.current_path = Some(PathBuf::from(r"C:\x\alpha.mp3"));
+        app.track_label = "alpha.mp3".to_string();
+        // Dos ítems encolados: el próximo es «beta» y queda 1 pendiente.
+        app.queue.push_back(QueueItem::Local(track_named("beta")));
+        app.queue.push_back(QueueItem::Local(track_named("gamma")));
+
+        let buffer = render_player_frame(&app, &engine);
+        let text = player_screen_text(&buffer);
+        assert!(
+            text.contains("Siguiente: beta (+1)"),
+            "la línea con lo siguiente es visible: {text}"
+        );
+    }
+
+    /// Con la cola vacía el panel se ve igual que hoy: sin fila «Siguiente» ni
+    /// ningún placeholder de «0».
+    #[test]
+    fn player_info_hides_the_queue_line_when_queue_is_empty() {
+        let Some(engine) = engine_or_skip() else { return };
+        let mut app = library_with_three();
+        app.mode = Mode::Player;
+        app.has_player = true;
+        app.current_path = Some(PathBuf::from(r"C:\x\alpha.mp3"));
+        app.track_label = "alpha.mp3".to_string();
+
+        let buffer = render_player_frame(&app, &engine);
+        let text = player_screen_text(&buffer);
+        assert!(
+            !text.contains("Siguiente"),
+            "sin cola no hay fila de próxima: {text}"
+        );
     }
 
     #[test]
