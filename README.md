@@ -129,10 +129,12 @@ anterior.
 
 Con el mouse activado (por defecto):
 
-- **Barra de progreso:** clic para saltar a ese punto; arrastrar para recorrer
-  la canción.
+- **Barra de progreso:** clic para saltar a ese punto; arrastrar y soltar para
+  elegir otro (el salto se hace al soltar).
 - **Barra de volumen:** clic o arrastre para fijar el volumen.
 - **Rueda** sobre el reproductor: sube o baja el volumen.
+- Con el prompt de URL o el menú de temas abiertos, el mouse no actúa sobre lo
+  que queda debajo.
 
 La captura del mouse reemplaza la selección de texto nativa de la terminal (en
 Windows Terminal se sigue pudiendo seleccionar con `Shift` + arrastre). Para

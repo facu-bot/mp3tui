@@ -318,9 +318,11 @@ struct HitMap {
 }
 
 /// Arrastre en curso: sigue a la barra donde empezó aunque el puntero salga.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum Drag {
-    Progress,
+    /// Arrastre sobre el progreso: guarda la última fracción para el seek al
+    /// soltar.
+    Progress(Option<f64>),
     Volume,
 }
 
@@ -353,19 +355,26 @@ fn mouse_action(hit: &HitMap, drag: Option<Drag>, event: MouseEvent) -> (MouseAc
     match event.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             if let Some(bar) = hit.progress.filter(|bar| bar.contains(column, row)) {
-                (MouseAction::SeekRatio(bar.ratio(column)), Some(Drag::Progress))
+                (MouseAction::SeekRatio(bar.ratio(column)), Some(Drag::Progress(None)))
             } else if let Some(bar) = hit.volume.filter(|bar| bar.contains(column, row)) {
                 (MouseAction::SetVolume(bar.ratio(column)), Some(Drag::Volume))
             } else {
                 (MouseAction::None, None)
             }
         }
+        // El progreso solo marca la posición mientras se arrastra (el seek va
+        // al soltar); el volumen sí sigue en vivo.
         MouseEventKind::Drag(MouseButton::Left) => match (drag, hit.progress, hit.volume) {
-            (Some(Drag::Progress), Some(bar), _) => (MouseAction::SeekRatio(bar.ratio(column)), drag),
+            (Some(Drag::Progress(_)), Some(bar), _) => {
+                (MouseAction::None, Some(Drag::Progress(Some(bar.ratio(column)))))
+            }
             (Some(Drag::Volume), _, Some(bar)) => (MouseAction::SetVolume(bar.ratio(column)), drag),
             _ => (MouseAction::None, drag),
         },
-        MouseEventKind::Up(MouseButton::Left) => (MouseAction::None, None),
+        MouseEventKind::Up(MouseButton::Left) => match drag {
+            Some(Drag::Progress(Some(ratio))) => (MouseAction::SeekRatio(ratio), None),
+            _ => (MouseAction::None, None),
+        },
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
             let over_player = hit.player.is_some_and(|area| {
                 area.contains(ratatui::layout::Position::new(column, row))
@@ -384,6 +393,12 @@ fn mouse_action(hit: &HitMap, drag: Option<Drag>, event: MouseEvent) -> (MouseAc
 /// está activado.
 fn handle_mouse(event: MouseEvent, app: &mut App, engine: &mut AudioEngine) {
     if !config::config().mouse {
+        return;
+    }
+    // Con un modal abierto (prompt de URL, menú de temas) el clic no
+    // atraviesa hacia lo que quedó tapado.
+    if app.url_input.is_some() || app.theme_menu.is_some() {
+        app.drag = None;
         return;
     }
     let (action, drag) = mouse_action(&app.hit.borrow(), app.drag, event);
@@ -3804,7 +3819,7 @@ mod tests {
     fn click_on_progress_seeks_and_starts_drag() {
         let (action, drag) =
             mouse_action(&sample_hit(), None, mouse(MouseEventKind::Down(MouseButton::Left), 45, 6));
-        assert_eq!(drag, Some(Drag::Progress));
+        assert_eq!(drag, Some(Drag::Progress(None)));
         match action {
             MouseAction::SeekRatio(r) => assert!((r - 0.5).abs() < 1e-9),
             other => panic!("esperaba seek: {other:?}"),
@@ -3812,21 +3827,43 @@ mod tests {
     }
 
     #[test]
-    fn drag_keeps_following_the_progress_bar_outside_its_row() {
+    fn dragging_progress_only_seeks_on_release() {
+        // Arrastrar no dispara un seek por cada movimiento (con URLs serían
+        // decenas de pedidos): marca la posición y el seek llega al soltar.
         let (action, drag) = mouse_action(
             &sample_hit(),
-            Some(Drag::Progress),
+            Some(Drag::Progress(None)),
             mouse(MouseEventKind::Drag(MouseButton::Left), 70, 12),
         );
-        assert_eq!(drag, Some(Drag::Progress));
-        assert_eq!(action, MouseAction::SeekRatio(1.0));
+        assert_eq!(action, MouseAction::None, "sin seek durante el arrastre");
+        assert_eq!(drag, Some(Drag::Progress(Some(1.0))), "sigue la barra fuera de su fila");
 
         let (action, drag) = mouse_action(
             &sample_hit(),
-            Some(Drag::Progress),
+            drag,
             mouse(MouseEventKind::Up(MouseButton::Left), 70, 12),
         );
-        assert_eq!((action, drag), (MouseAction::None, None), "soltar termina el arrastre");
+        assert_eq!((action, drag), (MouseAction::SeekRatio(1.0), None), "soltar hace el seek");
+
+        let (action, _) = mouse_action(
+            &sample_hit(),
+            Some(Drag::Progress(None)),
+            mouse(MouseEventKind::Up(MouseButton::Left), 70, 12),
+        );
+        assert_eq!(action, MouseAction::None, "clic sin arrastre no repite el seek");
+    }
+
+    #[test]
+    fn mouse_is_ignored_while_a_modal_is_open() {
+        let Some(mut engine) = engine_or_skip() else { return };
+        let mut app = test_app();
+        app.mode = Mode::Player;
+        app.has_player = true;
+        *app.hit.borrow_mut() = sample_hit();
+        app.url_input = Some(String::new());
+        handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 30, 5), &mut app, &mut engine);
+        assert_eq!(engine.volume(), 0.0, "el clic no atraviesa el prompt de URL");
+        assert_eq!(app.drag, None);
     }
 
     #[test]
