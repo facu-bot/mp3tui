@@ -21,7 +21,10 @@ use ratatui::Frame;
 
 use crate::audio::{AudioEngine, SPEED_STEP};
 use crate::config::{self, key_labels, Theme};
-use crate::playback::{filter_tracks, next_track, seek_target, shuffle_order, RepeatMode};
+use crate::playback::{
+    filter_tracks, natural_end_action, next_track, seek_target, shuffle_order, NextAction,
+    RepeatMode,
+};
 use crate::playlist::{move_selection, scroll_offset, Playlist, Track};
 use crate::visualizer::{SpectrumAnalyzer, NUM_BANDS};
 
@@ -252,6 +255,11 @@ struct App {
     ytdlp_rx: Option<Receiver<YtDlpMessage>>,
     ytdlp_request_id: u64,
     is_url: bool,
+    /// URL original (nunca la resuelta) + etiqueta de la pista cuando la
+    /// reproducción actual viene de una URL; `None` en reproducción local.
+    /// Guarda el original para repetir (RepeatMode::One) vía `submit_url_prompt`:
+    /// las URLs que resuelve yt-dlp vencen, así que una página se re-resuelve.
+    current_url: Option<(String, String)>,
     ytdlp_failed: bool,
     pub history: crate::history::History,
     pub pending_history: Option<(String, String)>,
@@ -358,6 +366,7 @@ pub fn run(engine: &mut AudioEngine, start: StartMode) -> io::Result<()> {
         ytdlp_rx: None,
         ytdlp_request_id: 0,
         is_url: is_url_start,
+        current_url: None,
         ytdlp_failed: false,
         history,
         pending_history: None,
@@ -373,6 +382,7 @@ pub fn run(engine: &mut AudioEngine, start: StartMode) -> io::Result<()> {
             crate::source::UrlKind::Page => {
                 app.status = Status::Resolving;
                 app.error = None;
+                app.current_url = Some((url.clone(), url_display_label(&url)));
                 app.ytdlp_request_id = 1;
                 let req_id = 1;
                 let (tx, rx) = mpsc::channel();
@@ -522,6 +532,7 @@ fn init_url_playback(app: &mut App, original_url: String, label: String) {
     app.has_player = true;
     app.status = Status::Connecting;
     app.error = None;
+    app.current_url = Some((original_url.clone(), label.clone()));
     app.pending_history = Some((original_url, label));
 }
 
@@ -873,6 +884,7 @@ fn cancel_pending_ytdlp(app: &mut App) {
 fn start_local_playback(app: &mut App, engine: &mut AudioEngine, path: PathBuf) -> bool {
     cancel_pending_ytdlp(app);
     app.is_url = false;
+    app.current_url = None;
     let label = path.to_string_lossy().into_owned();
     match engine.play(&path) {
         Ok(()) => {
@@ -951,6 +963,9 @@ fn submit_url_prompt(input: String, app: &mut App, engine: &mut AudioEngine) {
             app.mode = Mode::Player;
             app.status = Status::Resolving;
             app.error = None;
+            // La URL original queda guardada desde el input: si la pista que
+            // estaba sonando termina mientras resuelve, One repite ésta.
+            app.current_url = Some((url.clone(), url_display_label(&url)));
 
             let req_id = app.ytdlp_request_id;
             let (tx, rx) = mpsc::channel();
@@ -1044,10 +1059,11 @@ fn play_selected(app: &mut App, engine: &mut AudioEngine) {
     }
 }
 
-/// 'n' / 'p': salta a la siguiente/anterior pista de la playlist visible,
-/// respetando shuffle y repeat, sin salir del modo actual (en el explorador
-/// además mueve la selección). No envuelve con repeat Off/One.
-fn play_step(app: &mut App, engine: &mut AudioEngine, step: isize) {
+/// Posiciones de la vista que son pistas de la biblioteca (lo que recorren
+/// `n`/`p` y el fin natural; las entradas del historial quedan fuera).
+/// Regenera el orden de shuffle si la lista cambió desde que se armó
+/// (filtro/rescann).
+fn track_positions_in_view(app: &mut App) -> Vec<usize> {
     let track_positions: Vec<usize> = app
         .view
         .iter()
@@ -1057,17 +1073,51 @@ fn play_step(app: &mut App, engine: &mut AudioEngine, step: isize) {
             ViewItem::History(_) => None,
         })
         .collect();
+    if app.shuffle && !track_positions.is_empty() && app.shuffle_order.len() != track_positions.len()
+    {
+        app.shuffle_order = shuffle_order(track_positions.len());
+    }
+    track_positions
+}
 
+/// Índice de `track_positions` de la pista actualmente en reproducción
+/// (`None` si no está en la lista, p. ej. mientras suena una URL).
+fn current_track_index(app: &App, track_positions: &[usize]) -> Option<usize> {
+    current_view_position(app)
+        .and_then(|view_pos| track_positions.iter().position(|&p| p == view_pos))
+}
+
+/// Arranca la pista de una posición de la vista por el único camino de
+/// reproducción local (limpia `is_url`/`current_url` y pendientes de URL,
+/// sincroniza biblioteca y selección). Devuelve false si esa posición no es
+/// una pista o el archivo no pudo abrirse.
+fn play_view_position(app: &mut App, engine: &mut AudioEngine, target: usize) -> bool {
+    let Some(ViewItem::Track(library_index)) = app.view.get(target).copied() else {
+        return false;
+    };
+    let Some(track) = library_get(app, library_index) else {
+        return false;
+    };
+    if start_local_playback(app, engine, track.path.clone()) {
+        if let Some(library) = app.library.as_mut() {
+            library.set_current(Some(library_index));
+        }
+        app.selected = target;
+        true
+    } else {
+        false
+    }
+}
+
+/// 'n' / 'p': salta a la siguiente/anterior pista de la playlist visible,
+/// respetando shuffle y repeat, sin salir del modo actual (en el explorador
+/// además mueve la selección). No envuelve con repeat Off/One.
+fn play_step(app: &mut App, engine: &mut AudioEngine, step: isize) {
+    let track_positions = track_positions_in_view(app);
     if track_positions.is_empty() {
         return;
     }
-
-    if app.shuffle && app.shuffle_order.len() != track_positions.len() {
-        // La lista cambió desde que se armó el orden (filtro/rescann).
-        app.shuffle_order = shuffle_order(track_positions.len());
-    }
-    let current = current_view_position(app)
-        .and_then(|view_pos| track_positions.iter().position(|&p| p == view_pos));
+    let current = current_track_index(app, &track_positions);
     let Some(target_idx) = next_track(
         track_positions.len(),
         current,
@@ -1078,19 +1128,7 @@ fn play_step(app: &mut App, engine: &mut AudioEngine, step: isize) {
     ) else {
         return;
     };
-    let target = track_positions[target_idx];
-    let Some(ViewItem::Track(library_index)) = app.view.get(target).copied() else {
-        return;
-    };
-    let Some(track) = library_get(app, library_index) else {
-        return;
-    };
-    if start_local_playback(app, engine, track.path.clone()) {
-        if let Some(library) = app.library.as_mut() {
-            library.set_current(Some(library_index));
-        }
-        app.selected = target;
-    }
+    play_view_position(app, engine, track_positions[target_idx]);
 }
 
 fn toggle_shuffle(app: &mut App) {
@@ -1138,19 +1176,38 @@ fn current_track_duration(app: &App) -> Option<Duration> {
 }
 
 /// Fin natural de la pista (transición Playing → Ended): decide el repeat
-/// sin esperar que el usuario apriete espacio.
+/// sin esperar que el usuario apriete espacio. La regla única de avance vive
+/// en [`natural_end_action`] y vale igual para pistas locales y para URL.
 fn handle_natural_end(app: &mut App, engine: &mut AudioEngine) {
-    if app.is_url {
-        return;
-    }
-    match app.repeat {
-        RepeatMode::Off => {}
-        RepeatMode::One => {
-            if let Some(path) = app.current_path.clone() {
+    let track_positions = track_positions_in_view(app);
+    let current = current_track_index(app, &track_positions);
+
+    match natural_end_action(
+        app.repeat,
+        app.shuffle,
+        track_positions.len(),
+        current,
+        &app.shuffle_order,
+        app.is_url,
+    ) {
+        NextAction::Replay => {
+            if app.is_url {
+                // Re-lanza la URL ORIGINAL por el camino normal de URL: las
+                // páginas se resuelven de nuevo con yt-dlp porque las URLs
+                // resueltas vencen. Sin URL original guardada no hay qué repetir.
+                if let Some((url, _label)) = app.current_url.clone() {
+                    submit_url_prompt(url, app, engine);
+                }
+            } else if let Some(path) = app.current_path.clone() {
                 start_local_playback(app, engine, path);
             }
         }
-        RepeatMode::All => play_step(app, engine, 1),
+        NextAction::Play(target_idx) => {
+            if let Some(&target) = track_positions.get(target_idx) {
+                play_view_position(app, engine, target);
+            }
+        }
+        NextAction::Stop => {}
     }
 }
 
@@ -2628,6 +2685,7 @@ mod tests {
             ytdlp_rx: None,
             ytdlp_request_id: 0,
             is_url: false,
+            current_url: None,
             ytdlp_failed: false,
             history: crate::history::History::default(),
             pending_history: None,
@@ -3284,14 +3342,24 @@ mod tests {
     }
 
     #[test]
-    fn test_url_track_natural_end_does_not_advance_or_replay_local() {
+    fn test_url_track_natural_end_with_repeat_all_advances_to_library() {
         let mut app = test_app();
         app.is_url = true;
+        app.current_url = Some((
+            "https://example.com/audio.mp3".to_string(),
+            "audio.mp3".to_string(),
+        ));
         app.status = Status::Playing;
         app.repeat = RepeatMode::All;
+        let dir = std::env::temp_dir();
+        let t1 = dir.join(format!("mp3tui_t1_urlall1_{}.wav", std::process::id()));
+        let t2 = dir.join(format!("mp3tui_t1_urlall2_{}.wav", std::process::id()));
+        let wav = make_test_wav(4410);
+        let _ = std::fs::write(&t1, &wav);
+        let _ = std::fs::write(&t2, &wav);
         app.library = Some(crate::playlist::from_tracks_for_test(vec![
-            track_named("local_1"),
-            track_named("local_2"),
+            track_with_path(t1.clone(), "local_1"),
+            track_with_path(t2.clone(), "local_2"),
         ]));
         refresh_view(&mut app);
         app.selected = 0;
@@ -3299,22 +3367,33 @@ mod tests {
 
         let mut engine = match AudioEngine::new() {
             Ok(e) => e,
-            Err(_) => return,
+            Err(_) => {
+                let _ = std::fs::remove_file(&t1);
+                let _ = std::fs::remove_file(&t2);
+                return;
+            }
         };
 
         handle_natural_end(&mut app, &mut engine);
 
-        assert_eq!(
-            app.track_label, "https://example.com/audio.mp3",
-            "URL track must not be replaced by local track on natural end"
+        assert!(
+            !app.is_url,
+            "URL terminada con repeat All debe entrar a la biblioteca local"
         );
-        assert_eq!(app.selected, 0);
-        assert!(app.current_path.is_none());
+        assert_eq!(
+            app.current_path.as_ref(),
+            Some(&t1),
+            "debe avanzar a la primera pista local"
+        );
+        assert!(app.current_url.is_none(), "la sesión ya no es de URL");
         assert!(
             app.error.is_none(),
-            "must not attempt to play local tracks or set error: {:?}",
+            "no debe fallar al arrancar la pista local: {:?}",
             app.error
         );
+
+        let _ = std::fs::remove_file(&t1);
+        let _ = std::fs::remove_file(&t2);
     }
 
     #[test]
@@ -3421,6 +3500,141 @@ mod tests {
         handle_natural_end(&mut app, &mut engine);
         assert_eq!(app.selected, 1, "natural end must auto-advance local track");
         assert_eq!(app.current_path.as_ref(), Some(&t2));
+
+        let _ = std::fs::remove_file(&t1);
+        let _ = std::fs::remove_file(&t2);
+    }
+
+    #[test]
+    fn test_url_natural_end_repeat_off_advances_to_first_library_track() {
+        let mut app = test_app();
+        app.is_url = true;
+        app.current_url = Some((
+            "https://example.com/remote.mp3".to_string(),
+            "remote.mp3".to_string(),
+        ));
+        app.status = Status::Playing;
+        app.repeat = RepeatMode::Off;
+        app.track_label = "https://example.com/remote.mp3".to_string();
+        let dir = std::env::temp_dir();
+        let t1 = dir.join(format!("mp3tui_t1_urloff1_{}.wav", std::process::id()));
+        let t2 = dir.join(format!("mp3tui_t1_urloff2_{}.wav", std::process::id()));
+        let wav = make_test_wav(4410);
+        let _ = std::fs::write(&t1, &wav);
+        let _ = std::fs::write(&t2, &wav);
+        app.library = Some(crate::playlist::from_tracks_for_test(vec![
+            track_with_path(t1.clone(), "local_1"),
+            track_with_path(t2.clone(), "local_2"),
+        ]));
+        refresh_view(&mut app);
+
+        let mut engine = match AudioEngine::new() {
+            Ok(e) => e,
+            Err(_) => {
+                let _ = std::fs::remove_file(&t1);
+                let _ = std::fs::remove_file(&t2);
+                return;
+            }
+        };
+
+        handle_natural_end(&mut app, &mut engine);
+
+        assert!(
+            !app.is_url,
+            "repeat Off tras una URL debe avanzar a la biblioteca local"
+        );
+        assert_eq!(
+            app.current_path.as_ref(),
+            Some(&t1),
+            "la biblioteca local entra desde su primera pista"
+        );
+        assert_eq!(app.selected, 0);
+        assert!(
+            app.error.is_none(),
+            "no debe fallar al arrancar la pista local: {:?}",
+            app.error
+        );
+
+        let _ = std::fs::remove_file(&t1);
+        let _ = std::fs::remove_file(&t2);
+    }
+
+    #[test]
+    fn test_url_natural_end_repeat_one_replays_the_original_url() {
+        let mut app = test_app();
+        app.is_url = true;
+        app.status = Status::Playing;
+        app.repeat = RepeatMode::One;
+        let original = "https://www.youtube.com/watch?v=abc123".to_string();
+        app.current_url = Some((original.clone(), "Video".to_string()));
+        app.track_label = "Video".to_string();
+
+        let mut engine = match AudioEngine::new() {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+
+        handle_natural_end(&mut app, &mut engine);
+
+        assert!(
+            app.ytdlp_rx.is_some(),
+            "One con URL de página debe re-lanzar la URL original por yt-dlp"
+        );
+        assert_eq!(app.status, Status::Resolving, "vuelve a resolver");
+        assert!(app.is_url, "la sesión sigue siendo de URL");
+        assert_eq!(
+            app.current_url.as_ref().map(|(u, _)| u.as_str()),
+            Some(original.as_str()),
+            "la URL original debe conservarse para el próximo replay"
+        );
+    }
+
+    #[test]
+    fn test_local_natural_end_repeat_off_advances_then_stops_at_the_end() {
+        let mut app = test_app();
+        let dir = std::env::temp_dir();
+        let t1 = dir.join(format!("mp3tui_t1_offadv1_{}.wav", std::process::id()));
+        let t2 = dir.join(format!("mp3tui_t1_offadv2_{}.wav", std::process::id()));
+        let wav = make_test_wav(4410);
+        let _ = std::fs::write(&t1, &wav);
+        let _ = std::fs::write(&t2, &wav);
+        app.library = Some(crate::playlist::from_tracks_for_test(vec![
+            track_with_path(t1.clone(), "track_1"),
+            track_with_path(t2.clone(), "track_2"),
+        ]));
+        refresh_view(&mut app);
+        app.repeat = RepeatMode::Off;
+
+        let mut engine = match AudioEngine::new() {
+            Ok(e) => e,
+            Err(_) => {
+                let _ = std::fs::remove_file(&t1);
+                let _ = std::fs::remove_file(&t2);
+                return;
+            }
+        };
+
+        app.selected = 0;
+        play_selected(&mut app, &mut engine);
+        assert_eq!(app.current_path.as_ref(), Some(&t1));
+
+        // En el medio de la lista: Off avanza a la siguiente.
+        handle_natural_end(&mut app, &mut engine);
+        assert_eq!(app.selected, 1, "Off debe avanzar en el medio");
+        assert_eq!(app.current_path.as_ref(), Some(&t2));
+
+        // En la última pista: Off no envuelve, se queda donde está.
+        handle_natural_end(&mut app, &mut engine);
+        assert_eq!(
+            app.selected, 1,
+            "Off en la última pista no debe envolver ni mover la selección"
+        );
+        assert_eq!(
+            app.current_path.as_ref(),
+            Some(&t2),
+            "Off en la última pista no debe reemplazar la pista actual"
+        );
+        assert!(app.error.is_none(), "{:?}", app.error);
 
         let _ = std::fs::remove_file(&t1);
         let _ = std::fs::remove_file(&t2);

@@ -139,6 +139,50 @@ pub fn next_track(
     }
 }
 
+/// Qué hacer al terminar naturalmente una pista.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NextAction {
+    /// Repetir la misma pista (RepeatMode::One), local o URL.
+    Replay,
+    /// Reproducir la pista de la lista visible en ese índice.
+    Play(usize),
+    /// No hay pista siguiente: la sesión queda en «Fin de la pista».
+    Stop,
+}
+
+/// Regla única de fin natural de pista, igual para local y para URL.
+///
+/// - `One` siempre repite la misma pista, incluida una URL (el caller re-lanza
+///   la URL original por el camino normal de URL; las páginas se resuelven de
+///   nuevo con yt-dlp porque las URLs resueltas vencen).
+/// - `Off` avanza sin envolver: al final de la lista (o del orden de shuffle,
+///   donde cada pista suena una vez por ciclo) → `Stop`.
+/// - `All` avanza y envuelve, también dentro del orden de shuffle.
+/// - Una URL no está en la lista: `finished_url` descarta cualquier posición
+///   residual de la selección local y el avance entra a la biblioteca desde el
+///   inicio del orden de navegación (con shuffle, el primer elemento del
+///   orden mezclado).
+/// - `One` gobierna aunque la lista esté vacía: la pista terminada es el
+///   propio objetivo del replay; `Off`/`All` sin lista → `Stop`.
+pub fn natural_end_action(
+    repeat: RepeatMode,
+    shuffle: bool,
+    len: usize,
+    current: Option<usize>,
+    order: &[usize],
+    finished_url: bool,
+) -> NextAction {
+    if repeat == RepeatMode::One {
+        return NextAction::Replay;
+    }
+    // Una URL no ocupa una posición de la lista local.
+    let current = if finished_url { None } else { current };
+    match next_track(len, current, repeat, shuffle, order, 1) {
+        Some(index) => NextAction::Play(index),
+        None => NextAction::Stop,
+    }
+}
+
 /// Coincidencia case-insensitive por substring sobre título, artista, álbum o
 /// nombre de archivo. Un needle vacío (o solo espacios) matchea todo.
 pub fn matches_filter(track: &Track, needle: &str) -> bool {
@@ -372,6 +416,150 @@ mod tests {
         assert_eq!(
             next_track(3, Some(99), RepeatMode::Off, false, &[], 1),
             Some(0)
+        );
+    }
+
+    // ---- fin natural de pista (regla única local/URL) ----
+
+    #[test]
+    fn natural_end_repeat_one_always_replays() {
+        let order = [2usize, 0, 3, 1];
+        // Local en el medio, sin shuffle.
+        assert_eq!(
+            natural_end_action(RepeatMode::One, false, 4, Some(1), &order, false),
+            NextAction::Replay
+        );
+        // Local en la última pista.
+        assert_eq!(
+            natural_end_action(RepeatMode::One, false, 4, Some(3), &order, false),
+            NextAction::Replay
+        );
+        // Con shuffle (posición en el medio del orden mezclado).
+        assert_eq!(
+            natural_end_action(RepeatMode::One, true, 4, Some(2), &order, false),
+            NextAction::Replay
+        );
+        // URL, con y sin shuffle: se repite la misma URL.
+        assert_eq!(
+            natural_end_action(RepeatMode::One, false, 4, None, &order, true),
+            NextAction::Replay
+        );
+        assert_eq!(
+            natural_end_action(RepeatMode::One, true, 4, None, &order, true),
+            NextAction::Replay
+        );
+        // Lista vacía: la pista terminada es el propio objetivo de repetición.
+        assert_eq!(
+            natural_end_action(RepeatMode::One, false, 0, None, &order, false),
+            NextAction::Replay
+        );
+        assert_eq!(
+            natural_end_action(RepeatMode::One, true, 0, None, &order, true),
+            NextAction::Replay
+        );
+    }
+
+    #[test]
+    fn natural_end_repeat_off_advances_then_stops_at_the_end() {
+        let order: [usize; 0] = [];
+        assert_eq!(
+            natural_end_action(RepeatMode::Off, false, 4, Some(0), &order, false),
+            NextAction::Play(1),
+            "Off avanza en el medio de la lista"
+        );
+        assert_eq!(
+            natural_end_action(RepeatMode::Off, false, 4, Some(2), &order, false),
+            NextAction::Play(3)
+        );
+        assert_eq!(
+            natural_end_action(RepeatMode::Off, false, 4, Some(3), &order, false),
+            NextAction::Stop,
+            "Off en la última pista: se detiene, no envuelve"
+        );
+        // Lista vacía: nada que avanzar.
+        assert_eq!(
+            natural_end_action(RepeatMode::Off, false, 0, None, &order, false),
+            NextAction::Stop
+        );
+    }
+
+    #[test]
+    fn natural_end_repeat_off_after_url_starts_the_library_list() {
+        let order: [usize; 0] = [];
+        assert_eq!(
+            natural_end_action(RepeatMode::Off, false, 4, None, &order, true),
+            NextAction::Play(0),
+            "URL terminada: el siguiente sale de la biblioteca local"
+        );
+        // Una selección residual de la lista no cuenta como pista actual de
+        // una URL: no hay «siguiente URL», se entra a la biblioteca.
+        assert_eq!(
+            natural_end_action(RepeatMode::Off, false, 4, Some(2), &order, true),
+            NextAction::Play(0)
+        );
+    }
+
+    #[test]
+    fn natural_end_repeat_all_wraps() {
+        let order: [usize; 0] = [];
+        assert_eq!(
+            natural_end_action(RepeatMode::All, false, 4, Some(2), &order, false),
+            NextAction::Play(3),
+            "All avanza en el medio"
+        );
+        assert_eq!(
+            natural_end_action(RepeatMode::All, false, 4, Some(3), &order, false),
+            NextAction::Play(0),
+            "All envuelve de la última a la primera"
+        );
+        assert_eq!(
+            natural_end_action(RepeatMode::All, false, 4, None, &order, true),
+            NextAction::Play(0),
+            "URL + All: entra a la biblioteca local"
+        );
+        // Lista vacía: no hay nada que sonar.
+        assert_eq!(
+            natural_end_action(RepeatMode::All, false, 0, None, &order, false),
+            NextAction::Stop
+        );
+    }
+
+    #[test]
+    fn natural_end_with_shuffle_walks_the_order_and_stops_after_every_track() {
+        // Orden mezclado: la lista [A,B,C,D] se navega 2 → 0 → 3 → 1.
+        let order = [2usize, 0, 3, 1];
+        assert_eq!(
+            natural_end_action(RepeatMode::Off, true, 4, Some(2), &order, false),
+            NextAction::Play(0)
+        );
+        assert_eq!(
+            natural_end_action(RepeatMode::Off, true, 4, Some(0), &order, false),
+            NextAction::Play(3)
+        );
+        assert_eq!(
+            natural_end_action(RepeatMode::Off, true, 4, Some(3), &order, false),
+            NextAction::Play(1)
+        );
+        assert_eq!(
+            natural_end_action(RepeatMode::Off, true, 4, Some(1), &order, false),
+            NextAction::Stop,
+            "agotó el orden mezclado sin repetir: se detiene"
+        );
+        // URL + shuffle: empieza por el primer elemento del orden (aleatorio).
+        assert_eq!(
+            natural_end_action(RepeatMode::Off, true, 4, None, &order, true),
+            NextAction::Play(2)
+        );
+        // All + shuffle: envuelve dentro del orden mezclado.
+        assert_eq!(
+            natural_end_action(RepeatMode::All, true, 4, Some(1), &order, false),
+            NextAction::Play(2)
+        );
+        // Orden desactualizado (cambió el filtro): se ignora el shuffle.
+        let stale = [1usize, 0];
+        assert_eq!(
+            natural_end_action(RepeatMode::Off, true, 4, Some(0), &stale, false),
+            NextAction::Play(1)
         );
     }
 

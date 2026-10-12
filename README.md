@@ -55,6 +55,20 @@ Windows.
 | `/` | Abrir el panel del explorador con la búsqueda |
 | `q` / `Esc` | Salir |
 
+**Modos de repetir (`r`) al terminar una pista naturalmente:**
+
+- **off** — sigue la siguiente pista de la lista visible; al final de la lista
+  el reproductor queda en «Fin de la pista» (no envuelve). Con aleatorio
+  (`s`) recorre el orden mezclado y se detiene cuando cada pista sonó una vez.
+- **una** — se repite la misma pista, incluidas las URLs: una página se
+  vuelve a resolver con yt-dlp porque las URLs resueltas vencen.
+- **todas** — avanza y envuelve al principio de la lista (con aleatorio,
+  envuelve dentro del orden mezclado).
+
+El fin natural de una URL sigue esta misma regla y el «siguiente» sale de la
+biblioteca local. Los atajos manuales `n` / `p` no envuelven con repetir
+off/una, como siempre.
+
 Con música sonando, el explorador ya no reemplaza la pantalla: se superpone
 como panel lateral derecho (~36% del ancho) y el reproductor con su
 visualizador queda visible de fondo, achicado pero animando. Sin sesión de
@@ -193,7 +207,7 @@ mp3tui permite reproducir música remota directamente desde la terminal o desde 
   - Se eliminan credenciales embebidas en la URL (`user:pass@host`); los parámetros de consulta (`query`) se conservan.
   - Aparece en el explorador (`Tab`) arriba de la biblioteca local bajo el grupo `"Agregadas por URL"` con el distintivo `[URL]`.
   - Se reproducen directamente con `Enter` sin volver a pegar el enlace y se filtran con la búsqueda (`/`).
-- **Navegación de biblioteca:** la reproducción por URL es puntual; los atajos de pista siguiente/anterior (`n`/`p`) y aleatorio (`s`) continúan operando sobre la biblioteca local escaneada. Al terminar una URL remota de forma natural, el reproductor se detiene en «Fin de la pista» sin avanzar a la biblioteca local ni reintentar pistas locales.
+- **Navegación de biblioteca:** la reproducción por URL es puntual; los atajos de pista siguiente/anterior (`n`/`p`) y aleatorio (`s`) continúan operando sobre la biblioteca local escaneada. Al terminar una URL remota de forma natural entra la biblioteca local: con repetir **off** suena la primera pista (con aleatorio, la primera del orden mezclado) y al final de la lista el reproductor queda en «Fin de la pista»; con repetir **todas** avanza igual y envuelve; con repetir **una** se repite la misma URL (si es una página se vuelve a resolver con yt-dlp).
 
 ## Limitaciones conocidas
 
