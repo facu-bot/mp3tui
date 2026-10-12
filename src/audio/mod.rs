@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 //! Motor de audio: decodificación con symphonia, salida con cpal y un ring
 //! buffer compartido con muestras PCM para el visualizador FFT.
 
@@ -21,7 +19,7 @@ use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, TrackType};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
-use symphonia::core::units::{Time, TimeBase};
+use symphonia::core::units::Time;
 
 const STATE_STOPPED: u8 = 0;
 const STATE_PLAYING: u8 = 1;
@@ -162,12 +160,6 @@ impl VisualizerTap {
         self.sample_rate
     }
 
-    pub fn is_empty(&self) -> bool {
-        match &self.consumer {
-            Some(consumer) => consumer.is_empty(),
-            None => true,
-        }
-    }
 
     /// Lee hasta `out.len()` muestras mono. Devuelve la cantidad leída.
     pub fn read_mono(&mut self, out: &mut [f32]) -> usize {
@@ -702,14 +694,7 @@ impl AudioEngine {
                 "no hay una pista en reproducción".to_string(),
             ));
         }
-        let is_seekable = self
-            .shared
-            .session
-            .lock()
-            .ok()
-            .map(|s| s.is_seekable)
-            .unwrap_or(false);
-        if !is_seekable {
+        if !self.is_seekable() {
             return Err(AudioError::Io(
                 "seek no soportado en stream HTTP sin Content-Length".to_string(),
             ));
@@ -752,27 +737,6 @@ impl AudioEngine {
     /// Handle compartido para leer las muestras mono que suena el device.
     pub fn visualizer(&self) -> Arc<Mutex<VisualizerTap>> {
         Arc::clone(&self.tap)
-    }
-
-    /// Bloquea hasta que la pista termine de sonar (o falle). Limpia el playback.
-    pub fn wait_until_done(&mut self) -> Result<(), AudioError> {
-        loop {
-            if let Some(err) = self.take_error() {
-                self.stop();
-                return Err(err);
-            }
-            if self.shared.finished.load(Ordering::Acquire) {
-                break;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-
-        let pending = self.take_error();
-        self.stop();
-        match pending {
-            Some(err) => Err(err),
-            None => Ok(()),
-        }
     }
 
     /// Error del último decode/device fallido (si lo hubo), para mostrarlo
@@ -948,8 +912,6 @@ struct OpenedMedia {
     track_id: u32,
     /// Duración reportada por el contenedor; `None` si no la conoce.
     duration: Option<Duration>,
-    /// Timebase de la pista, para convertir timestamps en segundos (tests).
-    time_base: Option<TimeBase>,
 }
 
 fn open_media(path: &Path) -> Result<OpenedMedia, AudioError> {
@@ -984,7 +946,6 @@ fn open_media(path: &Path) -> Result<OpenedMedia, AudioError> {
         .default_track(TrackType::Audio)
         .ok_or_else(|| AudioError::UnsupportedFormat("sin pistas de audio".to_string()))?;
     let track_id = track.id;
-    let time_base = track.time_base;
     let params = track
         .codec_params
         .as_ref()
@@ -1002,7 +963,6 @@ fn open_media(path: &Path) -> Result<OpenedMedia, AudioError> {
         decoder,
         track_id,
         duration,
-        time_base,
     })
 }
 
@@ -1673,7 +1633,12 @@ mod tests {
             return;
         }
         let open = open_media(path).expect("abrir wav");
-        let time_base = open.time_base.expect("wav con timebase");
+        // El timebase se lee del contenedor acá: `OpenedMedia` no lo expone.
+        let time_base = open
+            .format
+            .default_track(TrackType::Audio)
+            .and_then(|track| track.time_base)
+            .expect("wav con timebase");
         let total = open.duration.unwrap_or_else(|| Duration::from_secs(6));
         let target_secs = (total.as_secs_f64() / 2.0).clamp(0.25, 8.0);
         let mut format = open.format;

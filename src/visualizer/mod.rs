@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 //! Analizador de espectro FFT: ventana Hann, rustfft, bandas logarítmicas
 //! estilo cava y suavizado temporal con attack rápido y decay lento.
 
@@ -202,13 +200,6 @@ impl SpectrumAnalyzer {
         let rms = self.rms_level();
         self.update_vu(Some(rms));
         self.update_wave_gain();
-    }
-
-    /// Atajo: ingest + analyze. El loop de la TUI usa ingest/analyze por
-    /// separado para no sostener el lock del tap durante la FFT.
-    pub fn update(&mut self, tap: &mut VisualizerTap) {
-        self.ingest(tap);
-        self.analyze();
     }
 
     /// Magnitudes por banda normalizadas en 0.0..=1.0.

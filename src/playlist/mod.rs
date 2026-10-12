@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 //! Biblioteca y playlist: escaneo recursivo de carpetas + metadata con lofty.
 
 use std::fs;
@@ -92,20 +90,19 @@ impl Track {
 /// Playlist / biblioteca de pistas.
 pub struct Playlist {
     tracks: Vec<Track>,
-    current: Option<usize>,
 }
 
 impl Playlist {
     pub fn new() -> Self {
         Self {
             tracks: Vec::new(),
-            current: None,
         }
     }
 
     /// Escaneo recursivo de `root` con `std::fs` (sin crates externos),
     /// manteniendo solo archivos de audio y agrupados por carpeta de origen
-    /// ver [`Self::from_dirs_scan`].
+    /// ver [`Self::from_dirs_scan`]. Atajo solo para tests.
+    #[cfg(test)]
     pub fn from_dir_scan(root: &Path) -> Self {
         Self::from_dirs_scan(&[root.to_path_buf()])
     }
@@ -159,10 +156,7 @@ impl Playlist {
             }
         }
 
-        Self {
-            tracks,
-            current: None,
-        }
+        Self { tracks }
     }
 
     pub fn len(&self) -> usize {
@@ -171,14 +165,6 @@ impl Playlist {
 
     pub fn is_empty(&self) -> bool {
         self.tracks.is_empty()
-    }
-
-    pub fn current(&self) -> Option<usize> {
-        self.current
-    }
-
-    pub fn set_current(&mut self, index: Option<usize>) {
-        self.current = index.filter(|value| *value < self.tracks.len());
     }
 
     pub fn get(&self, index: usize) -> Option<&Track> {
@@ -204,10 +190,7 @@ impl Default for Playlist {
 
 #[cfg(test)]
 pub(crate) fn from_tracks_for_test(tracks: Vec<Track>) -> Playlist {
-    Playlist {
-        tracks,
-        current: None,
-    }
+    Playlist { tracks }
 }
 
 fn is_audio_file(path: &Path) -> bool {

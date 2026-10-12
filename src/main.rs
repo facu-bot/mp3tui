@@ -3,7 +3,6 @@ mod config;
 pub mod history;
 mod playback;
 mod playlist;
-#[allow(dead_code)]
 mod source;
 mod ui;
 mod visualizer;

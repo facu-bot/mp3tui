@@ -82,6 +82,9 @@ pub struct StreamProducer {
 }
 
 impl StreamProducer {
+    /// Solo para tests: la producción arma el productor con
+    /// [`Self::new_sequential`].
+    #[cfg(test)]
     pub fn new(content_length: Option<u64>) -> (Self, HttpStream) {
         let is_seekable = content_length.is_some();
         Self::new_sequential(content_length, is_seekable)
@@ -727,7 +730,9 @@ pub fn open(url: &str) -> Result<(HttpStream, StreamInfo), StreamError> {
     open_with_params(url, HttpTimeouts::default(), DEFAULT_CHUNK_SIZE)
 }
 
-/// Abre una URL de audio remoto por HTTP con timeouts configurables.
+/// Abre una URL de audio remoto por HTTP con timeouts configurables. Solo
+/// para tests: la producción entra por [`open`].
+#[cfg(test)]
 pub(crate) fn open_with(
     url: &str,
     timeouts: HttpTimeouts,

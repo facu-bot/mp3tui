@@ -27,6 +27,12 @@ pub enum UrlKind {
 }
 
 /// Clasificación del header HTTP `Content-Type`.
+///
+/// Todavía sin consumidor en producción: el camino que lo usaría
+/// ([`UrlKind::Unknown`]) sigue sin inspeccionar el header. Se conserva con
+/// `allow` puntual para no perder un mapeo ya cubierto por tests; el `allow`
+/// desaparece el día que ese camino se cablee.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContentKind {
     /// Flujo de audio directo.
@@ -129,7 +135,9 @@ pub fn classify(input: &str) -> Input {
     }
 }
 
-/// Clasifica una cabecera HTTP `Content-Type`.
+/// Clasifica una cabecera HTTP `Content-Type`. Sin consumidor en producción
+/// todavía: ver [`ContentKind`].
+#[allow(dead_code)]
 pub fn classify_content_type(header: &str) -> ContentKind {
     let mime = header
         .split(';')

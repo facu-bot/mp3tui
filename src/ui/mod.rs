@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 //! Interfaz de terminal: layout con ratatui y loop de eventos no bloqueante.
 //! Reproducción y explorador de biblioteca. Con sesión de audio
 //! el reproductor (info + visualizador) es el fondo permanente y el
@@ -1022,17 +1020,6 @@ fn apply_engine_snapshot(app: &mut App, snapshot: EngineSnapshot) -> Status {
     new_status
 }
 
-fn compute_frame_status(
-    app: &App,
-    engine: &AudioEngine,
-    this_frame_error: bool,
-) -> Status {
-    let pending_resolution = app.ytdlp_rx.is_some();
-    let playback_failed = engine.had_playback_error() || this_frame_error || app.ytdlp_failed;
-    let snapshot = EngineSnapshot::from_engine(engine, playback_failed);
-    compute_status(pending_resolution, snapshot)
-}
-
 fn status_of(engine: &AudioEngine) -> Status {
     compute_status(false, EngineSnapshot::from_engine(engine, false))
 }
@@ -1839,10 +1826,6 @@ fn submit_url_prompt_with(
             if path.is_file() {
                 if start_local_playback(app, engine, path.clone()) {
                     app.mode = Mode::Player;
-                    if let Some(lib) = app.library.as_mut() {
-                        let idx = lib.index_of(&path);
-                        lib.set_current(idx);
-                    }
                 }
             } else {
                 app.error = Some(format!("'{}' no existe o no es un archivo.", path.display()));
@@ -1943,9 +1926,6 @@ fn play_selected(app: &mut App, engine: &mut AudioEngine) {
                 return;
             };
             if start_local_playback(app, engine, track.path.clone()) {
-                if let Some(library) = app.library.as_mut() {
-                    library.set_current(Some(library_index));
-                }
                 app.mode = Mode::Player;
             }
         }
@@ -1992,9 +1972,6 @@ fn play_view_position(app: &mut App, engine: &mut AudioEngine, target: usize) ->
         return false;
     };
     if start_local_playback(app, engine, track.path.clone()) {
-        if let Some(library) = app.library.as_mut() {
-            library.set_current(Some(library_index));
-        }
         app.selected = target;
         true
     } else {
@@ -7906,7 +7883,9 @@ mod tests {
         };
 
         // Engine is not playing, not paused, and has no playback error (ended normally).
-        let status = compute_frame_status(&app, &engine, false);
+        let playback_failed = engine.had_playback_error() || app.ytdlp_failed;
+        let snapshot = EngineSnapshot::from_engine(&engine, playback_failed);
+        let status = compute_status(app.ytdlp_rx.is_some(), snapshot);
         assert_eq!(
             status,
             Status::Ended,

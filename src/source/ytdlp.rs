@@ -246,6 +246,9 @@ impl std::fmt::Display for YtDlpError {
 impl std::error::Error for YtDlpError {}
 
 /// Comprueba si `yt-dlp` está disponible en el entorno mediante `yt-dlp --version`.
+/// Solo para tests: la ausencia del binario se detecta en la ejecución real por
+/// [`YtDlpError::NotInstalled`].
+#[cfg(test)]
 pub fn is_available(runner: &dyn CommandRunner) -> bool {
     let args = vec!["--version".to_string()];
     match runner.run("yt-dlp", &args, Duration::from_secs(5)) {
