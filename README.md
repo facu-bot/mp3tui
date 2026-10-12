@@ -125,6 +125,24 @@ conocidas que existan en el sistema (`%USERPROFILE%\Music`, `\Downloads`,
 las reemplazan. Un archivo o carpeta pasado por CLI manda sobre todo lo
 anterior.
 
+### Mouse
+
+Con el mouse activado (por defecto):
+
+- **Barra de progreso:** clic para saltar a ese punto; arrastrar para recorrer
+  la canción.
+- **Barra de volumen:** clic o arrastre para fijar el volumen.
+- **Rueda** sobre el reproductor: sube o baja el volumen.
+
+La captura del mouse reemplaza la selección de texto nativa de la terminal (en
+Windows Terminal se sigue pudiendo seleccionar con `Shift` + arrastre). Para
+desactivarla:
+
+```toml
+[ui]
+mouse = false
+```
+
 ### Búsqueda (cuando está abierta)
 
 El campo aparece como una caja destacada junto a «Buscar:», con el fondo de

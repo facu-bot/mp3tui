@@ -52,6 +52,9 @@ pub struct Config {
     pub theme_overrides: Vec<(String, Color)>,
     pub keys: Keys,
     pub library: LibraryConfig,
+    /// `[ui] mouse`: captura del mouse (clic, arrastre, rueda). Activada por
+    /// defecto; con `false` la terminal conserva su selección de texto nativa.
+    pub mouse: bool,
     /// Avisos de la carga: campos inválidos, claves desconocidas o archivo
     /// ilegible. Vacío cuando todo (o el archivo mismo) está bien.
     pub warnings: Vec<String>,
@@ -65,6 +68,7 @@ impl Default for Config {
             theme_overrides: Vec::new(),
             keys: Keys::default(),
             library: LibraryConfig::default(),
+            mouse: true,
             warnings: Vec::new(),
         }
     }
@@ -173,7 +177,7 @@ pub fn parse(text: &str) -> Config {
 
     for section in table.keys() {
         match section.as_str() {
-            "theme" | "keybindings" | "library" => {}
+            "theme" | "keybindings" | "library" | "ui" => {}
             other => warnings.push(format!(
                 "sección desconocida «[{other}]» (se ignora)"
             )),
@@ -202,6 +206,16 @@ pub fn parse(text: &str) -> Config {
                 "[keybindings] debe ser una tabla con claves de la forma \
                  clave = \"valor\""
                     .to_string(),
+            ),
+        },
+    }
+
+    match table.get("ui") {
+        None => {}
+        Some(value) => match value.as_table() {
+            Some(section) => parse_ui(section, &mut config, &mut warnings),
+            None => warnings.push(
+                "[ui] debe ser una tabla, por ejemplo: mouse = false".to_string(),
             ),
         },
     }
@@ -1217,6 +1231,21 @@ impl LibraryConfig {
     }
 }
 
+/// `[ui]`: opciones de la interfaz. Hoy solo `mouse` (bool).
+fn parse_ui(section: &toml::Table, config: &mut Config, warnings: &mut Vec<String>) {
+    for (key, value) in section {
+        match key.as_str() {
+            "mouse" => match value.as_bool() {
+                Some(enabled) => config.mouse = enabled,
+                None => warnings.push(
+                    "[ui] mouse debe ser true o false; se deja activado".to_string(),
+                ),
+            },
+            other => warnings.push(format!("[ui] clave desconocida «{other}» (se ignora)")),
+        }
+    }
+}
+
 fn parse_library(
     section: &toml::Table,
     library: &mut LibraryConfig,
@@ -1318,6 +1347,29 @@ pub fn key_labels(codes: &[KeyCode]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ui_mouse_defaults_on_and_can_be_disabled() {
+        assert!(parse("").mouse, "mouse activado por defecto");
+        let off = parse("[ui]
+mouse = false");
+        assert!(!off.mouse);
+        assert!(off.warnings.is_empty(), "{:?}", off.warnings);
+    }
+
+    #[test]
+    fn ui_mouse_invalid_values_warn_and_keep_default() {
+        let bad = parse("[ui]
+mouse = \"no\"");
+        assert!(bad.mouse, "un valor inválido no desactiva el mouse");
+        assert_eq!(bad.warnings.len(), 1, "{:?}", bad.warnings);
+        assert!(bad.warnings[0].contains("mouse"), "{:?}", bad.warnings);
+
+        let unknown = parse("[ui]
+zoom = 2");
+        assert_eq!(unknown.warnings.len(), 1, "{:?}", unknown.warnings);
+        assert!(unknown.warnings[0].contains("zoom"), "{:?}", unknown.warnings);
+    }
 
     #[test]
     fn default_keys_use_b_search_tab_explorer_and_esc_only_to_quit() {

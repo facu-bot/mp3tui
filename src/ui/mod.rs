@@ -7,12 +7,16 @@
 //! pantalla completa solo cuando no hay player (arranque por directorio).
 
 use std::io;
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
+};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -273,6 +277,139 @@ struct App {
     theme_menu: Option<ThemeMenuState>,
     /// Doble Esc para salir: el primer Esc arma, el segundo sale.
     quit_guard: QuitGuard,
+    /// Zonas clickeables del último frame (las anota el render).
+    hit: RefCell<HitMap>,
+    /// Arrastre con el mouse en curso.
+    drag: Option<Drag>,
+}
+
+/// Barra clickeable registrada al dibujar: columna inicial, fila y ancho del
+/// tramo interno (sin etiqueta ni corchetes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BarHit {
+    x: u16,
+    y: u16,
+    width: u16,
+}
+
+impl BarHit {
+    /// Fracción 0..=1 de la columna dentro de la barra (afuera se recorta).
+    fn ratio(&self, column: u16) -> f64 {
+        if self.width <= 1 {
+            return 0.0;
+        }
+        let last = self.width - 1;
+        let offset = column.saturating_sub(self.x).min(last);
+        f64::from(offset) / f64::from(last)
+    }
+
+    fn contains(&self, column: u16, row: u16) -> bool {
+        row == self.y && column >= self.x && column < self.x.saturating_add(self.width)
+    }
+}
+
+/// Zonas clickeables del último frame (las anota el render).
+#[derive(Debug, Clone, Default)]
+struct HitMap {
+    progress: Option<BarHit>,
+    volume: Option<BarHit>,
+    /// Área del reproductor (info + visualizador): la rueda cambia el volumen.
+    player: Option<Rect>,
+}
+
+/// Arrastre en curso: sigue a la barra donde empezó aunque el puntero salga.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Drag {
+    Progress,
+    Volume,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum MouseAction {
+    None,
+    SeekRatio(f64),
+    SetVolume(f64),
+    VolumeStep(i8),
+}
+
+/// Columna inicial (relativa) y ancho del tramo interno de una barra hecha
+/// con `build_bar`, o `None` si no entra.
+fn bar_geometry(label: &str, suffix: &str, total_width: usize) -> Option<(u16, u16)> {
+    let label_len = label.chars().count();
+    // Etiqueta + " [" + "] " + sufijo; la barra necesita al menos 3 celdas.
+    let overhead = label_len + 2 + 2 + suffix.chars().count();
+    if total_width <= overhead + 2 {
+        return None;
+    }
+    let offset = u16::try_from(label_len + 2).ok()?;
+    let width = u16::try_from(total_width - overhead).ok()?;
+    Some((offset, width))
+}
+
+/// Traduce un evento de mouse a una acción según las zonas del frame y el
+/// arrastre en curso; devuelve también el nuevo estado de arrastre.
+fn mouse_action(hit: &HitMap, drag: Option<Drag>, event: MouseEvent) -> (MouseAction, Option<Drag>) {
+    let (column, row) = (event.column, event.row);
+    match event.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if let Some(bar) = hit.progress.filter(|bar| bar.contains(column, row)) {
+                (MouseAction::SeekRatio(bar.ratio(column)), Some(Drag::Progress))
+            } else if let Some(bar) = hit.volume.filter(|bar| bar.contains(column, row)) {
+                (MouseAction::SetVolume(bar.ratio(column)), Some(Drag::Volume))
+            } else {
+                (MouseAction::None, None)
+            }
+        }
+        MouseEventKind::Drag(MouseButton::Left) => match (drag, hit.progress, hit.volume) {
+            (Some(Drag::Progress), Some(bar), _) => (MouseAction::SeekRatio(bar.ratio(column)), drag),
+            (Some(Drag::Volume), _, Some(bar)) => (MouseAction::SetVolume(bar.ratio(column)), drag),
+            _ => (MouseAction::None, drag),
+        },
+        MouseEventKind::Up(MouseButton::Left) => (MouseAction::None, None),
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            let over_player = hit.player.is_some_and(|area| {
+                area.contains(ratatui::layout::Position::new(column, row))
+            });
+            if !over_player {
+                return (MouseAction::None, drag);
+            }
+            let step = if event.kind == MouseEventKind::ScrollUp { 1 } else { -1 };
+            (MouseAction::VolumeStep(step), drag)
+        }
+        _ => (MouseAction::None, drag),
+    }
+}
+
+/// Aplica un evento de mouse (clic/arrastre en barras, rueda) si `[ui] mouse`
+/// está activado.
+fn handle_mouse(event: MouseEvent, app: &mut App, engine: &mut AudioEngine) {
+    if !config::config().mouse {
+        return;
+    }
+    let (action, drag) = mouse_action(&app.hit.borrow(), app.drag, event);
+    app.drag = drag;
+    match action {
+        MouseAction::None => {}
+        MouseAction::SeekRatio(ratio) => seek_to_ratio(app, engine, ratio),
+        MouseAction::SetVolume(volume) => engine.set_volume((volume as f32).clamp(0.0, 1.0)),
+        MouseAction::VolumeStep(step) => engine.set_volume(
+            (engine.volume() + f32::from(step) * VOLUME_STEP).clamp(0.0, 1.0),
+        ),
+    }
+}
+
+/// Seek a una fracción de la duración (clic/arrastre en la barra de progreso).
+fn seek_to_ratio(app: &mut App, engine: &mut AudioEngine, ratio: f64) {
+    if !app.has_player {
+        return;
+    }
+    let Some(total) = engine.duration().or_else(|| current_track_duration(app)) else {
+        return;
+    };
+    match engine.seek(total.mul_f64(ratio.clamp(0.0, 1.0))) {
+        Ok(()) => app.error = None,
+        Err(err) => app.error = Some(err.to_string()),
+    }
 }
 
 /// Ventana para confirmar la salida con un segundo Esc.
@@ -349,6 +486,9 @@ impl Tui {
         match ratatui::try_init() {
             Ok(terminal) => {
                 let _ = crossterm::execute!(io::stdout(), crossterm::event::EnableBracketedPaste);
+                if config::config().mouse {
+                    let _ = crossterm::execute!(io::stdout(), crossterm::event::EnableMouseCapture);
+                }
                 Ok(Self {
                     terminal,
                     restored: false,
@@ -368,6 +508,7 @@ impl Tui {
         }
         self.restored = true;
         let _ = crossterm::execute!(io::stdout(), crossterm::event::DisableBracketedPaste);
+        let _ = crossterm::execute!(io::stdout(), crossterm::event::DisableMouseCapture);
         let _ = self.terminal.show_cursor();
         let _ = ratatui::try_restore();
     }
@@ -444,6 +585,8 @@ pub fn run(engine: &mut AudioEngine, start: StartMode) -> io::Result<()> {
         history_path: crate::history::history_path(),
         theme_menu: None,
         quit_guard: QuitGuard::default(),
+        hit: RefCell::new(HitMap::default()),
+        drag: None,
     };
 
     if let Some((url, kind)) = start_url_info {
@@ -543,6 +686,7 @@ fn event_loop(tui: &mut Tui, app: &mut App, engine: &mut AudioEngine) -> io::Res
                     break;
                 }
             }
+            Event::Mouse(mouse) => handle_mouse(mouse, app, engine),
             Event::Paste(pasted) if app.url_input.is_some() => {
                 if let Some(buf) = app.url_input.as_mut() {
                     handle_prompt_paste(buf, &pasted);
@@ -1461,6 +1605,8 @@ fn toggle_explorer(app: &mut App) {
 }
 
 fn render(frame: &mut Frame<'_>, app: &App, engine: &AudioEngine) {
+    // Las zonas clickeables se vuelven a anotar en cada frame.
+    *app.hit.borrow_mut() = HitMap::default();
     match app.mode {
         Mode::Player => render_player(frame, app, engine),
         Mode::Browser => render_browser(frame, app),
@@ -1657,6 +1803,7 @@ fn player_areas(area: Rect, explorer_open: bool) -> (Rect, Rect, Rect, Option<Re
 fn render_player(frame: &mut Frame<'_>, app: &App, engine: &AudioEngine) {
     let (info_area, visual_area, footer_area, panel) =
         player_areas(frame.area(), app.explorer_open);
+    app.hit.borrow_mut().player = Some(info_area.union(visual_area));
 
     // Mejora 5: el foco visual va al panel cuando está abierto; info y
     // visualizador quedan con borde apagado en ese caso.
@@ -1765,6 +1912,13 @@ fn render_player_info(frame: &mut Frame<'_>, area: Rect, app: &App, engine: &Aud
         )),
         rows[row],
     );
+    if let Some((offset, width)) = bar_geometry("Volumen  ", &vol_suffix, inner.width as usize) {
+        app.hit.borrow_mut().volume = Some(BarHit {
+            x: rows[row].x + offset,
+            y: rows[row].y,
+            width,
+        });
+    }
 
     let position = engine.position();
     let duration = engine.duration().or_else(|| current_track_duration(app));
@@ -1788,6 +1942,15 @@ fn render_player_info(frame: &mut Frame<'_>, area: Rect, app: &App, engine: &Aud
                 )),
                 rows[row + 1],
             );
+            if let Some((offset, width)) =
+                bar_geometry("Progreso ", &prog_suffix, inner.width as usize)
+            {
+                app.hit.borrow_mut().progress = Some(BarHit {
+                    x: rows[row + 1].x + offset,
+                    y: rows[row + 1].y,
+                    width,
+                });
+            }
         }
         None => {
             frame.render_widget(
@@ -1876,13 +2039,10 @@ fn build_bar(
     buffered_color: Color,
     buffered: &[(f32, f32)],
 ) -> Line<'static> {
-    // Ancho de la barra interna: descontar etiqueta + " [" + "] " + sufijo.
-    let overhead = label.chars().count() + 2 + 2 + suffix.chars().count();
-    let bar_chars = if total_width > overhead + 2 {
-        total_width - overhead
-    } else {
-        0
-    };
+    // Ancho de la barra interna: misma geometría que usa el mouse para
+    // ubicar el clic (etiqueta + " [" + barra + "] " + sufijo).
+    let bar_chars = bar_geometry(label, suffix, total_width)
+        .map_or(0, |(_, width)| usize::from(width));
 
     let label_span = Span::styled(label.to_string(), Style::default().fg(empty_color));
 
@@ -3005,6 +3165,8 @@ mod tests {
             history_path: Some(test_temp_history_path()),
             theme_menu: None,
             quit_guard: QuitGuard::default(),
+            hit: RefCell::new(HitMap::default()),
+            drag: None,
         }
     }
 
@@ -3603,6 +3765,137 @@ mod tests {
 
     fn theme_menu_key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE }
+    }
+
+    fn sample_hit() -> HitMap {
+        HitMap {
+            progress: Some(BarHit { x: 20, y: 6, width: 51 }),
+            volume: Some(BarHit { x: 20, y: 5, width: 11 }),
+            player: Some(Rect::new(0, 0, 100, 20)),
+        }
+    }
+
+    #[test]
+    fn bar_geometry_matches_build_bar_layout() {
+        // "Progreso " (9) + " [" (2) => la barra empieza en la columna 11.
+        let (offset, width) = bar_geometry("Progreso ", "1:00 / 3:00", 80).expect("entra");
+        assert_eq!(offset, 11);
+        assert_eq!(width as usize, 80 - (9 + 2 + 2 + "1:00 / 3:00".len()));
+        assert!(bar_geometry("Progreso ", "1:00 / 3:00", 10).is_none(), "sin espacio");
+    }
+
+    #[test]
+    fn bar_hit_ratio_and_contains() {
+        let bar = BarHit { x: 20, y: 6, width: 51 };
+        assert!(bar.contains(20, 6) && bar.contains(70, 6));
+        assert!(!bar.contains(19, 6) && !bar.contains(71, 6) && !bar.contains(30, 7));
+        assert_eq!(bar.ratio(20), 0.0);
+        assert_eq!(bar.ratio(70), 1.0);
+        assert!((bar.ratio(45) - 0.5).abs() < 1e-9);
+        assert_eq!(bar.ratio(5), 0.0, "a la izquierda se recorta a 0");
+        assert_eq!(bar.ratio(200), 1.0, "a la derecha se recorta a 1");
+    }
+
+    #[test]
+    fn click_on_progress_seeks_and_starts_drag() {
+        let (action, drag) =
+            mouse_action(&sample_hit(), None, mouse(MouseEventKind::Down(MouseButton::Left), 45, 6));
+        assert_eq!(drag, Some(Drag::Progress));
+        match action {
+            MouseAction::SeekRatio(r) => assert!((r - 0.5).abs() < 1e-9),
+            other => panic!("esperaba seek: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drag_keeps_following_the_progress_bar_outside_its_row() {
+        let (action, drag) = mouse_action(
+            &sample_hit(),
+            Some(Drag::Progress),
+            mouse(MouseEventKind::Drag(MouseButton::Left), 70, 12),
+        );
+        assert_eq!(drag, Some(Drag::Progress));
+        assert_eq!(action, MouseAction::SeekRatio(1.0));
+
+        let (action, drag) = mouse_action(
+            &sample_hit(),
+            Some(Drag::Progress),
+            mouse(MouseEventKind::Up(MouseButton::Left), 70, 12),
+        );
+        assert_eq!((action, drag), (MouseAction::None, None), "soltar termina el arrastre");
+    }
+
+    #[test]
+    fn click_on_volume_sets_volume() {
+        let (action, drag) =
+            mouse_action(&sample_hit(), None, mouse(MouseEventKind::Down(MouseButton::Left), 30, 5));
+        assert_eq!(drag, Some(Drag::Volume));
+        assert_eq!(action, MouseAction::SetVolume(1.0));
+    }
+
+    #[test]
+    fn wheel_over_player_steps_volume_and_elsewhere_does_nothing() {
+        let hit = sample_hit();
+        let (up, _) = mouse_action(&hit, None, mouse(MouseEventKind::ScrollUp, 10, 10));
+        let (down, _) = mouse_action(&hit, None, mouse(MouseEventKind::ScrollDown, 10, 10));
+        assert_eq!(up, MouseAction::VolumeStep(1));
+        assert_eq!(down, MouseAction::VolumeStep(-1));
+        let (outside, _) = mouse_action(&hit, None, mouse(MouseEventKind::ScrollUp, 150, 40));
+        assert_eq!(outside, MouseAction::None);
+        let (miss, drag) =
+            mouse_action(&hit, None, mouse(MouseEventKind::Down(MouseButton::Left), 2, 2));
+        assert_eq!((miss, drag), (MouseAction::None, None), "clic fuera de las barras");
+    }
+
+    fn render_player_frame(app: &App, engine: &AudioEngine) -> ratatui::buffer::Buffer {
+        let backend = ratatui::backend::TestBackend::new(100, 40);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal de prueba");
+        terminal
+            .draw(|frame| render(frame, app, engine))
+            .expect("dibuja");
+        terminal.backend().buffer().clone()
+    }
+
+    #[test]
+    fn render_registers_the_volume_bar_where_it_is_drawn() {
+        let Some(engine) = engine_or_skip() else { return };
+        let mut app = test_app();
+        app.mode = Mode::Player;
+        app.has_player = true;
+        let buffer = render_player_frame(&app, &engine);
+
+        let bar = app.hit.borrow().volume.expect("barra de volumen registrada");
+        let row: String = (0..buffer.area.width)
+            .map(|x| buffer[(x, bar.y)].symbol().to_string())
+            .collect();
+        assert!(row.contains("Volumen"), "la fila registrada es la del volumen: {row}");
+        assert_eq!(buffer[(bar.x - 1, bar.y)].symbol(), "[", "empieza justo después de «[»");
+        assert!(app.hit.borrow().player.is_some(), "área del reproductor registrada");
+    }
+
+    #[test]
+    fn clicking_the_end_of_the_volume_bar_sets_full_volume() {
+        let Some(mut engine) = engine_or_skip() else { return };
+        let mut app = test_app();
+        app.mode = Mode::Player;
+        app.has_player = true;
+        render_player_frame(&app, &engine);
+        let bar = app.hit.borrow().volume.expect("barra registrada");
+
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: bar.x + bar.width - 1,
+            row: bar.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(click, &mut app, &mut engine);
+        assert_eq!(engine.volume(), 1.0, "clic al final = 100%");
+        engine.set_volume(0.0);
+        assert_eq!(app.drag, Some(Drag::Volume));
     }
 
     fn find_search_box(line: &Line<'_>) -> Option<Span<'static>> {
