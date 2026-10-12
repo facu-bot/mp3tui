@@ -184,9 +184,8 @@ previsualizan cada modo en vivo, `Enter` aplica el modo y guarda su `mode`
 en la sección `[visualizer]` de este archivo (creándola si no existe) y
 vuelve al panel, y `Esc` cancela, restaura el modo anterior y vuelve al
 panel. `onda` dibuja el osciloscopio con las muestras crudas del audio,
-`espejo` las 32 bandas en espejo vertical desde una línea central, `caida`
-las barras con marca de máximo por banda (decae en ~800 ms) y `vu` el medidor
-de nivel mono con RMS y marca de pico (decae en ~800 ms); `circular`
+`espejo` las 32 bandas en espejo vertical desde una línea central y `vu` el
+medidor de nivel mono con RMS y marca de pico (decae en ~800 ms); `circular`
 el plot polar grueso de las 32 bandas (radios desde el centro con el
 gradiente del tema, centro tenue). `barras` es el
 comportamiento actual.
@@ -248,7 +247,7 @@ roots = ["C:/Musica"]
 
 [visualizer]
 style = "auto" # auto (según la terminal), ascii o unicode
-mode = "barras" # barras (default), onda, espejo, caida, vu o circular
+mode = "barras" # barras (default), onda, espejo, vu o circular
 ```
 
 Notas del comportamiento de la config:
@@ -269,14 +268,15 @@ Notas del comportamiento de la config:
 - `[visualizer] mode` elige el modo del visualizador: `barras` (default, el
   comportamiento actual), `onda` (osciloscopio con las muestras crudas del
   audio, la más reciente a la derecha), `espejo` (las 32 bandas en espejo
-  vertical desde una línea central tenue), `caida` (barras con marca del
-  máximo por banda en `spectrum_high`, decae en ~800 ms), `vu` (medidor de
-   nivel mono con RMS, barra horizontal con gradiente del tema, marca de pico
-  en `spectrum_high` que decae en ~800 ms y escala tenue; mono porque el tap
-  ya promedia los canales — ver nota T4) o `circular` (plot polar grueso de
-   las 32 bandas como radios desde el centro, con el gradiente del tema por
-   distancia al centro y centro tenue; compensa el aspecto ~1:2 de la celda).
-   Un valor inválido avisa y se usa `barras`.
+  vertical desde una línea central tenue), `vu` (medidor de nivel mono con
+  RMS, barra horizontal con gradiente del tema, marca de pico en
+  `spectrum_high` que decae en ~800 ms y escala tenue; mono porque el tap ya
+  promedia los canales — ver nota T4) o `circular` (plot polar grueso de las
+  32 bandas como radios desde el centro, con el gradiente del tema por
+  distancia al centro y centro tenue; compensa el aspecto ~1:2 de la celda).
+  Un valor inválido avisa y se usa `barras`. El valor `caida` (modo
+  eliminado) avisa específicamente y cae a `barras`, autocorrigiendo además
+  el archivo real al cargar.
 - Si dos acciones distintas quedan mapeadas a la misma tecla, gana la de
   mayor prioridad en el dispatch y se genera un warning que lo explicita
   (la perdedora vuelve a sus defaults libres).

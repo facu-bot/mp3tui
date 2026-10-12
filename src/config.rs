@@ -57,10 +57,14 @@ pub struct Config {
     pub mouse: bool,
     /// `[visualizer] style`: ascii, unicode o auto (según `WT_SESSION`).
     pub visualizer_style: VisualizerStyle,
-    /// `[visualizer] mode`: barras (default), onda, espejo, caida, vu o
-    /// circular (T1 modos-visualizador: solo barras dibuja distinto; el resto
-    /// cae al render de barras hasta T2–T5).
+    /// `[visualizer] mode`: barras (default), onda, espejo, vu o circular.
+    /// El valor eliminado `caida` avisa específicamente y cae a `barras`.
     pub visualizer_mode: VisualizerMode,
+    /// `true` cuando `parse()` encontró el valor eliminado `caida` en
+    /// `[visualizer] mode`: señal para que `load()` reescriba la config real
+    /// a `barras` una sola vez (`parse()` puro, el que usan los tests, nunca
+    /// toca archivos).
+    pub(crate) removed_visualizer_mode: bool,
     /// Avisos de la carga: campos inválidos, claves desconocidas o archivo
     /// ilegible. Vacío cuando todo (o el archivo mismo) está bien.
     pub warnings: Vec<String>,
@@ -77,6 +81,7 @@ impl Default for Config {
             mouse: true,
             visualizer_style: VisualizerStyle::default(),
             visualizer_mode: VisualizerMode::default(),
+            removed_visualizer_mode: false,
             warnings: Vec::new(),
         }
     }
@@ -123,7 +128,13 @@ pub fn load() -> Config {
         return Config::default();
     };
     match fs::read_to_string(&path) {
-        Ok(text) => parse(&text),
+        Ok(text) => {
+            let mut config = parse(&text);
+            if config.removed_visualizer_mode {
+                migrate_removed_visualizer_mode_at(&path, &mut config.warnings);
+            }
+            config
+        }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             if from_override {
                 Config {
@@ -1541,8 +1552,6 @@ pub enum VisualizerMode {
     Onda,
     /// 32 bandas arriba+abajo desde el centro (T3).
     Espejo,
-    /// Peak-hold + caída por segmentos (T3).
-    Caida,
     /// Medidor RMS, mono como el tap actual (T4).
     Vu,
     /// Plot polar grueso de las 32 bandas (T5).
@@ -1556,19 +1565,17 @@ impl VisualizerMode {
             Self::Barras => "barras",
             Self::Onda => "onda",
             Self::Espejo => "espejo",
-            Self::Caida => "caida",
             Self::Vu => "vu",
             Self::Circular => "circular",
         }
     }
 
-    /// Los 6 valores en orden estable de menú (sub-selector de Modo, T1).
-    pub fn options() -> [Self; 6] {
+    /// Los 5 valores en orden estable de menú (sub-selector de Modo).
+    pub fn options() -> [Self; 5] {
         [
             Self::Barras,
             Self::Onda,
             Self::Espejo,
-            Self::Caida,
             Self::Vu,
             Self::Circular,
         ]
@@ -1782,6 +1789,24 @@ pub fn persist_visualizer_mode(mode: &str) -> Result<(), String> {
     persist_visualizer_mode_at(&path, mode)
 }
 
+/// Autocorrige `path` cuando `[visualizer] mode` traía el valor eliminado
+/// `caida`: reescribe `mode` a `barras` con la persistencia línea-a-línea
+/// existente (`persist_visualizer_mode_at`), la misma que usa el sub-selector
+/// del panel. Solo lo llama `load()`, nunca `parse()` (puro, sin tocar
+/// archivos). Best-effort: un fallo al escribir se agrega a `warnings` en
+/// vez de entrar en pánico; sin reintentos.
+fn migrate_removed_visualizer_mode_at(path: &Path, warnings: &mut Vec<String>) {
+    if let Err(err) =
+        persist_visualizer_mode_at(path, VisualizerMode::Barras.as_str())
+    {
+        warnings.push(format!(
+            "no se pudo corregir automáticamente [visualizer] mode \
+             («caida» → «barras») en '{}': {err}",
+            path.display()
+        ));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Persistencia del toggle de mouse (T4, espejo de la del tema / bandas)
 // ---------------------------------------------------------------------------
@@ -1959,9 +1984,12 @@ pub fn persist_mouse_enabled(enabled: bool) -> Result<(), String> {
     persist_mouse_enabled_at(&path, enabled)
 }
 
-/// `[visualizer]`: `style` (auto/ascii/unicode) y `mode`
-/// (barras/onda/espejo/caida/vu/circular). Merge campo a campo como el resto:
-/// lo inválido avisa y cae al default sin tocar lo demás.
+/// `[visualizer]`: `style` (auto/ascii/unicode) y `mode`, derivado de
+/// `VisualizerMode::options()` (sin lista de valores hardcodeada en el
+/// match ni en el aviso). El valor eliminado `caida` avisa específicamente
+/// y cae a `barras` (`load()` migra la config real, ver
+/// `migrate_removed_visualizer_mode_at`). Merge campo a campo como el
+/// resto: lo inválido avisa y cae al default sin tocar lo demás.
 fn parse_visualizer(
     section: &toml::Table,
     config: &mut Config,
@@ -1991,20 +2019,31 @@ fn parse_visualizer(
             },
             "mode" => match value.as_str() {
                 Some(raw) => {
-                    match raw.trim().to_ascii_lowercase().as_str() {
-                        "barras" => config.visualizer_mode = VisualizerMode::Barras,
-                        "onda" => config.visualizer_mode = VisualizerMode::Onda,
-                        "espejo" => config.visualizer_mode = VisualizerMode::Espejo,
-                        "caida" => config.visualizer_mode = VisualizerMode::Caida,
-                        "vu" => config.visualizer_mode = VisualizerMode::Vu,
-                        "circular" => {
-                            config.visualizer_mode = VisualizerMode::Circular
+                    let normalized = raw.trim().to_ascii_lowercase();
+                    match VisualizerMode::options()
+                        .into_iter()
+                        .find(|mode| mode.as_str() == normalized)
+                    {
+                        Some(mode) => config.visualizer_mode = mode,
+                        None if normalized == "caida" => {
+                            config.visualizer_mode = VisualizerMode::Barras;
+                            config.removed_visualizer_mode = true;
+                            warnings.push(format!(
+                                "[visualizer] mode «{raw}»: el modo «caida» \
+                                 fue eliminado; se usa «barras»"
+                            ));
                         }
-                        _ => warnings.push(format!(
-                            "[visualizer] mode «{raw}» no reconocido \
-                             (válidos: barras, onda, espejo, caida, vu, circular); \
-                             se usa «barras»"
-                        )),
+                        None => {
+                            let valid = VisualizerMode::options()
+                                .iter()
+                                .map(|mode| mode.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            warnings.push(format!(
+                                "[visualizer] mode «{raw}» no reconocido \
+                                 (válidos: {valid}); se usa «barras»"
+                            ));
+                        }
                     }
                 }
                 None => warnings.push(
@@ -3267,7 +3306,6 @@ zoom = 2");
             ("barras", VisualizerMode::Barras),
             ("onda", VisualizerMode::Onda),
             ("espejo", VisualizerMode::Espejo),
-            ("caida", VisualizerMode::Caida),
             ("vu", VisualizerMode::Vu),
             ("circular", VisualizerMode::Circular),
         ] {
@@ -3283,6 +3321,36 @@ zoom = 2");
         assert_eq!(bad.visualizer_mode, VisualizerMode::Barras);
         assert_eq!(bad.warnings.len(), 1, "{:?}", bad.warnings);
         assert!(bad.warnings[0].contains("mode"), "{:?}", bad.warnings);
+        // La lista de válidos sale de `VisualizerMode::options()`, no de un
+        // string duplicado a mano.
+        assert!(
+            bad.warnings[0].contains("barras, onda, espejo, vu, circular"),
+            "lista de válidos derivada de options(): {:?}",
+            bad.warnings
+        );
+
+        // `caida` ya no existe: cae al aviso específico + default (no el
+        // genérico de «no reconocido»), y marca la config para que `load()`
+        // la migre.
+        let removed = parse("[visualizer]\nmode = \"caida\"");
+        assert_eq!(
+            removed.visualizer_mode,
+            VisualizerMode::Barras,
+            "caida ya no existe: cae a barras"
+        );
+        assert!(
+            removed.removed_visualizer_mode,
+            "marca para que load() migre el archivo real"
+        );
+        assert_eq!(removed.warnings.len(), 1, "{:?}", removed.warnings);
+        assert!(
+            removed.warnings[0].contains("eliminado"),
+            "aviso específico de modo eliminado, no el genérico: {:?}",
+            removed.warnings
+        );
+
+        // Un valor inválido cualquiera no dispara la migración.
+        assert!(!bad.removed_visualizer_mode);
 
         let not_a_string = parse("[visualizer]\nmode = 42");
         assert_eq!(
@@ -3308,23 +3376,21 @@ zoom = 2");
     }
 
     #[test]
-    fn visualizer_mode_options_list_six_values_in_stable_menu_order() {
+    fn visualizer_mode_options_list_five_values_in_stable_menu_order() {
         assert_eq!(
             VisualizerMode::options(),
             [
                 VisualizerMode::Barras,
                 VisualizerMode::Onda,
                 VisualizerMode::Espejo,
-                VisualizerMode::Caida,
                 VisualizerMode::Vu,
                 VisualizerMode::Circular,
             ],
-            "orden estable del sub-modal: barras, onda, espejo, caida, vu, circular"
+            "orden estable del sub-modal: barras, onda, espejo, vu, circular"
         );
         assert_eq!(VisualizerMode::Barras.as_str(), "barras");
         assert_eq!(VisualizerMode::Onda.as_str(), "onda");
         assert_eq!(VisualizerMode::Espejo.as_str(), "espejo");
-        assert_eq!(VisualizerMode::Caida.as_str(), "caida");
         assert_eq!(VisualizerMode::Vu.as_str(), "vu");
         assert_eq!(VisualizerMode::Circular.as_str(), "circular");
     }
@@ -3373,11 +3439,11 @@ zoom = 2");
         // Un comentario que menciona [visualizer] no abre una sección.
         let out = update_visualizer_mode(
             "# [visualizer]\n[library]\nroots = []\n",
-            "caida",
+            "vu",
         );
         assert!(
             out.starts_with("# [visualizer]\n")
-                && out.ends_with("[visualizer]\nmode = \"caida\"\n"),
+                && out.ends_with("[visualizer]\nmode = \"vu\"\n"),
             "{out:?}"
         );
 
@@ -3466,6 +3532,40 @@ zoom = 2");
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn migrate_removed_visualizer_mode_at_rewrites_caida_to_barras_once() {
+        let path = std::env::temp_dir()
+            .join(format!("mp3tui_mode_migrate_{}.toml", std::process::id()));
+        std::fs::write(&path, "# mío\n[visualizer]\nmode = \"caida\"\n").unwrap();
+
+        let mut warnings = Vec::new();
+        migrate_removed_visualizer_mode_at(&path, &mut warnings);
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text, "# mío\n[visualizer]\nmode = \"barras\"\n");
+        assert!(warnings.is_empty(), "{:?}", warnings);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn migrate_removed_visualizer_mode_at_reports_write_failure_as_warning() {
+        // Destino no escribible (directorio): el error se agrega a
+        // `warnings`, nunca entra en pánico ni se reintenta.
+        let dir = std::env::temp_dir()
+            .join(format!("mp3tui_mode_migrate_dir_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut warnings = Vec::new();
+        migrate_removed_visualizer_mode_at(&dir, &mut warnings);
+
+        assert_eq!(warnings.len(), 1, "{:?}", warnings);
+        assert!(!warnings[0].is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

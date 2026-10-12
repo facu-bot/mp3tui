@@ -24,10 +24,10 @@ const F_MAX_CAP: f32 = 16_000.0;
 const ATTACK: f32 = 0.55;
 /// Peso del valor nuevo cuando la barra baja (decay más lento).
 const DECAY: f32 = 0.16;
-/// Caída lineal del peak-hold por `analyze()`: de techo a cero en 48 frames
+/// Caída lineal del pico VU por `analyze()`: de techo a cero en 48 frames
 /// (≈ 800 ms a 60 fps). Las barras bajan con el DECAY existente (suavizado
-/// attack/decay); solo el pico tiene decay propio (T3 modos-visualizador:
-/// testeado en `peaks_fall_linearly_and_never_drop_below_bands`).
+/// attack/decay); solo el pico tiene decay propio (testeado en
+/// `vu_decays_without_samples_and_peak_falls_with_peak_fall`).
 const PEAK_FALL: f32 = 1.0 / 48.0;
 /// Tamaño del staging de lectura (igual al ring del tap: 8192 muestras).
 const TAP_READ_MAX: usize = 1 << 13;
@@ -55,12 +55,9 @@ pub struct SpectrumAnalyzer {
     /// Nivel VU mono para el modo `vu` (T4 modos-visualizador): RMS suavizado
     /// de la señal del tap actual; ver `update_vu`.
     vu: f32,
-    /// Pico del medidor VU (T4): máximo visto del nivel, con el mismo decay
-    /// `PEAK_FALL` del modo `caida`.
+    /// Pico del medidor VU (T4): máximo visto del nivel, con decay
+    /// `PEAK_FALL`, nunca por debajo del nivel actual.
     vu_peak: f32,
-    /// Peak-hold por banda para el modo `caida` (T3 modos-visualizador):
-    /// marca del máximo visto; sube con la banda y baja con `PEAK_FALL`.
-    peaks: [f32; NUM_BANDS],
     band_ranges: Vec<(usize, usize)>,
     sample_rate: u32,
 }
@@ -91,7 +88,6 @@ impl SpectrumAnalyzer {
             bands: [0.0; NUM_BANDS],
             vu: 0.0,
             vu_peak: 0.0,
-            peaks: [0.0; NUM_BANDS],
             band_ranges: Self::compute_ranges(44_100),
             sample_rate: 0,
         }
@@ -131,7 +127,6 @@ impl SpectrumAnalyzer {
             for band in &mut self.bands {
                 *band *= 1.0 - DECAY;
             }
-            self.update_peaks();
             self.update_vu(None);
             return;
         }
@@ -169,7 +164,6 @@ impl SpectrumAnalyzer {
                 current + (target - current) * DECAY
             };
         }
-        self.update_peaks();
         let rms = self.rms_level();
         self.update_vu(Some(rms));
     }
@@ -186,12 +180,6 @@ impl SpectrumAnalyzer {
         &self.bands
     }
 
-    /// Peak-hold por banda (modo `caida` de T3): el máximo visto por banda,
-    /// en 0.0..=1.0. Siempre >= la banda actual.
-    pub fn peaks(&self) -> &[f32; NUM_BANDS] {
-        &self.peaks
-    }
-
     /// Nivel del medidor VU (modo `vu` de T4): RMS suavizado en 0.0..=1.0.
     pub fn vu(&self) -> f32 {
         self.vu
@@ -201,22 +189,6 @@ impl SpectrumAnalyzer {
     /// 0.0..=1.0. Siempre >= el nivel actual.
     pub fn vu_peak(&self) -> f32 {
         self.vu_peak
-    }
-
-    /// Peak-hold del modo `caida` (T3): el pico sube con la banda en el acto
-    /// y baja linealmente con `PEAK_FALL`, sin quedar nunca debajo de ella.
-    /// Vive en el analizador (acoplamiento mínimo: se actualiza donde se
-    /// actualizan las bandas y el render solo lee con `peaks()`, sin
-    /// interior mutability aunque `render_visualizer` reciba `&Analyzer`).
-    fn update_peaks(&mut self) {
-        for index in 0..NUM_BANDS {
-            let band = self.bands[index];
-            if band >= self.peaks[index] {
-                self.peaks[index] = band;
-            } else {
-                self.peaks[index] = (self.peaks[index] - PEAK_FALL).max(band);
-            }
-        }
     }
 
     /// RMS del ring mono actual (0.0..=1.0 con clamp del llamador): raíz de la
@@ -232,8 +204,13 @@ impl SpectrumAnalyzer {
 
     /// Nivel VU mono del modo `vu` (T4 modos-visualizador): sigue al RMS con
     /// el mismo suavizado attack/decay de las bandas (sin jitter) y el pico
-    /// sube en el acto y baja con `PEAK_FALL` (reusado de T3, sin duplicar),
-    /// sin quedar nunca debajo del nivel.
+    /// sube en el acto y baja con `PEAK_FALL`, sin quedar nunca debajo del
+    /// nivel.
+    ///
+    /// Sin ganancia extra: el VU mide RMS honesto, a diferencia de las
+    /// bandas (`GAIN = 5.0`). Un seno a escala completa da ≈ 0.707 y usa el
+    /// 70% de la escala, dejando headroom (testeado en
+    /// `vu_is_a_single_mono_level_from_current_tap`).
     ///
     /// Decisión mono documentada (nota T1/T4): el tap ya promedia a mono en
     /// el callback (`tap.push_slice(&mono)` en `src/audio/mod.rs`, que suma
@@ -398,10 +375,15 @@ mod tests {
             analyzer.analyze();
         }
         // Seno a escala completa: RMS = 1/√2 ≈ 0.707 (sin ganancia extra: el
-        // VU mide honesto, sin el GAIN de las barras).
+        // VU mide honesto, sin el GAIN de las barras), con headroom.
         assert!(
             (analyzer.vu() - 0.707).abs() < 0.05,
             "el nivel converge al RMS del mono, obtenido {}",
+            analyzer.vu()
+        );
+        assert!(
+            analyzer.vu() < 0.8,
+            "queda headroom en el medidor (obtenido {})",
             analyzer.vu()
         );
         assert!(
@@ -425,8 +407,8 @@ mod tests {
             analyzer.vu_peak() >= analyzer.vu(),
             "el pico nunca baja del nivel"
         );
-        // El pico baja linealmente con el mismo PEAK_FALL del modo `caida`
-        // (~800 ms de techo a cero a 60 fps).
+        // El pico baja linealmente con PEAK_FALL (~800 ms de techo a cero
+        // a 60 fps).
         analyzer.vu = 0.0;
         analyzer.vu_peak = 1.0;
         for _ in 0..48 {
@@ -471,50 +453,6 @@ mod tests {
         analyzer.analyze();
         let after = analyzer.bands()[0];
         assert!(after > 0.0 && after < 0.8, "debe decaer lentamente, obtenido {after}");
-    }
-
-    // T3 (modos-visualizador): peak-hold del modo `caida`.
-    #[test]
-    fn peaks_start_at_zero_and_track_rising_bands() {
-        let mut analyzer = SpectrumAnalyzer::new();
-        assert_eq!(analyzer.peaks(), &[0.0f32; NUM_BANDS]);
-        analyzer.bands[3] = 0.6;
-        analyzer.analyze();
-        // Sin muestras las bandas decaen con DECAY, y el pico registra el
-        // nivel resultante (nunca queda debajo de la banda).
-        assert_eq!(analyzer.peaks()[3], analyzer.bands()[3]);
-        assert!(analyzer.peaks()[3] > 0.0 && analyzer.peaks()[3] < 0.6);
-    }
-
-    #[test]
-    fn peaks_fall_linearly_and_never_drop_below_bands() {
-        let mut analyzer = SpectrumAnalyzer::new();
-        analyzer.peaks[0] = 1.0;
-        analyzer.bands[0] = 0.0;
-        for _ in 0..24 {
-            analyzer.analyze();
-        }
-        assert!(
-            (analyzer.peaks()[0] - 0.5).abs() < 1e-5,
-            "24 frames ≈ mitad del recorrido, obtenido {}",
-            analyzer.peaks()[0]
-        );
-        for _ in 0..24 {
-            analyzer.analyze();
-        }
-        assert!(
-            analyzer.peaks()[0] < 1e-5,
-            "48 frames ≈ 800 ms a 60 fps: el pico llegó a cero, obtenido {}",
-            analyzer.peaks()[0]
-        );
-        assert!(
-            analyzer.peaks()[0] >= analyzer.bands()[0],
-            "el pico nunca baja de la banda"
-        );
-        // Y con la banda subiendo, el pico la sigue en el acto.
-        analyzer.bands[1] = 0.9;
-        analyzer.analyze();
-        assert_eq!(analyzer.peaks()[1], analyzer.bands()[1]);
     }
 
     #[test]

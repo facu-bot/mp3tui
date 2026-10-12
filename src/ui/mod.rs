@@ -703,9 +703,8 @@ struct BandsMenuState {
 
 /// Estado del selector de modo (T1 modos-visualizador): selección con
 /// previsualización en vivo y el modo con el que se abrió (para el marcador
-/// y para restaurar con Esc). Espejo de `BandsMenuState` sobre los 6 valores
-/// fijos. En T1 la previsualización solo mueve el modo activo (todos los
-/// modos dibujan las barras hasta T2–T5).
+/// y para restaurar con Esc). Espejo de `BandsMenuState` sobre los 5 valores
+/// fijos.
 struct ModeMenuState {
     /// Índice en `config::VisualizerMode::options()`.
     selected: usize,
@@ -1532,9 +1531,9 @@ fn handle_mode_menu_key(
             let delta = if matches!(key.code, KeyCode::Up) { -1 } else { 1 };
             menu.selected = move_selection(menu.selected, delta, len);
             let mode = config::VisualizerMode::options()[menu.selected];
-            // Previsualización en vivo: cambia el modo sin persistir. En T1
-            // todos los modos dibujan las barras, así que el fondo no cambia
-            // hasta T2–T5; el estado activo sí sigue al cursor.
+            // Previsualización en vivo: cambia el modo sin persistir. Cada
+            // modo tiene su propio pintor, así que el fondo cambia al toque
+            // mientras se navega con ↑/↓.
             config::preview_visualizer_mode(mode);
         }
         KeyCode::Enter => {
@@ -3346,10 +3345,10 @@ fn render_visualizer(frame: &mut Frame<'_>, area: Rect, analyzer: &SpectrumAnaly
         config::effective_visualizer_style(),
         config::VisualizerStyle::Ascii
     );
-    // T2 modos-visualizador: `onda` va a su osciloscopio con las muestras
-    // crudas del tap; T3: `espejo` y `caida` van a sus pintores con el dato
-    // de bandas; T4: `vu` a su medidor con RMS; T5: `circular` a su plot
-    // polar (`barras` byte-a-byte idéntico vía `paint_bands`, sin tocar).
+    // Cada modo va a su propio pintor con los datos que necesita: `onda` al
+    // osciloscopio con las muestras crudas del tap, `espejo` y `vu` con las
+    // bandas/RMS del analizador, `circular` a su plot polar; `barras` sigue
+    // el path actual byte-a-byte idéntico vía `paint_bands`.
     match resolve_visualizer_paint(config::active_visualizer_mode()) {
         VisualizerPaint::Bars => {
             paint_bands(frame.buffer_mut(), inner, analyzer.bands(), &theme(), ascii)
@@ -3361,14 +3360,6 @@ fn render_visualizer(frame: &mut Frame<'_>, area: Rect, analyzer: &SpectrumAnaly
         VisualizerPaint::Mirror => {
             paint_mirror(frame.buffer_mut(), inner, analyzer.bands(), &theme(), ascii)
         }
-        VisualizerPaint::Fall => paint_fall(
-            frame.buffer_mut(),
-            inner,
-            analyzer.bands(),
-            analyzer.peaks(),
-            &theme(),
-            ascii,
-        ),
         VisualizerPaint::Vu => paint_vu(
             frame.buffer_mut(),
             inner,
@@ -3387,28 +3378,24 @@ fn render_visualizer(frame: &mut Frame<'_>, area: Rect, analyzer: &SpectrumAnaly
     }
 }
 
-/// Destino del dispatch de render por modo (T5 modos-visualizador): barras,
-/// osciloscopio, espejo, caída, VU o plot polar (sin fallback: los 6 modos
-/// tienen pintor propio desde T5).
+/// Destino del dispatch de render por modo: barras, osciloscopio, espejo, VU
+/// o plot polar. Sin fallback: los 5 modos tienen pintor propio.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VisualizerPaint {
     Bars,
     Wave,
     Mirror,
-    Fall,
     Vu,
     Circular,
 }
 
-/// Dispatch puro del modo al pintor: cada modo va al suyo (`circular` al plot
-/// polar de T5; el fallback temporal a barras murió en T5, testeado en
-/// `visualizer_paint_routes_all_modes_to_their_painters`).
+/// Dispatch puro del modo al pintor: cada modo va al suyo, sin fallback
+/// (testeado en `visualizer_paint_routes_all_modes_to_their_painters`).
 fn resolve_visualizer_paint(mode: config::VisualizerMode) -> VisualizerPaint {
     match mode {
         config::VisualizerMode::Barras => VisualizerPaint::Bars,
         config::VisualizerMode::Onda => VisualizerPaint::Wave,
         config::VisualizerMode::Espejo => VisualizerPaint::Mirror,
-        config::VisualizerMode::Caida => VisualizerPaint::Fall,
         config::VisualizerMode::Vu => VisualizerPaint::Vu,
         config::VisualizerMode::Circular => VisualizerPaint::Circular,
     }
@@ -3621,10 +3608,10 @@ fn paint_mirror(
 ///   `spectrum_high` a la derecha) y celda parcial con los mismos glifos de
 ///   las barras (`band_full_glyph`/`band_frac_glyph`: `@`/rampa en ascii con
 ///   fondo de puntos `.`, `█`/octavos en unicode — sin lógica duplicada).
-/// - Marca de pico con el decay `PEAK_FALL` del analizador (reusado de T3, el
-///   render solo lee `peak`): tick vertical en `spectrum_high` sobre las filas
-///   de barra (`█`, `▇` si cae a mitad de columna, `@` en ascii — igual que el
-///   modo `caida`); tapa la barra donde coincide para que siempre se vea.
+/// - Marca de pico con el decay `PEAK_FALL` del analizador (el render solo
+///   lee `peak`): tick vertical en `spectrum_high` sobre las filas de barra,
+///   con `band_full_glyph` (`█`/`@`) caiga el pico en el borde exacto de la
+///   columna o no — tapa la barra donde coincide para que siempre se vea.
 /// - Eje/escala tenue en `dim` en la última fila (`-` con tics `|` en ascii,
 ///   `─` con tics `┼` en unicode, en 0/25/50/75/100%).
 /// - Panel muy bajo (1–2 filas): una sola fila de barra arriba, sin pico ni
@@ -3684,18 +3671,13 @@ fn paint_vu(
     if inner.height >= 3 && peak > 0.0 {
         let peak_f = peak * f32::from(width);
         let peak_full = peak_f.floor() as u16;
-        let peak_frac = peak_f - peak_f.floor();
-        // Columna del borde (igual que el modo `caida` en vertical: borde
-        // exacto = primera celda vacía, con clip al ancho; si cae a mitad de
-        // columna, la celda que lo contiene).
+        // Columna del borde (borde exacto = primera celda vacía, con clip
+        // al ancho; si cae a mitad de columna, la celda que lo contiene).
         let col = peak_full.min(width.saturating_sub(1));
-        let symbol = if peak_frac <= 0.0 {
-            band_full_glyph(ascii)
-        } else if ascii {
-            "@"
-        } else {
-            "▇"
-        };
+        // Medidor horizontal: no hay glifo vertical de 7/8 que tenga sentido
+        // para "a mitad de columna" (eso era del painter vertical original).
+        // La misma celda llena, caiga el pico en el borde exacto o no.
+        let symbol = band_full_glyph(ascii);
         for row in 0..bar_rows {
             if let Some(cell) = buffer.cell_mut((inner.x + col, inner.y + row)) {
                 cell.set_symbol(symbol).set_fg(theme.spectrum_high);
@@ -3722,72 +3704,11 @@ fn paint_vu(
     }
 }
 
-/// T3 (modos-visualizador): barras normales (`paint_bands`, byte-a-byte
-/// idénticas: sin picos el buffer es indistinguible, testeado en
-/// `paint_fall_without_peaks_matches_plain_bars`) + marca de peak-hold por
-/// banda en `spectrum_high`.
-///
-/// Decisiones (testeadas en los tests `paint_fall_*` y `peaks_*`):
-/// - Las barras bajan con el DECAY existente del analizador (suavizado
-///   attack/decay de `analyze`): sin decay propio para la barra.
-/// - El pico vive en el analizador (`SpectrumAnalyzer::peaks`, actualizado en
-///   `analyze` donde se actualizan las bandas: acoplamiento mínimo, el render
-///   solo lee sin interior mutability) y baja linealmente con `PEAK_FALL`
-///   (~800 ms de techo a cero a 60 fps), sin quedar nunca debajo de la banda.
-/// - La marca es una celda en el nivel del pico: `█` en unicode (`▇` si el
-///   pico cae a mitad de celda) y `@` en ascii (coherente con la rampa, cuyo
-///   nivel lleno es `@`); tapa la barra donde coincide para que el máximo
-///   siempre se vea. Fondo de puntos `.` en ascii respetado.
-fn paint_fall(
-    buffer: &mut ratatui::buffer::Buffer,
-    inner: Rect,
-    bands: &[f32; NUM_BANDS],
-    peaks: &[f32; NUM_BANDS],
-    theme: &Theme,
-    ascii: bool,
-) {
-    paint_bands(buffer, inner, bands, theme, ascii);
-    if inner.width == 0 || inner.height == 0 {
-        return;
-    }
-    let total = u32::from(inner.width);
-    let bottom = inner.y + inner.height;
-    for (band, &peak) in peaks.iter().enumerate() {
-        let Some((slot_start, width)) = band_slot(band, total) else {
-            break;
-        };
-        let level = peak.clamp(0.0, 1.0) * f32::from(inner.height);
-        if level <= 0.0 {
-            continue;
-        }
-        let full = level.floor() as u16;
-        let frac = level - level.floor();
-        // Filas desde abajo hasta el pico: en borde exacto va la fila del
-        // borde; si cae a mitad de celda, la celda que lo contiene.
-        let rows_up = (if frac <= 0.0 { full } else { full + 1 })
-            .min(inner.height)
-            .max(1);
-        let y = bottom - rows_up;
-        let symbol = if frac <= 0.0 {
-            band_full_glyph(ascii)
-        } else if ascii {
-            "@"
-        } else {
-            "▇"
-        };
-        for dx in 0..width {
-            if let Some(cell) = buffer.cell_mut((inner.x + slot_start + dx, y)) {
-                cell.set_symbol(symbol).set_fg(theme.spectrum_high);
-            }
-        }
-    }
-}
-
 /// Slot horizontal proporcional de la banda `band` en un ancho total de
 /// `total` columnas: `(x0_rel, ancho)` relativos al inicio del área, o `None`
 /// si la banda cae fuera (menos columnas que bandas). Slot >= 2 → barra =
-/// slot - 1 (1 col de gap); slot == 1 → sin gap posible. T3 lo extrae de
-/// `paint_bands` para reusarlo en espejo/caída sin duplicar el reparto.
+/// slot - 1 (1 col de gap); slot == 1 → sin gap posible. Extraído de
+/// `paint_bands` para reusarlo en `paint_mirror` sin duplicar el reparto.
 fn band_slot(band: usize, total: u32) -> Option<(u16, u16)> {
     let bands_count = NUM_BANDS as u32;
     let (slot_start, slot_end) = if total >= bands_count {
@@ -4742,104 +4663,6 @@ mod tests {
         }
     }
 
-    // T3 (modos-visualizador): caída con peak-hold por banda.
-    // Área 32x10 → 1 columna por banda.
-    // ------------------------------------------------------------------
-
-    #[test]
-    fn paint_fall_marks_peak_above_bar_with_spectrum_high() {
-        let theme = Theme::default();
-        let area = Rect::new(0, 0, 32, 10);
-        let mut buffer = Buffer::empty(area);
-        let bands = [0.2f32; NUM_BANDS];
-        let peaks = [0.8f32; NUM_BANDS];
-        paint_fall(&mut buffer, area, &bands, &peaks, &theme, false);
-        // Banda 0.2 → 2 celdas (filas 8–9); pico 0.8 → fila 2.
-        let marker = &buffer[(0u16, 2u16)];
-        assert_eq!(marker.symbol(), "█", "marca del máximo sobre la barra");
-        assert_eq!(marker.fg, theme.spectrum_high, "el pico va en spectrum_high");
-        assert_eq!(
-            buffer[(0u16, 9u16)].symbol(),
-            "█",
-            "la barra sigue normal abajo"
-        );
-        assert_eq!(
-            buffer[(0u16, 5u16)].symbol(),
-            " ",
-            "entre pico y barra no hay nada"
-        );
-    }
-
-    #[test]
-    fn paint_fall_fractional_peak_uses_seven_eighths_block() {
-        let theme = Theme::default();
-        let area = Rect::new(0, 0, 32, 10);
-        let mut buffer = Buffer::empty(area);
-        let peaks = [0.85f32; NUM_BANDS];
-        paint_fall(&mut buffer, area, &[0.0f32; NUM_BANDS], &peaks, &theme, false);
-        // 0.85 * 10 = 8.5 → fila 1 con bloque parcial.
-        assert_eq!(
-            buffer[(0u16, 1u16)].symbol(),
-            "▇",
-            "pico fraccional = ▇ en unicode"
-        );
-        assert_eq!(buffer[(0u16, 1u16)].fg, theme.spectrum_high);
-        // ASCII: el pico es coherente con la rampa (@ = nivel lleno).
-        let mut buffer = Buffer::empty(area);
-        paint_fall(&mut buffer, area, &[0.0f32; NUM_BANDS], &peaks, &theme, true);
-        assert_eq!(buffer[(0u16, 1u16)].symbol(), "@", "pico ascii = @");
-        assert_eq!(buffer[(0u16, 1u16)].fg, theme.spectrum_high);
-        assert_eq!(
-            buffer[(0u16, 5u16)].symbol(),
-            ".",
-            "el fondo de puntos sobrevive"
-        );
-    }
-
-    #[test]
-    fn paint_fall_without_peaks_matches_plain_bars() {
-        // Sin picos el modo es indistinguible de las barras normales.
-        let theme = Theme::default();
-        let area = Rect::new(0, 0, 40, 10);
-        let bands: [f32; NUM_BANDS] = std::array::from_fn(|i| (i as f32 * 0.137) % 1.0);
-        let mut plain = Buffer::empty(area);
-        paint_bands(&mut plain, area, &bands, &theme, false);
-        let mut fall = Buffer::empty(area);
-        paint_fall(&mut fall, area, &bands, &[0.0f32; NUM_BANDS], &theme, false);
-        for y in 0..10u16 {
-            for x in 0..40u16 {
-                assert_eq!(
-                    fall[(x, y)].symbol(),
-                    plain[(x, y)].symbol(),
-                    "celda ({x},{y})"
-                );
-                assert_eq!(fall[(x, y)].fg, plain[(x, y)].fg, "color ({x},{y})");
-            }
-        }
-    }
-
-    #[test]
-    fn paint_fall_tiny_heights_degrade_without_panic() {
-        let theme = Theme::default();
-        let area = Rect::new(0, 0, 32, 1);
-        let mut buffer = Buffer::empty(area);
-        paint_fall(
-            &mut buffer,
-            area,
-            &[0.5f32; NUM_BANDS],
-            &[1.0f32; NUM_BANDS],
-            &theme,
-            false,
-        );
-        for x in 0..32u16 {
-            assert_eq!(
-                buffer[(x, 0u16)].symbol(),
-                "█",
-                "1 fila: pico y barra colapsan sin pánico"
-            );
-        }
-    }
-
     // T4 (modos-visualizador): VU mono horizontal con RMS.
     // Área 32x5 → barra en filas 0–3, escala tenue en fila 4.
     // ------------------------------------------------------------------
@@ -4936,6 +4759,31 @@ mod tests {
             buffer[(20u16, 0u16)].symbol(),
             " ",
             "a la derecha del pico no hay nada"
+        );
+    }
+
+    #[test]
+    fn paint_vu_peak_at_fractional_column_uses_full_glyph() {
+        let theme = Theme::default();
+        let area = Rect::new(0, 0, 32, 5);
+        // Pico en 0.26 → columna 8 con fracción > 0 (no cae en el borde
+        // exacto de una celda): el medidor es horizontal, así que el glifo
+        // vertical de 7/8 no aplica — queda el mismo glifo lleno que el
+        // borde exacto (`band_full_glyph`).
+        let mut buffer = Buffer::empty(area);
+        paint_vu(&mut buffer, area, 0.0, 0.26, &theme, false);
+        assert_eq!(
+            buffer[(8u16, 0u16)].symbol(),
+            "█",
+            "pico a mitad de columna usa el glifo lleno (unicode)"
+        );
+
+        let mut buffer = Buffer::empty(area);
+        paint_vu(&mut buffer, area, 0.0, 0.26, &theme, true);
+        assert_eq!(
+            buffer[(8u16, 0u16)].symbol(),
+            "@",
+            "pico a mitad de columna usa el glifo lleno (ascii)"
         );
     }
 
@@ -7417,10 +7265,10 @@ mod tests {
         // Sin envoltura, como los otros selectores.
         handle_mode_menu_key(theme_menu_key(KeyCode::Up), &mut app, |_| Ok(()));
         assert_eq!(selected(&app), 0, "↑ en la primera fila no se mueve");
-        for _ in 0..7 {
+        for _ in 0..6 {
             handle_mode_menu_key(theme_menu_key(KeyCode::Down), &mut app, |_| Ok(()));
         }
-        assert_eq!(selected(&app), 5, "↓ frena en circular sin envolver");
+        assert_eq!(selected(&app), 4, "↓ frena en circular sin envolver (5 modos)");
 
         // Navegar previsualiza en vivo: el modo activo sigue al cursor.
         assert_eq!(
@@ -7556,8 +7404,7 @@ mod tests {
 
     #[test]
     fn visualizer_paint_routes_all_modes_to_their_painters() {
-        // T5: los 6 modos tienen pintor propio (`circular` al plot polar);
-        // el fallback temporal a barras muere acá (test T4 reescrito).
+        // Los 5 modos tienen pintor propio, sin fallback a barras.
         assert_eq!(
             resolve_visualizer_paint(config::VisualizerMode::Barras),
             VisualizerPaint::Bars,
@@ -7572,11 +7419,6 @@ mod tests {
             resolve_visualizer_paint(config::VisualizerMode::Espejo),
             VisualizerPaint::Mirror,
             "espejo va a su pintor simétrico, no a las barras"
-        );
-        assert_eq!(
-            resolve_visualizer_paint(config::VisualizerMode::Caida),
-            VisualizerPaint::Fall,
-            "caida va a su pintor con peak-hold, no a las barras"
         );
         assert_eq!(
             resolve_visualizer_paint(config::VisualizerMode::Vu),
