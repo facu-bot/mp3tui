@@ -31,7 +31,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 
-use ratatui::crossterm::event::KeyCode;
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::Color;
 
 /// Override de la ruta del archivo (pruebas / instalaciones portables).
@@ -858,6 +858,12 @@ pub struct Keys {
     pub open_url: Vec<KeyCode>,
     /// Abrir el menú de temas (T12): por defecto 't'.
     pub theme_menu: Vec<KeyCode>,
+    /// Abrir el panel de configuración (T1: shell con filas Temas/Mouse/Bandas).
+    /// Se dispara con Ctrl+tecla (por defecto `Ctrl+P`): a diferencia de
+    /// `explorer` (donde Tab y Ctrl+Tab valen por igual porque el dispatch
+    /// ignora modificadores), acá se exige Ctrl para no robarle la letra
+    /// suelta a otra acción (`p` sigue siendo pista anterior).
+    pub settings: Vec<KeyCode>,
 }
 
 impl Default for Keys {
@@ -890,6 +896,7 @@ impl Default for Keys {
             back: keys(&[KeyCode::Esc]),
             open_url: keys(&[KeyCode::Char('u')]),
             theme_menu: keys(&[KeyCode::Char('t')]),
+            settings: keys(&[KeyCode::Char('p')]),
         }
     }
 }
@@ -914,6 +921,7 @@ fn parse_keybindings(
             "search" => &mut keys.search,
             "open_url" => &mut keys.open_url,
             "theme_menu" => &mut keys.theme_menu,
+            "settings" => &mut keys.settings,
             "speed_up" => &mut keys.speed_up,
             "speed_down" => &mut keys.speed_down,
             "explorer" => &mut keys.explorer,
@@ -1004,6 +1012,7 @@ fn resolve_key_collisions(keys: &mut Keys, warnings: &mut Vec<String>) {
         ("search", &mut keys.search, &defaults.search),
         ("open_url", &mut keys.open_url, &defaults.open_url),
         ("theme_menu", &mut keys.theme_menu, &defaults.theme_menu),
+        ("settings", &mut keys.settings, &defaults.settings),
         ("move_up", &mut keys.move_up, &defaults.move_up),
         ("move_down", &mut keys.move_down, &defaults.move_down),
         ("page_up", &mut keys.page_up, &defaults.page_up),
@@ -1188,6 +1197,14 @@ pub fn pressed(bindings: &[KeyCode], code: KeyCode) -> bool {
         (KeyCode::Char(a), KeyCode::Char(b)) => a.eq_ignore_ascii_case(&b),
         (binding, code) => binding == code,
     })
+}
+
+/// ¿`key` dispara un atajo `Ctrl+...` (`settings`, por defecto Ctrl+P)? A
+/// diferencia de `pressed` —que ignora modificadores, como el Ctrl+Tab que cae
+/// en `explorer`—, exige Ctrl: la letra suelta sigue siendo de su acción
+/// (`p` = pista anterior, `t` = menú de temas).
+pub fn pressed_ctrl(bindings: &[KeyCode], key: KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL) && pressed(bindings, key.code)
 }
 
 // ---------------------------------------------------------------------------
@@ -2031,9 +2048,49 @@ zoom = 2");
         assert!(plain.warnings.is_empty(), "warnings: {:?}", plain.warnings);
     }
 
+    // -------------------------------------------------------------------------
+    // T1: acción `settings` (panel de configuración, Ctrl+P)
+    // -------------------------------------------------------------------------
+
     #[test]
-    fn theme_menu_default_parse_and_collision() {
-        assert_eq!(Keys::default().theme_menu, vec![KeyCode::Char('t')]);
+    fn settings_defaults_to_ctrl_p_and_parses() {
+        assert_eq!(
+            Keys::default().settings,
+            vec![KeyCode::Char('p')],
+            "default: la letra de Ctrl+P"
+        );
+
+        let config = parse("[keybindings]\nsettings = \"o\"\n");
+        assert_eq!(config.keys.settings, vec![KeyCode::Char('o')]);
+        assert!(config.warnings.is_empty(), "warnings: {:?}", config.warnings);
+    }
+
+    #[test]
+    fn settings_default_does_not_collide_with_prev_track() {
+        // `settings` (Ctrl+P) y `prev_track` (p) comparten la letra pero no la
+        // combinación: los defaults no generan avisos y ambos conservan su tecla.
+        let config = parse("");
+        assert!(config.warnings.is_empty(), "warnings: {:?}", config.warnings);
+        assert_eq!(config.keys.settings, vec![KeyCode::Char('p')]);
+        assert_eq!(config.keys.prev_track, vec![KeyCode::Char('p')]);
+    }
+
+    #[test]
+    fn pressed_ctrl_requires_the_control_modifier() {
+        use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
+        let bindings = vec![KeyCode::Char('p')];
+        let plain = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE);
+        assert!(!pressed_ctrl(&bindings, plain), "la letra suelta no dispara settings");
+        let ctrl = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL);
+        assert!(pressed_ctrl(&bindings, ctrl), "Ctrl+P sí");
+        let other = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
+        assert!(!pressed_ctrl(&bindings, other), "otra tecla con Ctrl tampoco");
+        let upper = KeyEvent::new(KeyCode::Char('P'), KeyModifiers::CONTROL);
+        assert!(pressed_ctrl(&bindings, upper), "sin distinguir mayúsculas");
+    }
+
+    #[test]
+    fn theme_menu_default_parse_and_collision() {        assert_eq!(Keys::default().theme_menu, vec![KeyCode::Char('t')]);
 
         let config = parse(
             r#"

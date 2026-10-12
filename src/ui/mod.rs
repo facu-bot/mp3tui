@@ -278,6 +278,8 @@ struct App {
     pub history_path: Option<PathBuf>,
     /// Menú de temas abierto (T12): `Some` mientras el modal está activo.
     theme_menu: Option<ThemeMenuState>,
+    /// Panel de configuración abierto (T1): `Some` mientras el modal está activo.
+    settings_panel: Option<SettingsPanelState>,
     /// Doble Esc para salir: el primer Esc arma, el segundo sale.
     quit_guard: QuitGuard,
     /// Zonas clickeables del último frame (las anota el render).
@@ -408,6 +410,17 @@ fn footer_chip_spans(text: &str) -> (Vec<Span<'static>>, Vec<(u16, u16, String)>
 /// «Esc×2»): la primera de la lista. `None` si no es un atajo.
 fn key_for_chip(keys_text: &str) -> Option<KeyCode> {
     let first = keys_text.split(['/', ' ']).next()?.trim_end_matches("×2");
+    // «Ctrl+P: config» (T1): la acción `settings` exige Ctrl, así que el
+    // prefijo se resuelve solo contra sus teclas (sin distinguir mayúsculas:
+    // el chip muestra «P» y el binding es «p»).
+    if let Some(rest) = first.strip_prefix("Ctrl+") {
+        return config::config()
+            .keys
+            .settings
+            .iter()
+            .copied()
+            .find(|code| config::key_label(*code).eq_ignore_ascii_case(rest));
+    }
     let keys = &config::config().keys;
     [
         &keys.quit, &keys.play_pause, &keys.volume_up, &keys.volume_down,
@@ -415,12 +428,24 @@ fn key_for_chip(keys_text: &str) -> Option<KeyCode> {
         &keys.shuffle, &keys.repeat, &keys.search, &keys.speed_up,
         &keys.speed_down, &keys.explorer, &keys.move_up, &keys.move_down,
         &keys.page_up, &keys.page_down, &keys.home, &keys.end, &keys.select,
-        &keys.back, &keys.open_url, &keys.theme_menu,
+        &keys.back, &keys.open_url, &keys.theme_menu, &keys.settings,
     ]
     .into_iter()
     .flatten()
     .copied()
     .find(|code| config::key_label(*code) == first)
+}
+
+/// Etiqueta de la tecla de `settings` para el chip («P» en «Ctrl+P: config»):
+/// una letra suelta se muestra en mayúscula (se aprieta con Ctrl); los
+/// nombres especiales quedan tal cual («Enter», «Tab»…).
+fn settings_key_display() -> String {
+    let label = config::key_labels(&config::config().keys.settings);
+    if label.chars().count() == 1 {
+        label.to_uppercase()
+    } else {
+        label
+    }
 }
 
 /// Fila de controles clickeables: la línea a dibujar y, por botón, la columna
@@ -539,9 +564,9 @@ fn handle_mouse(event: MouseEvent, app: &mut App, engine: &mut AudioEngine) {
     if !config::config().mouse {
         return;
     }
-    // Con un modal abierto (prompt de URL, menú de temas) el clic no
-    // atraviesa hacia lo que quedó tapado.
-    if app.url_input.is_some() || app.theme_menu.is_some() {
+    // Con un modal abierto (prompt de URL, menú de temas, panel de
+    // configuración) el clic no atraviesa hacia lo que quedó tapado.
+    if app.url_input.is_some() || app.theme_menu.is_some() || app.settings_panel.is_some() {
         app.drag = None;
         return;
     }
@@ -559,7 +584,17 @@ fn handle_mouse(event: MouseEvent, app: &mut App, engine: &mut AudioEngine) {
         MouseAction::Press(Button::Next) => play_step(app, engine, 1),
         MouseAction::Press(Button::Shuffle) => toggle_shuffle(app),
         MouseAction::Press(Button::Repeat) => app.repeat = app.repeat.cycle(),
-        MouseAction::Key(code) => handle_key(KeyEvent::new(code, KeyModifiers::NONE), app, engine),
+        MouseAction::Key(code) => {
+            // El chip «Ctrl+P: config» registra la tecla de `settings`: al
+            // clickearlo se sintetiza con Ctrl (la acción lo exige); el resto
+            // de los chips va sin modificador, como siempre.
+            let modifiers = if config::pressed(&config::config().keys.settings, code) {
+                KeyModifiers::CONTROL
+            } else {
+                KeyModifiers::NONE
+            };
+            handle_key(KeyEvent::new(code, modifiers), app, engine)
+        }
     }
 }
 
@@ -637,6 +672,17 @@ struct ThemeMenuState {
     original_name: String,
     /// Colores activos al abrir: Esc los restaura.
     original_theme: Theme,
+}
+
+/// Filas fijas del panel de configuración (T1): el contenido de cada una
+/// llega en T2 (Temas), T3 (Mouse) y T4 (Bandas).
+const SETTINGS_ROWS: [&str; 3] = ["Temas", "Mouse", "Bandas"];
+
+/// Estado del panel de configuración (T1: shell sin contenido): selección por
+/// índice sobre `SETTINGS_ROWS`.
+struct SettingsPanelState {
+    /// Índice en `SETTINGS_ROWS`.
+    selected: usize,
 }
 
 /// Guard de terminal: raw mode + alternate screen vía `ratatui::try_init`.
@@ -749,6 +795,7 @@ pub fn run(engine: &mut AudioEngine, start: StartMode) -> io::Result<()> {
         pending_history: None,
         history_path: crate::history::history_path(),
         theme_menu: None,
+        settings_panel: None,
         quit_guard: QuitGuard::default(),
         hit: RefCell::new(HitMap::default()),
         drag: None,
@@ -972,6 +1019,13 @@ fn dispatch_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine) {
         return;
     }
 
+    // Panel de configuración (T1): con el panel abierto las teclas van al
+    // panel (los modales son excluyentes: el primero que está abierto gana).
+    if app.settings_panel.is_some() {
+        handle_settings_panel_key(key, app);
+        return;
+    }
+
     // Con la búsqueda abierta todo lo demás se escribe en el query: ni 'q'
     // sale ni las flechas mueven la selección.
     if app.search.is_some() {
@@ -991,7 +1045,11 @@ fn dispatch_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine) {
 fn handle_player_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine) {
     let keys = &config::config().keys;
     let code = key.code;
-    if config::pressed(&keys.quit, code) {
+    // `settings` va primero: exige Ctrl (`pressed_ctrl`), así que la letra
+    // suelta nunca cae acá y el resto del chain queda intacto (`p` = previa).
+    if config::pressed_ctrl(&keys.settings, key) {
+        open_settings_panel(app);
+    } else if config::pressed(&keys.quit, code) {
         request_quit(app);
     } else if config::pressed(&keys.play_pause, code) {
         toggle_play(app, engine);
@@ -1035,10 +1093,14 @@ fn handle_list_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine) {
     let keys = &config::config().keys;
     let view_len = app.view.len();
     let code = key.code;
+    // `settings` va primero (igual que en el player): exige Ctrl, la letra
+    // suelta nunca cae acá.
+    if config::pressed_ctrl(&keys.settings, key) {
+        open_settings_panel(app);
     // El orden importa: «back» antes que «quit» — Esc cierra el panel (o
     // sale del explorador sin player) aunque Esc también esté en «quit».
     // Tab no está en «back» (T14): cae en «explorer» y no-opea sin player.
-    if config::pressed(&keys.back, code) {
+    } else if config::pressed(&keys.back, code) {
         go_back(app);
     } else if config::pressed(&keys.explorer, code) {
         toggle_explorer(app);
@@ -1324,6 +1386,34 @@ fn handle_theme_menu_key(
             };
             // Restaura el tema con el que se abrió (colores + id).
             config::activate_theme(&menu.original_name, menu.original_theme);
+        }
+        _ => {}
+    }
+}
+
+// --- Panel de configuración (T1: shell) -------------------------------------
+
+fn open_settings_panel(app: &mut App) {
+    app.settings_panel = Some(SettingsPanelState { selected: 0 });
+}
+
+fn handle_settings_panel_key(key: KeyEvent, app: &mut App) {
+    match key.code {
+        KeyCode::Up | KeyCode::Down => {
+            let Some(panel) = app.settings_panel.as_mut() else {
+                return;
+            };
+            // Sin envoltura, como el menú de temas (`move_selection` con clamp).
+            let delta = if matches!(key.code, KeyCode::Up) { -1 } else { 1 };
+            panel.selected = move_selection(panel.selected, delta, SETTINGS_ROWS.len());
+        }
+        // T1: Enter es NO-OP a propósito —el contenido de cada fila llega en
+        // T2/T3/T4—: el panel sigue abierto y el estado queda intacto.
+        KeyCode::Enter => {}
+        // Un solo Esc cierra el panel; como no toca la guarda de salida, el
+        // doble-Esc para salir solo aplica sin modal (igual que con el menú).
+        KeyCode::Esc => {
+            app.settings_panel = None;
         }
         _ => {}
     }
@@ -1784,6 +1874,10 @@ fn render(frame: &mut Frame<'_>, app: &App, engine: &AudioEngine) {
     if let Some(menu) = &app.theme_menu {
         render_theme_menu(frame, menu);
     }
+
+    if let Some(panel) = &app.settings_panel {
+        render_settings_panel(frame, panel);
+    }
 }
 
 fn render_url_prompt(frame: &mut Frame<'_>, input: &str) {
@@ -1834,6 +1928,53 @@ fn render_theme_menu(frame: &mut Frame<'_>, menu: &ThemeMenuState) {
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
     frame.render_widget(Paragraph::new(theme_menu_lines(menu)), inner);
+}
+
+/// Modal centrado del panel (T1), con el mismo estilo del modal de temas:
+/// fondo limpio + borde acentuado con título.
+fn render_settings_panel(frame: &mut Frame<'_>, panel: &SettingsPanelState) {
+    let area = frame.area();
+    let width = 44.min(area.width.saturating_sub(4)).max(24);
+    let height = (SETTINGS_ROWS.len() as u16 + 2)
+        .min(area.height.saturating_sub(2))
+        .max(3);
+
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let rect = Rect::new(x, y, width, height);
+
+    frame.render_widget(Clear, rect);
+
+    let block = Block::bordered()
+        .border_style(Style::default().fg(theme().accent))
+        .title(Span::styled(
+            " Configuración ",
+            Style::default().fg(theme().accent).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    frame.render_widget(Paragraph::new(settings_panel_lines(panel)), inner);
+}
+
+/// Filas del panel (T1: fijas; T2/T3/T4 les dan contenido): la selección va
+/// resaltada como en el menú de temas.
+fn settings_panel_lines(panel: &SettingsPanelState) -> Vec<Line<'static>> {
+    let colors = theme(); // snapshot coherente para todas las filas
+    SETTINGS_ROWS
+        .iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let style = if i == panel.selected {
+                Style::default()
+                    .bg(colors.select_bg)
+                    .fg(colors.accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(colors.text)
+            };
+            Line::from(Span::styled(format!(" {row} "), style))
+        })
+        .collect()
 }
 
 /// Bloque con borde apagado y título acentuado: el patrón de todo el programa.
@@ -3027,6 +3168,13 @@ fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
         )];
     }
 
+    // Panel de configuración (T1: shell): Enter todavía no hace nada —el
+    // contenido de cada fila llega en T2/T3/T4— así que el pie solo ayuda a
+    // mover y cerrar.
+    if app.settings_panel.is_some() {
+        return vec![Line::from(" ↑/↓: mover   Esc: cerrar ")];
+    }
+
     if app.search.is_some() {
         return vec![
             Line::from(" Escribí para filtrar por título, artista, álbum o archivo "),
@@ -3051,11 +3199,12 @@ fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
         // recordatorio de que ↑/↓ son volumen solo con el panel cerrado.
         Mode::Player if app.explorer_open => vec![
             Line::from(format!(
-                " {}/{}: mover   {}: reproducir   {}: buscar   {}/{}: cerrar",
+                " {}/{}: mover   {}: reproducir   {}: buscar   Ctrl+{}: config   {}/{}: cerrar",
                 key_labels(&keys.move_up),
                 key_labels(&keys.move_down),
                 key_labels(&keys.select),
                 key_labels(&keys.search),
+                settings_key_display(),
                 key_labels(&keys.back),
                 key_labels(&keys.explorer),
             )),
@@ -3094,13 +3243,13 @@ fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
                 key_labels(&keys.open_url),
             )),
             Line::from(format!(
-                " {}: shuffle   {}: repeat   {}/{}: vel   {}: temas   {}: biblio   {}×2: salir",
+                " {}: shuffle   {}: repeat   {}/{}: vel   {}: temas   Ctrl+{}: config   {}×2: salir",
                 key_labels(&keys.shuffle),
                 key_labels(&keys.repeat),
                 key_labels(&keys.speed_down),
                 key_labels(&keys.speed_up),
                 key_labels(&keys.theme_menu),
-                key_labels(&keys.explorer),
+                settings_key_display(),
                 key_labels(&keys.quit),
             )),
         ],
@@ -3128,9 +3277,10 @@ fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
                 key_labels(&keys.repeat),
             )),
             Line::from(format!(
-                " {}: URL   {}: temas   {}: volver   {}×2: salir",
+                " {}: URL   {}: temas   Ctrl+{}: config   {}: volver   {}×2: salir",
                 key_labels(&keys.open_url),
                 key_labels(&keys.theme_menu),
+                settings_key_display(),
                 key_labels(&keys.back),
                 key_labels(&keys.quit),
             )),
@@ -3152,14 +3302,18 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App, compact: bool) {
         let mut hit = app.hit.borrow_mut();
         for (index, line) in footer_lines(app, compact).into_iter().enumerate() {
             let text: String = line.spans.iter().map(|span| span.content.as_ref()).collect();
+            let line_width = line.width();
             let (spans, entries) = footer_chip_spans(&text);
             lines.push(Line::from(spans));
             let Ok(index) = u16::try_from(index) else { continue };
             if index >= inner.height {
                 continue;
             }
-            let line_width = text.chars().count() as u16;
-            let x0 = inner.x + inner.width.saturating_sub(line_width) / 2;
+            let Ok(line_width) = u16::try_from(line_width) else { continue };
+            // Mismo centrado que el Paragraph de abajo (ratatui centra con
+            // `(ancho/2) - (línea/2)`, no con `(ancho - línea)/2`: con resto
+            // impar difieren en una columna y el chip quedaba corrido).
+            let x0 = inner.x + (inner.width / 2).saturating_sub(line_width / 2);
             let right = inner.x + inner.width;
             for (start, width, keys) in entries {
                 let Some(code) = key_for_chip(&keys) else { continue };
@@ -3472,6 +3626,7 @@ mod tests {
             pending_history: None,
             history_path: Some(test_temp_history_path()),
             theme_menu: None,
+            settings_panel: None,
             quit_guard: QuitGuard::default(),
             hit: RefCell::new(HitMap::default()),
             drag: None,
@@ -4868,6 +5023,229 @@ mod tests {
             Some(config::active_theme().select_bg),
             "la fila seleccionada va resaltada"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // T1: shell del panel de configuración (Ctrl+P)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn settings_opens_with_ctrl_p_from_player_and_list() {
+        let Some(mut engine) = engine_or_skip() else { return };
+        let ctrl_p = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL);
+
+        let mut app = test_app();
+        app.mode = Mode::Player;
+        handle_player_key(ctrl_p, &mut app, &mut engine);
+        assert!(
+            app.settings_panel.is_some(),
+            "Ctrl+P abre el panel desde el reproductor"
+        );
+        assert_eq!(
+            app.settings_panel.as_ref().expect("abierto").selected,
+            0,
+            "arranca en la primera fila"
+        );
+
+        let mut app = test_app();
+        handle_list_key(ctrl_p, &mut app, &mut engine);
+        assert!(
+            app.settings_panel.is_some(),
+            "Ctrl+P abre el panel desde el explorador"
+        );
+
+        // La letra suelta sigue siendo pista anterior, no abre el panel.
+        let mut app = test_app();
+        app.mode = Mode::Player;
+        handle_player_key(theme_menu_key(KeyCode::Char('p')), &mut app, &mut engine);
+        assert!(app.settings_panel.is_none(), "la 'p' suelta no abre el panel");
+    }
+
+    #[test]
+    fn settings_panel_navigation_clamps_without_wrapping() {
+        let mut app = test_app();
+        open_settings_panel(&mut app);
+        let selected = |app: &App| {
+            app.settings_panel.as_ref().expect("panel abierto").selected
+        };
+
+        // Como el menú de temas (move_selection con clamp): no envuelve.
+        handle_settings_panel_key(theme_menu_key(KeyCode::Up), &mut app);
+        assert_eq!(selected(&app), 0, "↑ en la primera fila no se mueve");
+        handle_settings_panel_key(theme_menu_key(KeyCode::Down), &mut app);
+        handle_settings_panel_key(theme_menu_key(KeyCode::Down), &mut app);
+        handle_settings_panel_key(theme_menu_key(KeyCode::Down), &mut app);
+        assert_eq!(selected(&app), 2, "↓ frena en la última fila sin envolver");
+        handle_settings_panel_key(theme_menu_key(KeyCode::Up), &mut app);
+        assert_eq!(selected(&app), 1, "↑ vuelve una fila");
+    }
+
+    #[test]
+    fn settings_enter_is_noop_that_keeps_state() {
+        // Candado de alcance T1: Enter no cierra el panel ni rompe el estado
+        // (el contenido de cada fila llega en T2/T3/T4).
+        let mut app = test_app();
+        open_settings_panel(&mut app);
+        app.settings_panel.as_mut().expect("abierto").selected = 1;
+        handle_settings_panel_key(theme_menu_key(KeyCode::Enter), &mut app);
+        let panel = app.settings_panel.as_ref().expect("Enter no cierra el panel");
+        assert_eq!(panel.selected, 1, "Enter no mueve ni resetea la selección");
+    }
+
+    #[test]
+    fn settings_esc_closes_panel_without_arming_quit() {
+        let Some(mut engine) = engine_or_skip() else { return };
+        let mut app = test_app();
+        app.mode = Mode::Player;
+        open_settings_panel(&mut app);
+
+        handle_key(theme_menu_key(KeyCode::Esc), &mut app, &mut engine);
+        assert!(app.settings_panel.is_none(), "un solo Esc cierra el panel");
+        assert!(!app.quit_guard.is_armed(Instant::now()), "y no arma la salida");
+        assert!(!app.should_quit);
+
+        // El doble-Esc de salida solo aplica sin modal: hacen falta dos más.
+        handle_key(theme_menu_key(KeyCode::Esc), &mut app, &mut engine);
+        assert!(!app.should_quit, "tras cerrar, un Esc solo arma");
+        handle_key(theme_menu_key(KeyCode::Esc), &mut app, &mut engine);
+        assert!(app.should_quit, "el segundo Esc sin modal sale");
+    }
+
+    #[test]
+    fn settings_panel_lists_the_three_fixed_rows_with_highlight() {
+        assert_eq!(SETTINGS_ROWS, ["Temas", "Mouse", "Bandas"], "filas fijas de T1");
+        let panel = SettingsPanelState { selected: 1 };
+        let lines = settings_panel_lines(&panel);
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        assert_eq!(texts.len(), 3, "una fila por sección: {texts:?}");
+        for row in SETTINGS_ROWS {
+            assert!(
+                texts.iter().any(|t| t.contains(row)),
+                "falta la fila {row}: {texts:?}"
+            );
+        }
+        assert_eq!(
+            lines[1].spans[0].style.bg,
+            Some(theme().select_bg),
+            "la fila seleccionada va resaltada"
+        );
+        assert_ne!(
+            lines[0].spans[0].style.bg,
+            Some(theme().select_bg),
+            "las demás filas no van resaltadas"
+        );
+    }
+
+    #[test]
+    fn settings_panel_renders_inside_tiny_terminals() {
+        let panel = SettingsPanelState { selected: 0 };
+        for (w, h) in [(10, 2), (23, 10), (40, 2), (1, 1), (0, 0)] {
+            let backend = ratatui::backend::TestBackend::new(w, h);
+            let mut terminal = ratatui::Terminal::new(backend).expect("terminal de prueba");
+            terminal
+                .draw(|frame| render_settings_panel(frame, &panel))
+                .unwrap_or_else(|e| panic!("{w}x{h}: {e}"));
+        }
+    }
+
+    #[test]
+    fn footer_shows_settings_chip_in_player_and_browser() {
+        let mut app = test_app();
+        // Reproductor y explorador (panel + pantalla completa): chip + `t` intacto.
+        for (mode, open) in [
+            (Mode::Player, false),
+            (Mode::Player, true),
+            (Mode::Browser, false),
+        ] {
+            app.mode = mode;
+            app.explorer_open = open;
+            let joined: String = footer_lines(&app, false)
+                .iter()
+                .map(line_text)
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(
+                joined.contains("Ctrl+P: config"),
+                "falta el chip en {mode:?}/{open}: {joined}"
+            );
+            assert!(joined.contains("t: temas"), "`t` sigue en T1: {joined}");
+            for line in footer_lines(&app, false) {
+                assert!(
+                    line_width(&line) <= 78,
+                    "línea del pie demasiado ancha ({}): {}",
+                    line_width(&line),
+                    line_text(&line)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mouse_is_inert_under_settings_panel() {
+        let Some(mut engine) = engine_or_skip() else { return };
+        let mut app = test_app();
+        app.mode = Mode::Player;
+        app.has_player = true;
+        *app.hit.borrow_mut() = sample_hit();
+        open_settings_panel(&mut app);
+        handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 30, 5),
+            &mut app,
+            &mut engine,
+        );
+        assert_eq!(engine.volume(), 0.0, "el clic no atraviesa el panel");
+        assert_eq!(app.drag, None);
+    }
+
+    #[test]
+    fn settings_chip_click_opens_the_panel() {
+        let Some(mut engine) = engine_or_skip() else { return };
+        assert_eq!(
+            key_for_chip("Ctrl+P"),
+            Some(KeyCode::Char('p')),
+            "el chip resuelve a la tecla de settings"
+        );
+        let mut app = library_with_three();
+        app.mode = Mode::Player;
+        app.has_player = true;
+        let buffer = render_player_frame(&app, &engine);
+        let chip = app
+            .hit
+            .borrow()
+            .chips
+            .iter()
+            .find(|(_, key)| *key == KeyCode::Char('p'))
+            .map(|(rect, _)| *rect)
+            .expect("chip «Ctrl+P: config» registrado");
+        let row: String = (chip.x..chip.x + chip.width)
+            .map(|x| buffer[(x, chip.y)].symbol().to_string())
+            .collect();
+        assert!(row.starts_with("Ctrl+P"), "el área es la del chip dibujado: {row:?}");
+        handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), chip.x, chip.y),
+            &mut app,
+            &mut engine,
+        );
+        assert!(app.settings_panel.is_some(), "clickear el chip abre el panel");
+    }
+
+    #[test]
+    fn handle_key_routes_to_settings_panel_when_open() {
+        let Some(mut engine) = engine_or_skip() else { return };
+        let mut app = library_with_three();
+        app.mode = Mode::Player;
+        app.has_player = true;
+        app.explorer_open = true;
+        open_settings_panel(&mut app);
+
+        handle_key(theme_menu_key(KeyCode::Down), &mut app, &mut engine);
+
+        assert_eq!(
+            app.settings_panel.as_ref().expect("sigue abierto").selected,
+            1,
+            "con el panel abierto las teclas van al panel, no a la lista"
+        );
+        assert!(app.search.is_none());
     }
 
     #[test]

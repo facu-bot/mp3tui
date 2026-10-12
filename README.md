@@ -52,6 +52,7 @@ Windows.
 | `[` / `]` | Velocidad 0.50x – 2.00x (pasos de 0.25x) |
 | `u` | Abrir diálogo para reproducir URL o archivo |
 | `t` | Abrir el selector de temas (↑/↓ previsualiza, Enter guarda, Esc cancela) |
+| `Ctrl+P` | Abrir el panel de configuración (Temas/Mouse/Bandas) |
 | `Tab` / `Ctrl+Tab` | Abrir o cerrar el panel del explorador |
 | `b` | Abrir el panel del explorador con la búsqueda |
 | `Esc` `Esc` | Salir: el primer `Esc` muestra «Apretá Esc de nuevo para salir» y el segundo, dentro de 2 segundos, cierra la app (otra tecla lo cancela) |
@@ -90,6 +91,7 @@ audio (arranque sin archivo) el explorador sigue ocupando toda la pantalla.
 | `s` | Aleatorio |
 | `r` | Modo repetir |
 | `t` | Selector de temas |
+| `Ctrl+P` | Abrir el panel de configuración |
 | `b` | Búsqueda incremental (vive en el panel) |
 | `Esc` / `Tab` / `Ctrl+Tab` | Cerrar el panel (el reproductor de fondo queda solo) |
 | `Esc` `Esc` | Salir (con el panel cerrado; el primer `Esc` con el panel abierto lo cierra) |
@@ -137,8 +139,8 @@ Con el mouse activado (por defecto):
 - **Rueda** sobre el reproductor: sube o baja el volumen.
 - **Footer de atajos:** cada atajo es un chip (la tecla resaltada y su acción);
   clickearlo hace lo mismo que apretar esa tecla.
-- Con el prompt de URL o el menú de temas abiertos, el mouse no actúa sobre lo
-  que queda debajo.
+- Con el prompt de URL, el menú de temas o el panel de configuración
+  abiertos, el mouse no actúa sobre lo que queda debajo.
 
 La captura del mouse reemplaza la selección de texto nativa de la terminal (en
 Windows Terminal se sigue pudiendo seleccionar con `Shift` + arrastre). Para
@@ -195,7 +197,9 @@ seek_back = "left"
 #   quit, play_pause, volume_up, volume_down, seek_back, seek_fwd,
 #   prev_track, next_track, shuffle, repeat, search, speed_up,
 #   speed_down, explorer, open_url, move_up, move_down, page_up, page_down,
-#   home, end, select, back, theme_menu
+#   home, end, select, back, theme_menu, settings
+# `settings` se dispara con Ctrl+tecla (por defecto Ctrl+P): la letra suelta
+# sigue siendo de su acción (`p` = pista anterior).
 # Nombres de tecla: space, enter, esc, tab, up, down, left, right,
 #   pageup, pagedown, home, end, backspace, delete, insert, backtab,
 #   comma, minus, plus (o un carácter simple como "q" o "/")
@@ -231,6 +235,9 @@ Notas del comportamiento de la config:
 - Si dos acciones distintas quedan mapeadas a la misma tecla, gana la de
   mayor prioridad en el dispatch y se genera un warning que lo explicita
   (la perdedora vuelve a sus defaults libres).
+- `settings` (el panel, `Ctrl+P`) participa del mismo sistema de colisiones,
+  pero exige Ctrl: con los defaults comparte la letra con `prev_track` (`p`)
+  sin generar ningún aviso, porque nunca compiten por la misma combinación.
 - La config se lee una sola vez al arrancar: no hay recarga en caliente.
 
 ## Reproducción desde URLs HTTP y YouTube
