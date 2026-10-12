@@ -79,6 +79,13 @@ const STALL_ERROR_MESSAGE: &str = "el servidor dejó de enviar datos";
 /// hace en lotes para no recorrer el buffer entero en cada lectura.
 const SEQUENTIAL_PRUNE_BATCH: usize = 512 * 1024; // 512 KiB
 
+/// Plazo máximo con el que el productor vuelve a evaluar su espera de espacio.
+/// `CancelHandle::cancel` avisa sin tomar el lock del estado, así que un aviso
+/// que llegue en la ventana entre el chequeo del predicado y el `wait` se
+/// perdería; un plazo acotado hace inofensiva esa ventana. Solo corre mientras
+/// el buffer está lleno y el lector atrasado, así que no cuesta en régimen.
+const PRODUCER_WAIT_PEEK: Duration = Duration::from_millis(250);
+
 struct BufferState {
     data: Vec<u8>,
     /// Offset absoluto del primer byte conservado en `data` (lo anterior ya se podó).
@@ -201,10 +208,11 @@ impl StreamProducer {
             if state.unconsumed_len() < SEQUENTIAL_READ_AHEAD_CAP as u64 {
                 break;
             }
-            // Se espera sin retener el `Mutex` (patrón del `Condvar`), y se
-            // vuelve a evaluar el predicado al despertar.
-            state = match self.shared.condvar.wait(state) {
-                Ok(g) => g,
+            // Se espera sin retener el `Mutex` (patrón del `Condvar`), con un
+            // tope para no perder un aviso de cancelación que haya llegado entre
+            // el chequeo y la espera, y se vuelve a evaluar el predicado.
+            state = match self.shared.condvar.wait_timeout(state, PRODUCER_WAIT_PEEK) {
+                Ok((g, _)) => g,
                 Err(_) => return,
             };
         }
@@ -1592,15 +1600,21 @@ mod tests {
         }
     }
 
-    /// El productor puede quedar esperando espacio cuando el lector se detiene:
-    /// esa espera tiene que salir también al cancelar. Si no, el hilo de red
-    /// quedaría tomado para siempre y el socket abierto.
+    /// El productor puede quedar frenado en el tope cuando el lector se detiene:
+    /// esa espera tiene que salir al cancelar. Si no, el hilo de red quedaría
+    /// tomado y el socket abierto.
+    ///
+    /// El cuerpo declarado es enorme a propósito: así el hecho de que el
+    /// servidor deje de poder escribir distingue «frenado por el tope» de
+    /// «terminó de mandar».
     #[test]
     fn test_sequential_producer_waiting_for_space_releases_on_cancel() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
 
-        let total: usize = 64 * 1024 * 1024;
+        let total: usize = 1024 * 1024 * 1024; // 1 GiB: no se completa en el test
+        let written = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let written_server = Arc::clone(&written);
         let saw_cut = Arc::new(AtomicBool::new(false));
         let saw_cut_server = Arc::clone(&saw_cut);
 
@@ -1618,12 +1632,12 @@ mod tests {
             let block = [0x5au8; 32 * 1024];
             let mut sent = 0usize;
             while sent < total {
-                let n = (total - sent).min(block.len());
-                if socket.write_all(&block[..n]).is_err() {
+                if socket.write_all(&block).is_err() {
                     saw_cut_server.store(true, Ordering::SeqCst);
                     return;
                 }
-                sent += n;
+                sent += block.len();
+                written_server.store(sent, Ordering::SeqCst);
             }
         });
 
@@ -1631,16 +1645,23 @@ mod tests {
         let (mut stream, _) = open(&url).expect("open stream");
         let cancel = stream.cancel_handle();
 
-        // Lee un poco: al productor le alcanza para llenar el tope y quedar
-        // esperando espacio (100 ms es mucho menos que los 64 MiB que tardaría
-        // el servidor en terminar de escribir).
+        // Un poco de lectura: al productor le alcanza para llenar el tope y
+        // quedar esperando espacio.
         let mut buf = [0u8; 64 * 1024];
         stream.read_exact(&mut buf).unwrap();
-        thread::sleep(Duration::from_millis(100));
-        cancel.cancel();
+        thread::sleep(Duration::from_millis(300));
 
-        // Cancelar tiene que despertar al productor y cerrar el socket: el
-        // corte de la conexión tiene que llegar en un plazo acotado.
+        // Tiene que estar frenado de verdad: el servidor no puede seguir.
+        let first = written.load(Ordering::SeqCst);
+        thread::sleep(Duration::from_millis(300));
+        let second = written.load(Ordering::SeqCst);
+        assert!(
+            second - first < 2 * 1024 * 1024,
+            "el productor no se frenó en el tope: pasó de {first} a {second} bytes"
+        );
+
+        // Cancelar tiene que despertarlo y cerrar el socket.
+        cancel.cancel();
         for _ in 0..40 {
             if saw_cut.load(Ordering::SeqCst) {
                 return;
