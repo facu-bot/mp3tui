@@ -52,6 +52,12 @@ pub struct SpectrumAnalyzer {
     staging: Vec<f32>,
     pending: usize,
     bands: [f32; NUM_BANDS],
+    /// Nivel VU mono para el modo `vu` (T4 modos-visualizador): RMS suavizado
+    /// de la señal del tap actual; ver `update_vu`.
+    vu: f32,
+    /// Pico del medidor VU (T4): máximo visto del nivel, con el mismo decay
+    /// `PEAK_FALL` del modo `caida`.
+    vu_peak: f32,
     /// Peak-hold por banda para el modo `caida` (T3 modos-visualizador):
     /// marca del máximo visto; sube con la banda y baja con `PEAK_FALL`.
     peaks: [f32; NUM_BANDS],
@@ -83,6 +89,8 @@ impl SpectrumAnalyzer {
             staging: vec![0.0; TAP_READ_MAX],
             pending: 0,
             bands: [0.0; NUM_BANDS],
+            vu: 0.0,
+            vu_peak: 0.0,
             peaks: [0.0; NUM_BANDS],
             band_ranges: Self::compute_ranges(44_100),
             sample_rate: 0,
@@ -124,6 +132,7 @@ impl SpectrumAnalyzer {
                 *band *= 1.0 - DECAY;
             }
             self.update_peaks();
+            self.update_vu(None);
             return;
         }
 
@@ -161,6 +170,8 @@ impl SpectrumAnalyzer {
             };
         }
         self.update_peaks();
+        let rms = self.rms_level();
+        self.update_vu(Some(rms));
     }
 
     /// Atajo: ingest + analyze. El loop de la TUI usa ingest/analyze por
@@ -181,6 +192,17 @@ impl SpectrumAnalyzer {
         &self.peaks
     }
 
+    /// Nivel del medidor VU (modo `vu` de T4): RMS suavizado en 0.0..=1.0.
+    pub fn vu(&self) -> f32 {
+        self.vu
+    }
+
+    /// Pico del medidor VU (modo `vu` de T4): máximo visto del nivel, en
+    /// 0.0..=1.0. Siempre >= el nivel actual.
+    pub fn vu_peak(&self) -> f32 {
+        self.vu_peak
+    }
+
     /// Peak-hold del modo `caida` (T3): el pico sube con la banda en el acto
     /// y baja linealmente con `PEAK_FALL`, sin quedar nunca debajo de ella.
     /// Vive en el analizador (acoplamiento mínimo: se actualiza donde se
@@ -194,6 +216,46 @@ impl SpectrumAnalyzer {
             } else {
                 self.peaks[index] = (self.peaks[index] - PEAK_FALL).max(band);
             }
+        }
+    }
+
+    /// RMS del ring mono actual (0.0..=1.0 con clamp del llamador): raíz de la
+    /// media cuadrática de las muestras acumuladas; sin historia devuelve 0.
+    fn rms_level(&self) -> f32 {
+        let take = self.filled.min(FFT_SIZE);
+        if take == 0 {
+            return 0.0;
+        }
+        let sum: f32 = self.ring[..take].iter().map(|sample| sample * sample).sum();
+        (sum / take as f32).sqrt()
+    }
+
+    /// Nivel VU mono del modo `vu` (T4 modos-visualizador): sigue al RMS con
+    /// el mismo suavizado attack/decay de las bandas (sin jitter) y el pico
+    /// sube en el acto y baja con `PEAK_FALL` (reusado de T3, sin duplicar),
+    /// sin quedar nunca debajo del nivel.
+    ///
+    /// Decisión mono documentada (nota T1/T4): el tap ya promedia a mono en
+    /// el callback (`tap.push_slice(&mono)` en `src/audio/mod.rs`, que suma
+    /// los canales y divide); un VU estéreo L/R exigiría llevar los canales
+    /// por separado por ese hot path, fuera del margen de T4 (sin refactors
+    /// del motor). El render solo lee con `vu()`/`vu_peak()`.
+    fn update_vu(&mut self, target: Option<f32>) {
+        match target {
+            Some(rms) => {
+                let rms = rms.clamp(0.0, 1.0);
+                self.vu += (rms - self.vu) * if rms > self.vu { ATTACK } else { DECAY };
+            }
+            None => {
+                // Sin muestras nuevas el RMS del ring sería rancio: el nivel
+                // decae como las bandas.
+                self.vu *= 1.0 - DECAY;
+            }
+        }
+        if self.vu >= self.vu_peak {
+            self.vu_peak = self.vu;
+        } else {
+            self.vu_peak = (self.vu_peak - PEAK_FALL).max(self.vu);
         }
     }
 
@@ -304,6 +366,77 @@ mod tests {
         let fresh = SpectrumAnalyzer::new();
         assert!(fresh.waveform(80).is_empty());
         assert!(analyzer.waveform(0).is_empty());
+    }
+
+    // T4 (modos-visualizador): medidor VU MONO con RMS de la señal.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn vu_starts_silent() {
+        let analyzer = SpectrumAnalyzer::new();
+        assert_eq!(analyzer.vu(), 0.0, "sin señal el medidor arranca en cero");
+        assert_eq!(analyzer.vu_peak(), 0.0, "sin señal no hay pico");
+    }
+
+    #[test]
+    fn vu_is_a_single_mono_level_from_current_tap() {
+        // Decisión estéreo-vs-mono con test en mano (nota T1/T4): el tap ya
+        // promedia a MONO en el callback (`tap.push_slice(&mono)` en
+        // `src/audio/mod.rs`); sacar L/R exigiría tocar ese hot path, fuera
+        // del margen de T4. El VU expone UN solo (nivel, pico) desde el ring
+        // mono actual, sin canales por separado.
+        let mut analyzer = SpectrumAnalyzer::new();
+        analyzer.sample_rate = 44_100;
+        analyzer.band_ranges = SpectrumAnalyzer::compute_ranges(44_100);
+        for i in 0..FFT_SIZE {
+            let t = i as f32 / 44_100.0;
+            analyzer.ring[i] = (std::f32::consts::TAU * 440.0 * t).sin();
+        }
+        analyzer.filled = FFT_SIZE;
+        for _ in 0..8 {
+            analyzer.pending = 1;
+            analyzer.analyze();
+        }
+        // Seno a escala completa: RMS = 1/√2 ≈ 0.707 (sin ganancia extra: el
+        // VU mide honesto, sin el GAIN de las barras).
+        assert!(
+            (analyzer.vu() - 0.707).abs() < 0.05,
+            "el nivel converge al RMS del mono, obtenido {}",
+            analyzer.vu()
+        );
+        assert!(
+            analyzer.vu_peak() >= analyzer.vu(),
+            "el pico nunca baja del nivel"
+        );
+    }
+
+    #[test]
+    fn vu_decays_without_samples_and_peak_falls_with_peak_fall() {
+        let mut analyzer = SpectrumAnalyzer::new();
+        analyzer.vu = 0.8;
+        analyzer.vu_peak = 0.8;
+        analyzer.analyze();
+        assert!(
+            analyzer.vu() > 0.0 && analyzer.vu() < 0.8,
+            "sin muestras el nivel decae como las bandas, obtenido {}",
+            analyzer.vu()
+        );
+        assert!(
+            analyzer.vu_peak() >= analyzer.vu(),
+            "el pico nunca baja del nivel"
+        );
+        // El pico baja linealmente con el mismo PEAK_FALL del modo `caida`
+        // (~800 ms de techo a cero a 60 fps).
+        analyzer.vu = 0.0;
+        analyzer.vu_peak = 1.0;
+        for _ in 0..48 {
+            analyzer.analyze();
+        }
+        assert!(
+            analyzer.vu_peak() < 1e-5,
+            "48 frames: el pico llegó a cero, obtenido {}",
+            analyzer.vu_peak()
+        );
     }
 
     #[test]

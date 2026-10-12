@@ -3368,31 +3368,41 @@ fn render_visualizer(frame: &mut Frame<'_>, area: Rect, analyzer: &SpectrumAnaly
             &theme(),
             ascii,
         ),
+        VisualizerPaint::Vu => paint_vu(
+            frame.buffer_mut(),
+            inner,
+            analyzer.vu(),
+            analyzer.vu_peak(),
+            &theme(),
+            ascii,
+        ),
     }
 }
 
-/// Destino del dispatch de render por modo (T3 modos-visualizador): barras,
-/// osciloscopio, espejo o caída; T4–T5 agregan variantes sin tocar este fallback.
+/// Destino del dispatch de render por modo (T4 modos-visualizador): barras,
+/// osciloscopio, espejo, caída o VU; T5 agrega circular sin tocar este fallback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VisualizerPaint {
     Bars,
     Wave,
     Mirror,
     Fall,
+    Vu,
 }
 
 /// Dispatch puro del modo al pintor: `onda` va al osciloscopio, `espejo` a su
-/// pintor simétrico y `caida` al de peak-hold; `vu`/`circular` siguen en
-/// barras (fallback explícito y temporal hasta T4–T5, testeado en
-/// `visualizer_paint_routes_mirror_and_fall_to_their_painters`).
+/// pintor simétrico, `caida` al de peak-hold y `vu` a su medidor con RMS;
+/// solo `circular` sigue en barras (fallback explícito y temporal hasta T5,
+/// testeado en `visualizer_paint_routes_vu_to_its_painter_and_circular_to_bars`).
 fn resolve_visualizer_paint(mode: config::VisualizerMode) -> VisualizerPaint {
     match mode {
         config::VisualizerMode::Onda => VisualizerPaint::Wave,
         config::VisualizerMode::Espejo => VisualizerPaint::Mirror,
         config::VisualizerMode::Caida => VisualizerPaint::Fall,
-        config::VisualizerMode::Barras
-        | config::VisualizerMode::Vu
-        | config::VisualizerMode::Circular => VisualizerPaint::Bars,
+        config::VisualizerMode::Vu => VisualizerPaint::Vu,
+        config::VisualizerMode::Barras | config::VisualizerMode::Circular => {
+            VisualizerPaint::Bars
+        }
     }
 }
 
@@ -3494,6 +3504,117 @@ fn paint_mirror(
                         cell.set_symbol(symbol).set_fg(color);
                     }
                 }
+            }
+        }
+    }
+}
+
+/// T4 (modos-visualizador): medidor VU MONO horizontal con el RMS del tap
+/// actual (ver `SpectrumAnalyzer::vu`: un solo nivel, decisión documentada
+/// ahí — el estéreo exigiría tocar el hot path del callback de audio).
+///
+/// Decisiones (testeadas en los tests `paint_vu_*`):
+/// - Barra llena de izquierda a derecha con el gradiente del tema por columna
+///   (`spectrum_color`, como las barras: `spectrum_low` a la izquierda,
+///   `spectrum_high` a la derecha) y celda parcial con los mismos glifos de
+///   las barras (`band_full_glyph`/`band_frac_glyph`: `@`/rampa en ascii con
+///   fondo de puntos `.`, `█`/octavos en unicode — sin lógica duplicada).
+/// - Marca de pico con el decay `PEAK_FALL` del analizador (reusado de T3, el
+///   render solo lee `peak`): tick vertical en `spectrum_high` sobre las filas
+///   de barra (`█`, `▇` si cae a mitad de columna, `@` en ascii — igual que el
+///   modo `caida`); tapa la barra donde coincide para que siempre se vea.
+/// - Eje/escala tenue en `dim` en la última fila (`-` con tics `|` en ascii,
+///   `─` con tics `┼` en unicode, en 0/25/50/75/100%).
+/// - Panel muy bajo (1–2 filas): una sola fila de barra arriba, sin pico ni
+///   escala (degrada graceful sin pánico); niveles fuera de rango con clamp.
+fn paint_vu(
+    buffer: &mut ratatui::buffer::Buffer,
+    inner: Rect,
+    level: f32,
+    peak: f32,
+    theme: &Theme,
+    ascii: bool,
+) {
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let width = inner.width;
+    // Fondo (igual que las barras: puntos tenues en ascii, vacío en unicode).
+    for y in inner.y..inner.y + inner.height {
+        for x in inner.x..inner.x + width {
+            if let Some(cell) = buffer.cell_mut((x, y)) {
+                if ascii {
+                    cell.set_symbol(".").set_fg(theme.dim);
+                } else {
+                    cell.set_symbol(" ").set_fg(Color::Reset);
+                }
+            }
+        }
+    }
+    let level = level.clamp(0.0, 1.0);
+    let peak = peak.clamp(0.0, 1.0);
+    let bar_rows: u16 = if inner.height <= 2 { 1 } else { inner.height - 1 };
+    let denom = f32::from(width.saturating_sub(1).max(1));
+    // Barra: celdas llenas + parcial (mismos niveles y glifos que paint_bands).
+    let fill_f = level * f32::from(width);
+    let full = (fill_f.floor() as u16).min(width);
+    let frac = fill_f - fill_f.floor();
+    for row in 0..bar_rows {
+        let y = inner.y + row;
+        for dx in 0..full {
+            let t = f32::from(dx) / denom;
+            let (red, green, blue) = spectrum_color(t, theme);
+            if let Some(cell) = buffer.cell_mut((inner.x + dx, y)) {
+                cell.set_symbol(band_full_glyph(ascii))
+                    .set_fg(Color::Rgb(red, green, blue));
+            }
+        }
+        if frac > 0.0 && full < width {
+            let t = f32::from(full) / denom;
+            let (red, green, blue) = spectrum_color(t, theme);
+            if let Some(cell) = buffer.cell_mut((inner.x + full, y)) {
+                cell.set_symbol(band_frac_glyph(frac, ascii))
+                    .set_fg(Color::Rgb(red, green, blue));
+            }
+        }
+    }
+    // Marca de pico: solo con altura para escala (en 1–2 filas no hay pico).
+    if inner.height >= 3 && peak > 0.0 {
+        let peak_f = peak * f32::from(width);
+        let peak_full = peak_f.floor() as u16;
+        let peak_frac = peak_f - peak_f.floor();
+        // Columna del borde (igual que el modo `caida` en vertical: borde
+        // exacto = primera celda vacía, con clip al ancho; si cae a mitad de
+        // columna, la celda que lo contiene).
+        let col = peak_full.min(width.saturating_sub(1));
+        let symbol = if peak_frac <= 0.0 {
+            band_full_glyph(ascii)
+        } else if ascii {
+            "@"
+        } else {
+            "▇"
+        };
+        for row in 0..bar_rows {
+            if let Some(cell) = buffer.cell_mut((inner.x + col, inner.y + row)) {
+                cell.set_symbol(symbol).set_fg(theme.spectrum_high);
+            }
+        }
+    }
+    // Escala tenue en la última fila (solo con altura para barra + escala).
+    if inner.height >= 3 {
+        let y = inner.y + inner.height - 1;
+        let quarters = [
+            0u16,
+            width / 4,
+            width / 2,
+            width * 3 / 4,
+            width.saturating_sub(1),
+        ];
+        let (tick, line) = if ascii { ("|", "-") } else { ("┼", "─") };
+        for dx in 0..width {
+            let symbol = if quarters.contains(&dx) { tick } else { line };
+            if let Some(cell) = buffer.cell_mut((inner.x + dx, y)) {
+                cell.set_symbol(symbol).set_fg(theme.dim);
             }
         }
     }
@@ -4615,6 +4736,177 @@ mod tests {
                 "1 fila: pico y barra colapsan sin pánico"
             );
         }
+    }
+
+    // T4 (modos-visualizador): VU mono horizontal con RMS.
+    // Área 32x5 → barra en filas 0–3, escala tenue en fila 4.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn paint_vu_full_level_fills_bar_with_gradient_and_peak_mark() {
+        let theme = Theme::default();
+        let area = Rect::new(0, 0, 32, 5);
+        let mut buffer = Buffer::empty(area);
+        paint_vu(&mut buffer, area, 1.0, 1.0, &theme, false);
+        // Barra llena de izquierda a derecha en todas las filas de barra.
+        for y in 0..4u16 {
+            assert_eq!(buffer[(0u16, y)].symbol(), "█", "llena (y={y})");
+            assert_eq!(buffer[(31u16, y)].symbol(), "█", "hasta el borde (y={y})");
+        }
+        // Gradiente del tema de izquierda (low) a derecha (high).
+        let low = spectrum_color(0.0, &theme);
+        let high = spectrum_color(1.0, &theme);
+        assert_eq!(
+            buffer[(0u16, 0u16)].fg,
+            Color::Rgb(low.0, low.1, low.2),
+            "izquierda = spectrum_low"
+        );
+        assert_eq!(
+            buffer[(31u16, 0u16)].fg,
+            Color::Rgb(high.0, high.1, high.2),
+            "derecha = spectrum_high"
+        );
+        // Pico al tope: marca en spectrum_high que tapa la barra.
+        assert_eq!(buffer[(31u16, 1u16)].fg, theme.spectrum_high);
+        // Escala tenue en la última fila.
+        assert_eq!(buffer[(0u16, 4u16)].fg, theme.dim, "escala en dim");
+        assert_eq!(buffer[(5u16, 4u16)].fg, theme.dim, "escala en dim");
+    }
+
+    #[test]
+    fn paint_vu_partial_level_uses_frac_glyph_and_dot_background() {
+        let theme = Theme::default();
+        let area = Rect::new(0, 0, 32, 5);
+        // 0.3 * 32 = 9.6 → 9 llenas + parcial 0.6.
+        let mut buffer = Buffer::empty(area);
+        paint_vu(&mut buffer, area, 0.3, 0.0, &theme, false);
+        assert_eq!(buffer[(8u16, 0u16)].symbol(), "█", "llenas a la izquierda");
+        assert_eq!(
+            buffer[(9u16, 0u16)].symbol(),
+            "▅",
+            "parcial 0.6 = EIGHTH_BLOCKS[4], como paint_bands"
+        );
+        assert_eq!(buffer[(10u16, 0u16)].symbol(), " ", "vacío en unicode");
+        // Sin pico no hay marca en spectrum_high.
+        for x in 0..32u16 {
+            assert_ne!(
+                buffer[(x, 0u16)].fg,
+                theme.spectrum_high,
+                "sin pico no hay marca (x={x})"
+            );
+        }
+        // ASCII: misma rampa que las barras + fondo de puntos.
+        let mut buffer = Buffer::empty(area);
+        paint_vu(&mut buffer, area, 0.3, 0.0, &theme, true);
+        assert_eq!(buffer[(8u16, 0u16)].symbol(), "@", "llena ascii = @");
+        assert_eq!(
+            buffer[(9u16, 0u16)].symbol(),
+            "+",
+            "parcial 0.6 = ASCII_RAMP[6], como paint_bands"
+        );
+        let empty = &buffer[(20u16, 0u16)];
+        assert_eq!(empty.symbol(), ".", "fondo de puntos en ascii");
+        assert_eq!(empty.fg, theme.dim);
+        let scale = &buffer[(0u16, 4u16)];
+        assert_eq!(scale.symbol(), "|", "tics de escala ascii");
+        assert_eq!(scale.fg, theme.dim);
+    }
+
+    #[test]
+    fn paint_vu_peak_marks_above_bar_in_spectrum_high() {
+        let theme = Theme::default();
+        let area = Rect::new(0, 0, 32, 5);
+        let mut buffer = Buffer::empty(area);
+        // Nivel 0.25 (8 cols) con pico en 0.5 (col 16): la marca flota sobre
+        // el vacío, en todas las filas de barra.
+        paint_vu(&mut buffer, area, 0.25, 0.5, &theme, false);
+        for y in 0..4u16 {
+            let marker = &buffer[(16u16, y)];
+            assert_eq!(marker.symbol(), "█", "marca del pico (y={y})");
+            assert_eq!(marker.fg, theme.spectrum_high, "el pico va en spectrum_high");
+        }
+        assert_eq!(
+            buffer[(7u16, 0u16)].symbol(),
+            "█",
+            "la barra sigue normal a la izquierda"
+        );
+        assert_eq!(
+            buffer[(20u16, 0u16)].symbol(),
+            " ",
+            "a la derecha del pico no hay nada"
+        );
+    }
+
+    #[test]
+    fn paint_vu_silence_shows_scale_only() {
+        let theme = Theme::default();
+        let area = Rect::new(0, 0, 32, 5);
+        let mut buffer = Buffer::empty(area);
+        paint_vu(&mut buffer, area, 0.0, 0.0, &theme, false);
+        for y in 0..4u16 {
+            for x in 0..32u16 {
+                assert_eq!(
+                    buffer[(x, y)].symbol(),
+                    " ",
+                    "silencio: barra vacía ({x},{y})"
+                );
+            }
+        }
+        assert_eq!(buffer[(0u16, 4u16)].symbol(), "┼", "tics unicode");
+        assert_eq!(buffer[(1u16, 4u16)].symbol(), "─", "línea de escala unicode");
+        assert_eq!(buffer[(1u16, 4u16)].fg, theme.dim);
+    }
+
+    #[test]
+    fn paint_vu_clamps_out_of_range_without_panic() {
+        let theme = Theme::default();
+        let area = Rect::new(0, 0, 8, 4);
+        let mut buffer = Buffer::empty(area);
+        paint_vu(&mut buffer, area, 1.5, 2.0, &theme, false);
+        for y in 0..3u16 {
+            assert_eq!(buffer[(7u16, y)].symbol(), "█", "clip al ancho (y={y})");
+        }
+        let mut buffer = Buffer::empty(area);
+        paint_vu(&mut buffer, area, -0.5, -1.0, &theme, true);
+        for y in 0..3u16 {
+            for x in 0..8u16 {
+                assert_eq!(
+                    buffer[(x, y)].symbol(),
+                    ".",
+                    "negativo = vacío ({x},{y})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn paint_vu_tiny_heights_degrade_without_panic() {
+        let theme = Theme::default();
+        // 1 fila: una sola fila de barra, sin pico ni escala.
+        let area = Rect::new(0, 0, 16, 1);
+        let mut buffer = Buffer::empty(area);
+        paint_vu(&mut buffer, area, 0.5, 1.0, &theme, false);
+        for x in 0..8u16 {
+            assert_eq!(buffer[(x, 0u16)].symbol(), "█", "media barra (x={x})");
+        }
+        for x in 8..16u16 {
+            assert_ne!(
+                buffer[(x, 0u16)].fg,
+                theme.spectrum_high,
+                "sin marca de pico en 1 fila (x={x})"
+            );
+        }
+        // 2 filas: igual, sin pánico.
+        let area = Rect::new(0, 0, 16, 2);
+        let mut buffer = Buffer::empty(area);
+        paint_vu(&mut buffer, area, 1.0, 1.0, &theme, false);
+        for x in 0..16u16 {
+            assert_eq!(buffer[(x, 0u16)].symbol(), "█", "barra arriba (x={x})");
+        }
+        // Área vacía: sin pánico.
+        let area = Rect::new(0, 0, 0, 0);
+        let mut buffer = Buffer::empty(area);
+        paint_vu(&mut buffer, area, 1.0, 1.0, &theme, false);
     }
 
     fn test_app() -> App {
@@ -6970,10 +7262,10 @@ mod tests {
     }
 
     #[test]
-    fn visualizer_paint_routes_mirror_and_fall_to_their_painters() {
-        // T3: `espejo` y `caida` tienen pintor propio; `vu`/`circular`
-        // siguen en barras (fallback temporal hasta T4/T5, que reescriben
-        // este test al implementar su pintor).
+    fn visualizer_paint_routes_vu_to_its_painter_and_circular_to_bars() {
+        // T4: `vu` tiene pintor propio (medidor MONO con RMS); `circular`
+        // sigue en barras (fallback temporal hasta T5, que reescribe este
+        // test al implementar su pintor).
         assert_eq!(
             resolve_visualizer_paint(config::VisualizerMode::Barras),
             VisualizerPaint::Bars,
@@ -6994,17 +7286,16 @@ mod tests {
             VisualizerPaint::Fall,
             "caida va a su pintor con peak-hold, no a las barras"
         );
-        for mode in [
-            config::VisualizerMode::Vu,
-            config::VisualizerMode::Circular,
-        ] {
-            assert_eq!(
-                resolve_visualizer_paint(mode),
-                VisualizerPaint::Bars,
-                "fallback a barras para {}",
-                mode.as_str()
-            );
-        }
+        assert_eq!(
+            resolve_visualizer_paint(config::VisualizerMode::Vu),
+            VisualizerPaint::Vu,
+            "vu va a su medidor con RMS, no a las barras"
+        );
+        assert_eq!(
+            resolve_visualizer_paint(config::VisualizerMode::Circular),
+            VisualizerPaint::Bars,
+            "fallback a barras para circular"
+        );
     }
 
     #[test]

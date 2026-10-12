@@ -184,9 +184,10 @@ previsualizan cada modo en vivo, `Enter` aplica el modo y guarda su `mode`
 en la sección `[visualizer]` de este archivo (creándola si no existe) y
 vuelve al panel, y `Esc` cancela, restaura el modo anterior y vuelve al
 panel. `onda` dibuja el osciloscopio con las muestras crudas del audio,
-`espejo` las 32 bandas en espejo vertical desde una línea central y `caida`
-las barras con marca de máximo por banda (decae en ~800 ms); `vu`/`circular`
-dibujan las barras (fallback temporal hasta T4–T5). `barras` es el
+`espejo` las 32 bandas en espejo vertical desde una línea central, `caida`
+las barras con marca de máximo por banda (decae en ~800 ms) y `vu` el medidor
+de nivel mono con RMS y marca de pico (decae en ~800 ms); `circular`
+dibuja las barras (fallback temporal hasta T5). `barras` es el
 comportamiento actual.
 
 Desde el panel (`Ctrl+P` → `Mouse`) `Enter` alterna la captura del mouse en
@@ -268,9 +269,12 @@ Notas del comportamiento de la config:
   comportamiento actual), `onda` (osciloscopio con las muestras crudas del
   audio, la más reciente a la derecha), `espejo` (las 32 bandas en espejo
   vertical desde una línea central tenue), `caida` (barras con marca del
-  máximo por banda en `spectrum_high`, decae en ~800 ms), `vu` o `circular`.
-  Un valor inválido avisa y se usa `barras`. `vu`/`circular` dibujan las
-  barras (fallback temporal hasta T4–T5).
+  máximo por banda en `spectrum_high`, decae en ~800 ms), `vu` (medidor de
+  nivel mono con RMS, barra horizontal con gradiente del tema, marca de pico
+  en `spectrum_high` que decae en ~800 ms y escala tenue; mono porque el tap
+  ya promedia los canales — ver nota T4) o `circular`.
+  Un valor inválido avisa y se usa `barras`. `circular` dibuja las
+  barras (fallback temporal hasta T5).
 - Si dos acciones distintas quedan mapeadas a la misma tecla, gana la de
   mayor prioridad en el dispatch y se genera un warning que lo explicita
   (la perdedora vuelve a sus defaults libres).
