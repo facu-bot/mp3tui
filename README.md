@@ -69,5 +69,8 @@ mp3tui "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 | `Tab` | Biblioteca (panel lateral) |
 | `b` | Buscar |
 | `u` | Reproducir una URL |
+| `a` | Encolar la pista seleccionada de la Biblioteca |
+| `c` | Alternar el panel lateral entre Biblioteca y Cola |
+| `d` | Borrar el ítem seleccionado de la Cola |
 | `Ctrl+P` | Configuración (temas, bandas, modo) |
 | `Esc` `Esc` | Salir |

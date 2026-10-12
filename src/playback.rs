@@ -139,6 +139,33 @@ pub fn next_track(
     }
 }
 
+/// Ítem de la cola de reproducción: lo próximo que suena cuando la pista
+/// actual termina. Mientras la cola tenga ítems manda sobre `repeat` y
+/// `shuffle`; recién si está vacía se aplica [`natural_end_action`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueueItem {
+    /// Pista local ya escaneada: se reproduce por su ruta, sin resolver nada.
+    Local(Track),
+    /// URL pendiente de resolver. Se resuelve recién cuando le toca sonar
+    /// (las URLs resueltas vencen), así que acá se guarda la original.
+    Url {
+        /// URL original a reproducir cuando le toque el turno.
+        url: String,
+        /// Título para mostrar en la cola.
+        title: String,
+    },
+}
+
+impl QueueItem {
+    /// Etiqueta para listar el ítem en el panel de la cola.
+    pub fn label(&self) -> &str {
+        match self {
+            Self::Local(track) => &track.title,
+            Self::Url { title, .. } => title,
+        }
+    }
+}
+
 /// Qué hacer al terminar naturalmente una pista.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NextAction {

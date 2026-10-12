@@ -887,6 +887,14 @@ pub struct Keys {
     pub back: Vec<KeyCode>,
     /// Abrir prompt para reproducir URL: por defecto 'u'.
     pub open_url: Vec<KeyCode>,
+    /// Encolar el ítem seleccionado de la Biblioteca (pista local o URL del
+    /// historial) al final de la cola. Por defecto 'a'.
+    pub enqueue: Vec<KeyCode>,
+    /// Alternar la solapa del panel lateral entre Biblioteca y Cola. Por
+    /// defecto 'c'.
+    pub queue_panel: Vec<KeyCode>,
+    /// Eliminar el ítem seleccionado de la cola. Por defecto 'd'.
+    pub queue_delete: Vec<KeyCode>,
     /// Abrir el panel de configuración (shell con filas Temas/Mouse/Bandas).
     /// Se dispara con Ctrl+tecla (por defecto `Ctrl+P`): a diferencia de
     /// `explorer` (donde Tab y Ctrl+Tab valen por igual porque el dispatch
@@ -924,6 +932,9 @@ impl Default for Keys {
             select: keys(&[KeyCode::Enter]),
             back: keys(&[KeyCode::Esc]),
             open_url: keys(&[KeyCode::Char('u')]),
+            enqueue: keys(&[KeyCode::Char('a')]),
+            queue_panel: keys(&[KeyCode::Char('c')]),
+            queue_delete: keys(&[KeyCode::Char('d')]),
             settings: keys(&[KeyCode::Char('p')]),
         }
     }
@@ -948,6 +959,9 @@ fn parse_keybindings(
             "repeat" => &mut keys.repeat,
             "search" => &mut keys.search,
             "open_url" => &mut keys.open_url,
+            "enqueue" => &mut keys.enqueue,
+            "queue_panel" => &mut keys.queue_panel,
+            "queue_delete" => &mut keys.queue_delete,
             "settings" => &mut keys.settings,
             "speed_up" => &mut keys.speed_up,
             "speed_down" => &mut keys.speed_down,
@@ -1027,6 +1041,9 @@ fn resolve_key_collisions(keys: &mut Keys, warnings: &mut Vec<String>) {
         ("repeat", &mut keys.repeat, &defaults.repeat),
         ("search", &mut keys.search, &defaults.search),
         ("open_url", &mut keys.open_url, &defaults.open_url),
+        ("enqueue", &mut keys.enqueue, &defaults.enqueue),
+        ("queue_panel", &mut keys.queue_panel, &defaults.queue_panel),
+        ("queue_delete", &mut keys.queue_delete, &defaults.queue_delete),
         ("settings", &mut keys.settings, &defaults.settings),
         ("move_up", &mut keys.move_up, &defaults.move_up),
         ("move_down", &mut keys.move_down, &defaults.move_down),
@@ -2280,6 +2297,47 @@ zoom = 2");
         assert_eq!(config.warnings.len(), 1, "warnings: {:?}", config.warnings);
         assert!(config.warnings[0].contains("open_url"), "{:?}", config.warnings);
         assert!(config.warnings[0].contains("shuffle"), "{:?}", config.warnings);
+    }
+
+    #[test]
+    fn enqueue_queue_panel_and_queue_delete_defaults() {
+        let keys = Keys::default();
+        assert_eq!(keys.enqueue, vec![KeyCode::Char('a')], "a encola");
+        assert_eq!(
+            keys.queue_panel,
+            vec![KeyCode::Char('c')],
+            "c alterna Biblioteca/Cola"
+        );
+        assert_eq!(
+            keys.queue_delete,
+            vec![KeyCode::Char('d')],
+            "d borra el ítem de la cola"
+        );
+    }
+
+    #[test]
+    fn new_queue_keys_parse_from_toml() {
+        let config = parse(
+            r#"
+            [keybindings]
+            enqueue = "w"
+            queue_panel = "C"
+            queue_delete = "delete"
+            "#,
+        );
+        assert_eq!(config.keys.enqueue, vec![KeyCode::Char('w')]);
+        assert_eq!(config.keys.queue_panel, vec![KeyCode::Char('C')]);
+        assert_eq!(config.keys.queue_delete, vec![KeyCode::Delete]);
+        assert!(config.warnings.is_empty(), "warnings: {:?}", config.warnings);
+    }
+
+    #[test]
+    fn new_queue_keys_keep_working_when_remapped() {
+        // Un valor inválido deja el default y avisa, como cualquier atajo.
+        let config = parse("[keybindings]\nenqueue = \"voltear\"\n");
+        assert_eq!(config.keys.enqueue, Keys::default().enqueue);
+        assert_eq!(config.warnings.len(), 1, "warnings: {:?}", config.warnings);
+        assert!(config.warnings[0].contains("enqueue"), "{:?}", config.warnings);
     }
 
     #[test]

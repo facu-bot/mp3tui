@@ -13,6 +13,7 @@ const AUDIO_EXTENSIONS: [&str; 4] = ["mp3", "flac", "ogg", "wav"];
 const MAX_TRACKS: usize = 10_000;
 
 /// Una pista de audio de la biblioteca.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Track {
     pub path: PathBuf,
     /// Título del tag o, si no hay tags, el nombre del archivo sin extensión.

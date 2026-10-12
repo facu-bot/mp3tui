@@ -4,6 +4,7 @@
 //! explorador se superpone como panel lateral con Ctrl+Tab/b/Tab; a
 //! pantalla completa solo cuando no hay player (arranque por directorio).
 
+use std::collections::VecDeque;
 use std::io;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -25,7 +26,7 @@ use crate::audio::{AudioEngine, SPEED_STEP};
 use crate::config::{self, key_labels, Theme};
 use crate::playback::{
     filter_tracks, natural_end_action, next_track, seek_target, shuffle_order, NextAction,
-    RepeatMode, URL_REPLAY_TOO_SOON_MSG,
+    QueueItem, RepeatMode, URL_REPLAY_TOO_SOON_MSG,
 };
 use crate::playlist::{move_selection, scroll_offset, Playlist, Track};
 use crate::runtime;
@@ -255,6 +256,15 @@ struct App {
     /// Permutación de `0..view.len()`; válida mientras `shuffle` esté activo
     /// y `shuffle_order.len() == view.len()`.
     shuffle_order: Vec<usize>,
+    /// Cola de reproducción en orden FIFO: lo próximo a sonar. Mientras tenga
+    /// ítems manda sobre `repeat` y `shuffle`.
+    queue: VecDeque<QueueItem>,
+    /// Solapa activa del panel lateral: `false` = Biblioteca, `true` = Cola.
+    /// Solo tiene efecto con el panel abierto.
+    queue_panel: bool,
+    /// Selección dentro de la Cola (independiente de `selected`, la de la
+    /// Biblioteca): cada lista conserva la suya al alternar.
+    queue_selected: usize,
     current_path: Option<PathBuf>,
     has_player: bool,
     track_label: String,
@@ -437,7 +447,8 @@ fn key_for_chip(keys_text: &str) -> Option<KeyCode> {
         &keys.shuffle, &keys.repeat, &keys.search, &keys.speed_up,
         &keys.speed_down, &keys.explorer, &keys.move_up, &keys.move_down,
         &keys.page_up, &keys.page_down, &keys.home, &keys.end, &keys.select,
-        &keys.back, &keys.open_url, &keys.settings,
+        &keys.back, &keys.open_url, &keys.enqueue, &keys.queue_panel,
+        &keys.queue_delete, &keys.settings,
     ]
     .into_iter()
     .flatten()
@@ -846,6 +857,9 @@ pub fn run(engine: &mut AudioEngine, start: StartMode) -> io::Result<()> {
         shuffle: false,
         repeat: RepeatMode::Off,
         shuffle_order: Vec::new(),
+        queue: VecDeque::new(),
+        queue_panel: false,
+        queue_selected: 0,
         current_path,
         has_player,
         track_label,
@@ -1170,6 +1184,7 @@ fn handle_player_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine) {
 fn handle_list_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine) {
     let keys = &config::config().keys;
     let view_len = app.view.len();
+    let queue_len = app.queue.len();
     let code = key.code;
     // `settings` va primero (igual que en el player): exige Ctrl, la letra
     // suelta nunca cae acá.
@@ -1184,8 +1199,25 @@ fn handle_list_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine) {
         toggle_explorer(app);
     } else if config::pressed(&keys.quit, code) {
         request_quit(app);
+    } else if config::pressed(&keys.queue_panel, code) {
+        // Alterna la solapa del panel lateral (Biblioteca | Cola): cada lista
+        // conserva su propia selección (`selected` / `queue_selected`).
+        app.queue_panel = !app.queue_panel;
     } else if config::pressed(&keys.select, code) {
-        play_selected(app, engine);
+        if app.queue_panel {
+            play_selected_queue_item(app, engine);
+        } else {
+            play_selected(app, engine);
+        }
+    } else if config::pressed(&keys.enqueue, code) {
+        // Encolar solo tiene sentido sobre la lista Biblioteca.
+        if !app.queue_panel {
+            enqueue_selected(app);
+        }
+    } else if config::pressed(&keys.queue_delete, code) {
+        if app.queue_panel {
+            delete_selected_queue_item(app);
+        }
     } else if config::pressed(&keys.play_pause, code) {
         toggle_play(app, engine);
     } else if config::pressed(&keys.next_track, code) {
@@ -1201,9 +1233,17 @@ fn handle_list_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine) {
     } else if config::pressed(&keys.search, code) {
         open_search(app);
     } else if config::pressed(&keys.move_up, code) {
-        app.selected = move_selection(app.selected, -1, view_len);
+        if app.queue_panel {
+            app.queue_selected = move_selection(app.queue_selected, -1, queue_len);
+        } else {
+            app.selected = move_selection(app.selected, -1, view_len);
+        }
     } else if config::pressed(&keys.move_down, code) {
-        app.selected = move_selection(app.selected, 1, view_len);
+        if app.queue_panel {
+            app.queue_selected = move_selection(app.queue_selected, 1, queue_len);
+        } else {
+            app.selected = move_selection(app.selected, 1, view_len);
+        }
     } else if config::pressed(&keys.seek_back, code) {
         seek_by(app, engine, -1);
     } else if config::pressed(&keys.seek_fwd, code) {
@@ -1213,13 +1253,29 @@ fn handle_list_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine) {
     } else if config::pressed(&keys.speed_up, code) {
         step_speed(app, engine, 1.0);
     } else if config::pressed(&keys.page_up, code) {
-        app.selected = move_selection(app.selected, -PAGE_STEP, view_len);
+        if app.queue_panel {
+            app.queue_selected = move_selection(app.queue_selected, -PAGE_STEP, queue_len);
+        } else {
+            app.selected = move_selection(app.selected, -PAGE_STEP, view_len);
+        }
     } else if config::pressed(&keys.page_down, code) {
-        app.selected = move_selection(app.selected, PAGE_STEP, view_len);
+        if app.queue_panel {
+            app.queue_selected = move_selection(app.queue_selected, PAGE_STEP, queue_len);
+        } else {
+            app.selected = move_selection(app.selected, PAGE_STEP, view_len);
+        }
     } else if config::pressed(&keys.home, code) {
-        app.selected = move_selection(app.selected, isize::MIN, view_len);
+        if app.queue_panel {
+            app.queue_selected = move_selection(app.queue_selected, isize::MIN, queue_len);
+        } else {
+            app.selected = move_selection(app.selected, isize::MIN, view_len);
+        }
     } else if config::pressed(&keys.end, code) {
-        app.selected = move_selection(app.selected, isize::MAX, view_len);
+        if app.queue_panel {
+            app.queue_selected = move_selection(app.queue_selected, isize::MAX, queue_len);
+        } else {
+            app.selected = move_selection(app.selected, isize::MAX, view_len);
+        }
     }
 }
 
@@ -1930,6 +1986,70 @@ fn play_selected(app: &mut App, engine: &mut AudioEngine) {
     }
 }
 
+/// Encolar: suma el ítem seleccionado de la Biblioteca al final de la cola.
+/// Una pista local va como `QueueItem::Local`; una fila del historial, como
+/// `QueueItem::Url` (se resuelve recién cuando le toque el turno).
+fn enqueue_selected(app: &mut App) {
+    let Some(item) = app.view.get(app.selected).copied() else {
+        return;
+    };
+    match item {
+        ViewItem::Track(library_index) => {
+            if let Some(track) = library_get(app, library_index) {
+                app.queue.push_back(QueueItem::Local(track.clone()));
+            }
+        }
+        ViewItem::History(hist_idx) => {
+            if let Some(entry) = app.history.get(hist_idx) {
+                let title = if entry.title.is_empty() {
+                    entry.url.clone()
+                } else {
+                    entry.title.clone()
+                };
+                app.queue.push_back(QueueItem::Url {
+                    url: entry.url.clone(),
+                    title,
+                });
+            }
+        }
+    }
+}
+
+/// Enter en la Cola: saca el ítem seleccionado y lo reproduce ya (resuelve la
+/// URL por el camino normal si es una URL pendiente).
+fn play_selected_queue_item(app: &mut App, engine: &mut AudioEngine) {
+    if app.queue.is_empty() {
+        return;
+    }
+    let index = app.queue_selected.min(app.queue.len() - 1);
+    let Some(item) = app.queue.remove(index) else {
+        return;
+    };
+    if index >= app.queue.len() && !app.queue.is_empty() {
+        app.queue_selected = app.queue.len() - 1;
+    }
+    match item {
+        QueueItem::Local(track) => {
+            if start_local_playback(app, engine, track.path) {
+                app.mode = Mode::Player;
+            }
+        }
+        QueueItem::Url { url, .. } => {
+            submit_url_prompt(url, app, engine);
+        }
+    }
+}
+
+/// Borra el ítem seleccionado de la Cola y acota la selección al nuevo alto.
+fn delete_selected_queue_item(app: &mut App) {
+    if app.queue.is_empty() {
+        return;
+    }
+    let index = app.queue_selected.min(app.queue.len() - 1);
+    app.queue.remove(index);
+    app.queue_selected = app.queue_selected.min(app.queue.len().saturating_sub(1));
+}
+
 /// Posiciones de la vista que son pistas de la biblioteca (lo que recorren
 /// `n`/`p` y el fin natural; las entradas del historial quedan fuera).
 /// Regenera el orden de shuffle si la lista cambió desde que se armó
@@ -2074,6 +2194,26 @@ fn handle_natural_end_with(
     engine: &mut AudioEngine,
     mut replay: impl FnMut(&mut App, &mut AudioEngine, UrlReplayRequest),
 ) {
+    // La cola manda: mientras tenga ítems, el fin de pista saca el primero
+    // (FIFO) y lo reproduce, sin aplicar `repeat` ni `shuffle`.
+    if let Some(item) = app.queue.pop_front() {
+        match item {
+            QueueItem::Local(track) => {
+                if start_local_playback(app, engine, track.path) {
+                    // La selección sigue a la pista que arrancó, igual que
+                    // cuando el "siguiente" sale de la biblioteca.
+                    resync_selection(app);
+                }
+            }
+            QueueItem::Url { url, .. } => {
+                // Se resuelve recién ahora, por el mismo camino que el replay
+                // de URL: las URLs resueltas vencen.
+                replay(app, engine, UrlReplayRequest { original_url: url });
+            }
+        }
+        return;
+    }
+
     let track_positions = track_positions_in_view(app);
     let current = current_track_index(app, &track_positions);
 
@@ -2123,6 +2263,7 @@ fn handle_natural_end_with(
 fn go_back(app: &mut App) {
     if app.explorer_open {
         app.explorer_open = false;
+        app.queue_panel = false;
     } else if app.has_player {
         app.mode = Mode::Player;
     } else {
@@ -2144,6 +2285,9 @@ fn toggle_explorer(app: &mut App) {
         refresh_view(app);
         resync_selection(app);
         start_scan(app);
+    } else {
+        // Al cerrar el panel vuelve siempre a la solapa Biblioteca.
+        app.queue_panel = false;
     }
 }
 
@@ -2774,10 +2918,13 @@ fn render_browser_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
 /// apagado cuando el panel del explorador tiene el foco).
 fn render_library(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
     let folder = library_folder_label(app);
+    // La solapa Cola solo existe en el panel lateral (con player); en el
+    // explorador a pantalla completa siempre se ve la Biblioteca.
+    let queue_view = app.explorer_open && app.queue_panel;
     // Buscando: borde y título en el color de aviso (warn) en vez del acento
     // normal, para que el modo búsqueda se note de un vistazo y no sólo por
     // el texto "Buscar:" (que puede pasar desapercibido).
-    let searching = app.search.is_some();
+    let searching = app.search.is_some() && !queue_view;
     let highlight = if searching {
         theme().warn
     } else if focused {
@@ -2794,9 +2941,19 @@ fn render_library(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
     };
     let block = Block::bordered()
         .border_style(Style::default().fg(border_color))
-        .title(library_title_line(app, &folder, highlight));
+        .title(if queue_view {
+            queue_title_line(app, highlight)
+        } else {
+            library_title_line(app, &folder, highlight)
+        });
     let inner = block.inner(area);
     frame.render_widget(block, area);
+
+    if queue_view {
+        let lines = queue_rows(app, inner.width, inner.height);
+        frame.render_widget(Paragraph::new(lines), inner);
+        return;
+    }
 
     let Some(library) = &app.library else {
         // Primer escaneo en curso: estado de carga en vez de lista vacía.
@@ -3026,6 +3183,75 @@ fn library_rows(app: &App, width: u16, height: u16) -> Vec<Line<'static>> {
         }
     }
     lines
+}
+
+/// Filas visibles de la cola (FIFO): una por ítem con el mismo cursor y
+/// resaltado de selección que la biblioteca. Mantiene su propio scroll
+/// (`queue_selected`), independiente del de la Biblioteca. La cola vacía
+/// muestra un estado explícito.
+fn queue_rows(app: &App, width: u16, height: u16) -> Vec<Line<'static>> {
+    let height = height as usize;
+    if height == 0 {
+        return Vec::new();
+    }
+    if app.queue.is_empty() {
+        return vec![Line::styled(
+            " La cola está vacía: apretá a en la Biblioteca para encolar ",
+            Style::default().fg(theme().dim),
+        )];
+    }
+    let start = scroll_offset(app.queue_selected, app.queue.len(), height);
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(height);
+    for (position, item) in app.queue.iter().enumerate().skip(start) {
+        if lines.len() >= height {
+            break;
+        }
+        let selected = position == app.queue_selected;
+        lines.push(queue_row_line(item.label(), position + 1, selected, width));
+    }
+    lines
+}
+
+/// Una fila de la cola: cursor, número y etiqueta del ítem, con la misma
+/// paleta que la fila de la biblioteca (`select_bg` para la seleccionada).
+fn queue_row_line(label: &str, number: usize, selected: bool, width: u16) -> Line<'static> {
+    let cursor = if selected { CURSOR } else { " " };
+    let prefix = format!("{number:>2}. ");
+    let budget = (width as usize).saturating_sub(1 + prefix.chars().count());
+    let label = truncate_chars(label, budget);
+    let pad = budget.saturating_sub(label.chars().count());
+    let (cursor_style, text_style) = if selected {
+        let bg = theme().select_bg;
+        (
+            Style::default().bg(bg).fg(theme().accent).add_modifier(Modifier::BOLD),
+            Style::default().bg(bg).fg(theme().text).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        (
+            Style::default().fg(theme().accent).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme().text),
+        )
+    };
+    Line::from(vec![
+        Span::styled(cursor, cursor_style),
+        Span::styled(format!("{prefix}{label}{}", " ".repeat(pad)), text_style),
+    ])
+}
+
+/// Título del bloque Cola como línea con estilo (mismo patrón que el de la
+/// biblioteca).
+fn queue_title_line(app: &App, highlight: Color) -> Line<'static> {
+    Line::from(Span::styled(
+        queue_title(app),
+        Style::default().fg(highlight).add_modifier(Modifier::BOLD),
+    ))
+}
+
+/// Título del bloque Cola: cantidad de ítems pendientes.
+fn queue_title(app: &App) -> String {
+    let count = app.queue.len();
+    let noun = if count == 1 { "ítem" } else { "ítems" };
+    format!(" Cola · {count} {noun} ")
 }
 
 /// Encabezado de carpeta: nombre en acento y negrita seguido de un
@@ -4062,37 +4288,54 @@ fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
         // recordatorio de que ↑/↓ son volumen solo con el panel cerrado.
         // `u: URL` también vale con el panel abierto; `sig/ant` se
         // expande porque entra en 78 reagrupando (`u` pasa a la línea 2).
-        Mode::Player if app.explorer_open => vec![
-            Line::from(format!(
-                " {}/{}: mover   {}: reproducir   {}: buscar   Ctrl+{}: config   {}/{}: cerrar",
-                key_labels(&keys.move_up),
-                key_labels(&keys.move_down),
-                key_labels(&keys.select),
-                key_labels(&keys.search),
-                settings_key_display(),
-                key_labels(&keys.back),
-                key_labels(&keys.explorer),
-            )),
-            Line::from(format!(
-                " {}: pausa   {}/{}: ±5s   {}: shuffle   {}: repeat   {}: URL   {}×2: salir",
-                key_labels(&keys.play_pause),
-                key_labels(&keys.seek_back),
-                key_labels(&keys.seek_fwd),
-                key_labels(&keys.shuffle),
-                key_labels(&keys.repeat),
-                key_labels(&keys.open_url),
-                key_labels(&keys.quit),
-            )),
-            Line::from(format!(
-                " {}/{}: pista siguiente/anterior   volumen {}/{}: con el panel cerrado   {}/{}: vel",
-                key_labels(&keys.next_track),
-                key_labels(&keys.prev_track),
-                key_labels(&keys.volume_up),
-                key_labels(&keys.volume_down),
-                key_labels(&keys.speed_down),
-                key_labels(&keys.speed_up),
-            )),
-        ],
+        // La línea de acciones de la lista cambia según la solapa: en
+        // Biblioteca `a: encolar`; en Cola, `d: borrar` y `c: biblio`.
+        Mode::Player if app.explorer_open => {
+            let list_hint = if app.queue_panel {
+                format!(
+                    " {}: pausa   {}/{}: ±5s   {}: borrar   {}: biblio   {}: URL   {}×2: salir",
+                    key_labels(&keys.play_pause),
+                    key_labels(&keys.seek_back),
+                    key_labels(&keys.seek_fwd),
+                    key_labels(&keys.queue_delete),
+                    key_labels(&keys.queue_panel),
+                    key_labels(&keys.open_url),
+                    key_labels(&keys.quit),
+                )
+            } else {
+                format!(
+                    " {}: pausa   {}/{}: ±5s   {}: encolar   {}: cola   {}: URL   {}×2: salir",
+                    key_labels(&keys.play_pause),
+                    key_labels(&keys.seek_back),
+                    key_labels(&keys.seek_fwd),
+                    key_labels(&keys.enqueue),
+                    key_labels(&keys.queue_panel),
+                    key_labels(&keys.open_url),
+                    key_labels(&keys.quit),
+                )
+            };
+            vec![
+                Line::from(format!(
+                    " {}/{}: mover   {}: reproducir   Ctrl+{}: config   {}/{}: cerrar",
+                    key_labels(&keys.move_up),
+                    key_labels(&keys.move_down),
+                    key_labels(&keys.select),
+                    settings_key_display(),
+                    key_labels(&keys.back),
+                    key_labels(&keys.explorer),
+                )),
+                Line::from(list_hint),
+                Line::from(format!(
+                    " {}/{}: pista siguiente/anterior   volumen {}/{}: con el panel cerrado   {}/{}: vel",
+                    key_labels(&keys.next_track),
+                    key_labels(&keys.prev_track),
+                    key_labels(&keys.volume_up),
+                    key_labels(&keys.volume_down),
+                    key_labels(&keys.speed_down),
+                    key_labels(&keys.speed_up),
+                )),
+            ]
+        },
         // `Tab: biblio` vuelve; `b` sube a la línea 1 como
         // navegación y `↑/↓: vol` abrevia: es la única forma de que los 12
         // atajos entren en 2×78. Orden: navegación → reproducción → modos →
@@ -5327,6 +5570,9 @@ mod tests {
             shuffle: false,
             repeat: RepeatMode::Off,
             shuffle_order: Vec::new(),
+            queue: VecDeque::new(),
+            queue_panel: false,
+            queue_selected: 0,
             current_path: None,
             has_player: false,
             track_label: String::new(),
@@ -6249,6 +6495,13 @@ mod tests {
         assert_eq!(key_for_chip("Esc×2"), Some(KeyCode::Esc));
         assert_eq!(key_for_chip("espacio"), Some(KeyCode::Char(' ')));
         assert_eq!(key_for_chip("volumen ↑/↓"), None, "texto suelto, no es un atajo");
+    }
+
+    #[test]
+    fn new_queue_chips_resolve_to_their_shortcuts() {
+        assert_eq!(key_for_chip("a"), Some(KeyCode::Char('a')), "encolar");
+        assert_eq!(key_for_chip("c"), Some(KeyCode::Char('c')), "Biblioteca/Cola");
+        assert_eq!(key_for_chip("d"), Some(KeyCode::Char('d')), "borrar de la cola");
     }
 
     #[test]
@@ -8142,6 +8395,269 @@ mod tests {
             "debe mostrar el aviso de corte"
         );
         assert!(app.ytdlp_rx.is_none(), "sin yt-dlp en el test");
+    }
+
+    /// La cola manda sobre el fin de pista: con un ítem encolado se reproduce
+    /// ese y no se aplica `repeat`.
+    #[test]
+    fn test_natural_end_with_queued_item_takes_over_repeat() {
+        let mut app = test_app();
+        let mut engine = match AudioEngine::new() {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        let dir = std::env::temp_dir();
+        let actual = dir.join(format!("mp3tui_cola_actual_{}.wav", std::process::id()));
+        let siguiente = dir.join(format!("mp3tui_cola_siguiente_{}.wav", std::process::id()));
+        std::fs::write(&actual, make_test_wav(4410)).unwrap();
+        std::fs::write(&siguiente, make_test_wav(4410)).unwrap();
+
+        app.status = Status::Playing;
+        app.repeat = RepeatMode::One;
+        app.current_path = Some(actual.clone());
+        let mut encolada = Track::from_path(siguiente.clone());
+        encolada.title = "La que sigue".to_string();
+        app.queue.push_back(QueueItem::Local(encolada));
+
+        let mut dispatched: Option<UrlReplayRequest> = None;
+        handle_natural_end_with(&mut app, &mut engine, |_app, _engine, request| {
+            dispatched = Some(request);
+        });
+
+        assert_eq!(
+            app.current_path.as_ref(),
+            Some(&siguiente),
+            "con la cola cargada el fin de pista reproduce el ítem encolado"
+        );
+        assert_eq!(dispatched, None, "no se re-lanza la pista que terminó");
+        assert!(app.queue.is_empty(), "el ítem encolado sale de la cola");
+
+        let _ = std::fs::remove_file(&actual);
+        let _ = std::fs::remove_file(&siguiente);
+    }
+
+    /// La cola es FIFO también con shuffle activo: sale el primero encolado,
+    /// no uno al azar de la biblioteca.
+    #[test]
+    fn test_natural_end_with_queue_is_fifo_even_with_shuffle() {
+        let mut app = test_app();
+        let mut engine = match AudioEngine::new() {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        let dir = std::env::temp_dir();
+        let primera = dir.join(format!("mp3tui_cola_a_{}.wav", std::process::id()));
+        let segunda = dir.join(format!("mp3tui_cola_b_{}.wav", std::process::id()));
+        std::fs::write(&primera, make_test_wav(4410)).unwrap();
+        std::fs::write(&segunda, make_test_wav(4410)).unwrap();
+
+        app.status = Status::Playing;
+        app.shuffle = true;
+        let mut a = Track::from_path(primera.clone());
+        a.title = "Primera".to_string();
+        let mut b = Track::from_path(segunda.clone());
+        b.title = "Segunda".to_string();
+        app.queue.push_back(QueueItem::Local(a));
+        app.queue.push_back(QueueItem::Local(b));
+
+        handle_natural_end_with(&mut app, &mut engine, |_app, _engine, _request| {});
+
+        assert_eq!(
+            app.current_path.as_ref(),
+            Some(&primera),
+            "con shuffle la cola igual respeta el orden de encolado"
+        );
+        assert_eq!(
+            app.queue.front().map(QueueItem::label),
+            Some("Segunda"),
+            "el segundo ítem queda esperando su turno"
+        );
+
+        let _ = std::fs::remove_file(&primera);
+        let _ = std::fs::remove_file(&segunda);
+    }
+
+    /// Una URL encolada se resuelve recién al terminar la actual: el ítem sale
+    /// de la cola y pasa por el mismo camino que el replay de URL.
+    #[test]
+    fn test_natural_end_with_queued_url_resolves_only_when_its_turn_comes() {
+        let mut app = test_app();
+        let mut engine = match AudioEngine::new() {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        app.status = Status::Playing;
+        app.is_url = true;
+        app.queue.push_back(QueueItem::Url {
+            url: "https://www.youtube.com/watch?v=encolada".to_string(),
+            title: "Encolada".to_string(),
+        });
+
+        let mut dispatched: Option<UrlReplayRequest> = None;
+        handle_natural_end_with(&mut app, &mut engine, |_app, _engine, request| {
+            dispatched = Some(request);
+        });
+
+        assert_eq!(
+            dispatched.map(|request| request.original_url),
+            Some("https://www.youtube.com/watch?v=encolada".to_string()),
+            "la URL encolada se resuelve cuando se termina la actual"
+        );
+        assert!(app.queue.is_empty(), "el ítem encolado sale de la cola");
+    }
+
+    /// «Encolar» (`a`) suma la pista seleccionada de la Biblioteca como
+    /// `QueueItem::Local`, sin mover la selección ni la lista.
+    #[test]
+    fn enqueue_key_appends_the_selected_library_track_to_the_queue() {
+        let Some(mut engine) = engine_or_skip() else { return };
+        let mut app = library_with_three();
+        app.selected = 1;
+
+        handle_list_key(theme_menu_key(KeyCode::Char('a')), &mut app, &mut engine);
+
+        assert_eq!(app.queue.len(), 1, "una pista encolada");
+        assert_eq!(app.queue.front().map(QueueItem::label), Some("beta"));
+        assert_eq!(app.selected, 1, "la selección de la biblioteca no se mueve");
+        assert_eq!(app.view.len(), 3, "la lista no cambia");
+    }
+
+    /// Una fila del historial se encola como URL (se resuelve cuando le toca
+    /// sonar), no como pista local.
+    #[test]
+    fn enqueue_key_adds_a_history_url_as_a_queue_url_item() {
+        let Some(mut engine) = engine_or_skip() else { return };
+        let mut app = test_app();
+        app.history.add(
+            "Video de YouTube".to_string(),
+            "https://www.youtube.com/watch?v=x".to_string(),
+        );
+        refresh_view(&mut app);
+        app.selected = 0;
+
+        handle_list_key(theme_menu_key(KeyCode::Char('a')), &mut app, &mut engine);
+
+        assert_eq!(
+            app.queue.front(),
+            Some(&QueueItem::Url {
+                url: "https://www.youtube.com/watch?v=x".to_string(),
+                title: "Video de YouTube".to_string(),
+            })
+        );
+    }
+
+    /// `c` alterna Biblioteca y Cola dentro del panel; cada lista conserva su
+    /// propia selección.
+    #[test]
+    fn queue_panel_key_toggles_lists_and_keeps_two_selections() {
+        let Some(mut engine) = engine_or_skip() else { return };
+        let mut app = library_with_three();
+        app.mode = Mode::Player;
+        app.has_player = true;
+        app.explorer_open = true;
+        app.selected = 2;
+        app.queue.push_back(QueueItem::Local(track_named("uno")));
+        app.queue.push_back(QueueItem::Local(track_named("dos")));
+
+        handle_list_key(theme_menu_key(KeyCode::Char('c')), &mut app, &mut engine);
+        assert!(app.queue_panel, "c muestra la Cola en el panel");
+        assert_eq!(app.selected, 2, "la selección de Biblioteca no se toca");
+
+        handle_list_key(theme_menu_key(KeyCode::Down), &mut app, &mut engine);
+        assert_eq!(app.queue_selected, 1, "↓ mueve la selección de la Cola");
+        assert_eq!(app.selected, 2, "y no la de Biblioteca");
+
+        handle_list_key(theme_menu_key(KeyCode::Char('c')), &mut app, &mut engine);
+        assert!(!app.queue_panel, "c vuelve a Biblioteca");
+        assert_eq!(app.queue_selected, 1, "la Cola conserva su selección");
+    }
+
+    /// Lista de la Cola: FIFO con el mismo cursor/resaltado que la Biblioteca
+    /// y estado vacío explícito.
+    #[test]
+    fn queue_rows_show_labels_in_fifo_order_with_the_cursor() {
+        let mut app = test_app();
+        app.queue.push_back(QueueItem::Local(track_named("primera")));
+        app.queue.push_back(QueueItem::Url {
+            url: "https://x/y".to_string(),
+            title: "segunda".to_string(),
+        });
+        app.queue_selected = 1;
+
+        let lines = queue_rows(&app, 40, 10);
+        let texts: Vec<String> = lines.iter().map(|line| line_text(line)).collect();
+        assert_eq!(texts.len(), 2, "una fila por ítem: {texts:?}");
+        assert!(texts[0].contains("primera"), "{:?}", texts[0]);
+        assert!(texts[1].starts_with('\u{258c}'), "cursor en el seleccionado");
+        assert!(texts[1].contains("segunda"), "{:?}", texts[1]);
+
+        let empty = queue_rows(&test_app(), 40, 10);
+        let empty_text = line_text(&empty[0]);
+        assert!(empty_text.contains("vacía"), "estado vacío: {empty_text}");
+    }
+
+    /// `d` borra el ítem seleccionado de la Cola y la selección cae en el
+    /// siguiente.
+    #[test]
+    fn queue_delete_key_removes_the_selected_item() {
+        let Some(mut engine) = engine_or_skip() else { return };
+        let mut app = test_app();
+        app.explorer_open = true;
+        app.queue_panel = true;
+        app.queue.push_back(QueueItem::Local(track_named("uno")));
+        app.queue.push_back(QueueItem::Local(track_named("dos")));
+        app.queue.push_back(QueueItem::Local(track_named("tres")));
+        app.queue_selected = 1;
+
+        handle_list_key(theme_menu_key(KeyCode::Char('d')), &mut app, &mut engine);
+
+        let labels: Vec<&str> = app.queue.iter().map(QueueItem::label).collect();
+        assert_eq!(labels, vec!["uno", "tres"], "borra el seleccionado");
+        assert_eq!(app.queue_selected, 1, "la selección cae en el siguiente");
+    }
+
+    /// Enter en la Cola salta y reproduce ya el ítem seleccionado, sacándolo
+    /// de la cola.
+    #[test]
+    fn queue_enter_plays_the_selected_item_and_removes_it() {
+        let mut app = test_app();
+        let mut engine = match AudioEngine::new() {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("mp3tui_cola_enter_{}.wav", std::process::id()));
+        std::fs::write(&path, make_test_wav(4410)).unwrap();
+
+        app.explorer_open = true;
+        app.queue_panel = true;
+        app.queue.push_back(QueueItem::Local(track_with_path(path.clone(), "elegida")));
+        app.queue.push_back(QueueItem::Local(track_named("queda")));
+
+        handle_list_key(theme_menu_key(KeyCode::Enter), &mut app, &mut engine);
+
+        assert_eq!(app.current_path.as_ref(), Some(&path), "Enter reproduce ya");
+        let labels: Vec<&str> = app.queue.iter().map(QueueItem::label).collect();
+        assert_eq!(labels, vec!["queda"], "el ítem reproducido sale de la cola");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// PRESERVE: con la lista Biblioteca activa, las flechas siguen moviendo
+    /// `selected` (no la selección de la Cola).
+    #[test]
+    fn library_list_keys_keep_moving_the_library_selection() {
+        let Some(mut engine) = engine_or_skip() else { return };
+        let mut app = library_with_three();
+        app.explorer_open = true;
+        app.selected = 0;
+        app.queue_selected = 0;
+
+        handle_list_key(theme_menu_key(KeyCode::Down), &mut app, &mut engine);
+        assert_eq!(app.selected, 1, "↓ mueve la Biblioteca");
+        handle_list_key(theme_menu_key(KeyCode::End), &mut app, &mut engine);
+        assert_eq!(app.selected, 2, "Fin va a la última de la Biblioteca");
+        assert_eq!(app.queue_selected, 0, "la Cola no se toca");
     }
 
     #[test]
