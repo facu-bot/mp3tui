@@ -281,6 +281,9 @@ struct App {
     /// Selector de bandas abierto (T3): `Some` mientras el sub-modal está
     /// activo (el panel sigue abierto debajo).
     bands_menu: Option<BandsMenuState>,
+    /// Selector de modo abierto (T1 modos-visualizador): `Some` mientras el
+    /// sub-modal está activo (el panel sigue abierto debajo).
+    mode_menu: Option<ModeMenuState>,
     /// Panel de configuración abierto (T1): `Some` mientras el modal está activo.
     settings_panel: Option<SettingsPanelState>,
     /// Captura del mouse en vivo (T4): arranca con el valor de `[ui] mouse`
@@ -573,11 +576,12 @@ fn handle_mouse(event: MouseEvent, app: &mut App, engine: &mut AudioEngine) {
         return;
     }
     // Con un modal abierto (prompt de URL, menú de temas, selector de
-    // bandas, panel de configuración) el clic no atraviesa hacia lo que
-    // quedó tapado.
+    // bandas, selector de modo, panel de configuración) el clic no atraviesa
+    // hacia lo que quedó tapado.
     if app.url_input.is_some()
         || app.theme_menu.is_some()
         || app.bands_menu.is_some()
+        || app.mode_menu.is_some()
         || app.settings_panel.is_some()
     {
         app.drag = None;
@@ -697,9 +701,23 @@ struct BandsMenuState {
     original: config::VisualizerStyle,
 }
 
+/// Estado del selector de modo (T1 modos-visualizador): selección con
+/// previsualización en vivo y el modo con el que se abrió (para el marcador
+/// y para restaurar con Esc). Espejo de `BandsMenuState` sobre los 6 valores
+/// fijos. En T1 la previsualización solo mueve el modo activo (todos los
+/// modos dibujan las barras hasta T2–T5).
+struct ModeMenuState {
+    /// Índice en `config::VisualizerMode::options()`.
+    selected: usize,
+    /// Modo configurado al abrir (fila «actual» marcada con ●).
+    original: config::VisualizerMode,
+}
+
 /// Filas fijas del panel de configuración: Temas (T2) abre su sub-modal,
-/// Bandas (T3) el suyo y Mouse (T4) su toggle.
-const SETTINGS_ROWS: [&str; 3] = ["Temas", "Mouse", "Bandas"];
+/// Bandas (T3) el suyo, Mouse (T4) su toggle y Modo (T1 modos-visualizador)
+/// el suyo. El orden es estable: la cuarta fila va AL FINAL, sin reordenar
+/// las existentes.
+const SETTINGS_ROWS: [&str; 4] = ["Temas", "Mouse", "Bandas", "Modo"];
 
 /// Estado del panel de configuración (T1: shell sin contenido): selección por
 /// índice sobre `SETTINGS_ROWS`.
@@ -819,6 +837,7 @@ pub fn run(engine: &mut AudioEngine, start: StartMode) -> io::Result<()> {
         history_path: crate::history::history_path(),
         theme_menu: None,
         bands_menu: None,
+        mode_menu: None,
         settings_panel: None,
         // El estado vivo arranca con lo configurado (el toggle lo cambia en
         // el momento y lo persiste para el próximo arranque).
@@ -1052,6 +1071,13 @@ fn dispatch_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine) {
     // que el de temas (nunca están abiertos los dos a la vez).
     if app.bands_menu.is_some() {
         handle_bands_menu_key(key, app, config::persist_visualizer_style);
+        return;
+    }
+
+    // Selector de modo (T1 modos-visualizador): sub-modal del panel con la
+    // misma prioridad que los otros dos (nunca hay dos abiertos a la vez).
+    if app.mode_menu.is_some() {
+        handle_mode_menu_key(key, app, config::persist_visualizer_mode);
         return;
     }
 
@@ -1478,6 +1504,62 @@ fn handle_bands_menu_key(
     }
 }
 
+// --- Selector de modo (T1 modos-visualizador: sub-modal del panel) ---------
+
+fn open_mode_menu(app: &mut App) {
+    let current = config::active_visualizer_mode();
+    let selected = config::VisualizerMode::options()
+        .iter()
+        .position(|mode| *mode == current)
+        .unwrap_or(0);
+    app.mode_menu = Some(ModeMenuState {
+        selected,
+        original: current,
+    });
+}
+
+fn handle_mode_menu_key(
+    key: KeyEvent,
+    app: &mut App,
+    persist: impl FnOnce(&str) -> Result<(), String>,
+) {
+    let len = config::VisualizerMode::options().len();
+    match key.code {
+        KeyCode::Up | KeyCode::Down => {
+            let Some(menu) = app.mode_menu.as_mut() else {
+                return;
+            };
+            let delta = if matches!(key.code, KeyCode::Up) { -1 } else { 1 };
+            menu.selected = move_selection(menu.selected, delta, len);
+            let mode = config::VisualizerMode::options()[menu.selected];
+            // Previsualización en vivo: cambia el modo sin persistir. En T1
+            // todos los modos dibujan las barras, así que el fondo no cambia
+            // hasta T2–T5; el estado activo sí sigue al cursor.
+            config::preview_visualizer_mode(mode);
+        }
+        KeyCode::Enter => {
+            let Some(menu) = app.mode_menu.take() else {
+                return;
+            };
+            let mode = config::VisualizerMode::options()[menu.selected];
+            // Aplica primero (queda en la sesión aunque falle el guardado)
+            // y recién después persiste; un fallo solo deja el aviso.
+            config::activate_visualizer_mode(mode);
+            if let Err(err) = persist(mode.as_str()) {
+                app.error = Some(err);
+            }
+        }
+        KeyCode::Esc => {
+            let Some(menu) = app.mode_menu.take() else {
+                return;
+            };
+            // Restaura el modo con el que se abrió.
+            config::activate_visualizer_mode(menu.original);
+        }
+        _ => {}
+    }
+}
+
 // --- Panel de configuración (T1: shell) -------------------------------------
 
 /// Aplica la captura del mouse en la terminal en el momento (efecto
@@ -1520,8 +1602,9 @@ fn handle_settings_panel_key(
             let delta = if matches!(key.code, KeyCode::Up) { -1 } else { 1 };
             panel.selected = move_selection(panel.selected, delta, SETTINGS_ROWS.len());
         }
-        // T2/T3/T4: Enter en «Temas» abre el ThemeMenuState existente como
-        // sub-modal, Enter en «Bandas» abre el selector de estilos (el
+        // T2/T3/T4 + T1 modos-visualizador: Enter en «Temas» abre el
+        // ThemeMenuState existente como sub-modal, Enter en «Bandas» abre el
+        // selector de estilos, Enter en «Modo» abre el selector de modos (el
         // panel sigue abierto debajo; el dispatch prioriza al sub-modal y
         // su Enter/Esc vuelven al panel) y Enter en «Mouse» alterna la
         // captura en el momento + persiste (el panel sigue abierto).
@@ -1536,6 +1619,8 @@ fn handle_settings_panel_key(
                 toggle_mouse(app, persist_mouse);
             } else if selected == 2 {
                 open_bands_menu(app);
+            } else if selected == 3 {
+                open_mode_menu(app);
             }
         }
         // Un solo Esc cierra el panel; como no toca la guarda de salida, el
@@ -1595,6 +1680,57 @@ fn render_bands_menu(frame: &mut Frame<'_>, menu: &BandsMenuState) {
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
     frame.render_widget(Paragraph::new(bands_menu_lines(menu)), inner);
+}
+
+/// Filas del sub-modal: una por modo; ● marca el modo activo al abrir y
+/// la selección va resaltada como en el menú de temas.
+fn mode_menu_lines(menu: &ModeMenuState) -> Vec<Line<'static>> {
+    let colors = theme(); // snapshot coherente para todas las filas
+    config::VisualizerMode::options()
+        .iter()
+        .enumerate()
+        .map(|(i, mode)| {
+            let marker = if *mode == menu.original { "● " } else { "  " };
+            let row_style = if i == menu.selected {
+                Style::default()
+                    .bg(colors.select_bg)
+                    .fg(colors.accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(colors.text)
+            };
+            Line::from(Span::styled(
+                format!(" {marker}{} ", mode.as_str()),
+                row_style,
+            ))
+        })
+        .collect()
+}
+
+/// Modal centrado del selector de modo (T1 modos-visualizador), mismo estilo
+/// que el de bandas.
+fn render_mode_menu(frame: &mut Frame<'_>, menu: &ModeMenuState) {
+    let area = frame.area();
+    let width = 44.min(area.width.saturating_sub(4)).max(24);
+    let height = (config::VisualizerMode::options().len() as u16 + 2)
+        .min(area.height.saturating_sub(2))
+        .max(3);
+
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let rect = Rect::new(x, y, width, height);
+
+    frame.render_widget(Clear, rect);
+
+    let block = Block::bordered()
+        .border_style(Style::default().fg(theme().accent))
+        .title(Span::styled(
+            " Modo ",
+            Style::default().fg(theme().accent).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    frame.render_widget(Paragraph::new(mode_menu_lines(menu)), inner);
 }
 
 /// Filas del modal: una por tema builtin; ● marca el tema activo al abrir y
@@ -2056,6 +2192,12 @@ fn render(frame: &mut Frame<'_>, app: &App, engine: &AudioEngine) {
     // El sub-modal de bandas (T3) va encima del panel.
     if let Some(menu) = &app.bands_menu {
         render_bands_menu(frame, menu);
+    }
+
+    // El sub-modal de modo (T1 modos-visualizador) va encima del panel, como
+    // el de bandas (nunca están abiertos los dos a la vez).
+    if let Some(menu) = &app.mode_menu {
+        render_mode_menu(frame, menu);
     }
 
     // El sub-modal de temas (T2) va encima del panel: se dibuja último.
@@ -3204,7 +3346,35 @@ fn render_visualizer(frame: &mut Frame<'_>, area: Rect, bands: &[f32; NUM_BANDS]
         config::effective_visualizer_style(),
         config::VisualizerStyle::Ascii
     );
-    paint_bands(frame.buffer_mut(), inner, bands, &theme(), ascii);
+    // T1 modos-visualizador: el dispatch por modo existe pero cae a las
+    // barras para los 6 modos; `barras` recorre el path actual byte-a-byte
+    // idéntico (`paint_bands`, sin tocar).
+    match resolve_visualizer_paint(config::active_visualizer_mode()) {
+        VisualizerPaint::Bars => {
+            paint_bands(frame.buffer_mut(), inner, bands, &theme(), ascii)
+        }
+    }
+}
+
+/// Destino del dispatch de render por modo (T1 modos-visualizador): hoy un
+/// solo pintor real; T2–T5 agregan variantes sin tocar el fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VisualizerPaint {
+    Bars,
+}
+
+/// Dispatch puro del modo al pintor: en T1 TODOS los modos caen a las barras
+/// (fallback explícito y temporal hasta T2–T5, que implementan su render y
+/// reescriben este match junto con `visualizer_paint_falls_back_to_bars_in_t1`).
+fn resolve_visualizer_paint(mode: config::VisualizerMode) -> VisualizerPaint {
+    match mode {
+        config::VisualizerMode::Barras
+        | config::VisualizerMode::Onda
+        | config::VisualizerMode::Espejo
+        | config::VisualizerMode::Caida
+        | config::VisualizerMode::Vu
+        | config::VisualizerMode::Circular => VisualizerPaint::Bars,
+    }
 }
 
 /// Pinta las 32 barras dentro del área interior del bloque, sin widgets.
@@ -3371,11 +3541,19 @@ fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
         )];
     }
 
-    // Panel de configuración (T2/T3/T4): Enter abre el sub-modal de Temas en
-    // la primera fila y el de Bandas en la tercera; en «Mouse» alterna la
-    // captura en vivo (T5: el pie dice `abrir/alternar` por eso). Los `·`
-    // son tramos sueltos entre chips: el parser de chips separa por tres
-    // espacios, así todos los atajos siguen clickeables.
+    // Selector de modo (T1 modos-visualizador): mismo patrón que el de bandas.
+    if app.mode_menu.is_some() {
+        return vec![Line::from(
+            " ↑/↓: previsualizar modo   ·   Enter: guardar   ·   Esc: cancelar ",
+        )];
+    }
+
+    // Panel de configuración (T2/T3/T4 + T1 modos-visualizador): Enter abre
+    // el sub-modal de Temas en la primera fila, el de Bandas en la tercera y
+    // el de Modo en la cuarta; en «Mouse» alterna la captura en vivo (T5: el
+    // pie dice `abrir/alternar` por eso). Los `·` son tramos sueltos entre
+    // chips: el parser de chips separa por tres espacios, así todos los
+    // atajos siguen clickeables.
     if app.settings_panel.is_some() {
         return vec![Line::from(
             " ↑/↓: mover   ·   Enter: abrir/alternar   ·   Esc: cerrar ",
@@ -3842,6 +4020,7 @@ mod tests {
             history_path: Some(test_temp_history_path()),
             theme_menu: None,
             bands_menu: None,
+            mode_menu: None,
             settings_panel: None,
             // Los tests existentes asumen captura habilitada (clics que
             // actúan, guards de modal que frenan lo demás): default
@@ -5286,9 +5465,10 @@ mod tests {
         handle_settings_panel_key(theme_menu_key(KeyCode::Down), &mut app, |_| Ok(()));
         handle_settings_panel_key(theme_menu_key(KeyCode::Down), &mut app, |_| Ok(()));
         handle_settings_panel_key(theme_menu_key(KeyCode::Down), &mut app, |_| Ok(()));
-        assert_eq!(selected(&app), 2, "↓ frena en la última fila sin envolver");
+        handle_settings_panel_key(theme_menu_key(KeyCode::Down), &mut app, |_| Ok(()));
+        assert_eq!(selected(&app), 3, "↓ frena en la última fila sin envolver");
         handle_settings_panel_key(theme_menu_key(KeyCode::Up), &mut app, |_| Ok(()));
-        assert_eq!(selected(&app), 1, "↑ vuelve una fila");
+        assert_eq!(selected(&app), 2, "↑ vuelve una fila");
     }
 
     // T4 reemplaza el candado NO-OP de T2 (`settings_enter_is_noop_...`):
@@ -5314,12 +5494,16 @@ mod tests {
     }
 
     #[test]
-    fn settings_panel_lists_the_three_fixed_rows_with_highlight() {
-        assert_eq!(SETTINGS_ROWS, ["Temas", "Mouse", "Bandas"], "filas fijas de T1");
+    fn settings_panel_lists_the_four_fixed_rows_with_highlight() {
+        assert_eq!(
+            SETTINGS_ROWS,
+            ["Temas", "Mouse", "Bandas", "Modo"],
+            "filas fijas de T1 (+ Modo al final, sin reordenar)"
+        );
         let panel = SettingsPanelState { selected: 1 };
         let lines = settings_panel_lines(&panel, true);
         let texts: Vec<String> = lines.iter().map(line_text).collect();
-        assert_eq!(texts.len(), 3, "una fila por sección: {texts:?}");
+        assert_eq!(texts.len(), 4, "una fila por sección: {texts:?}");
         for row in SETTINGS_ROWS {
             assert!(
                 texts.iter().any(|t| t.contains(row)),
@@ -5567,7 +5751,7 @@ mod tests {
             off.iter().any(|t| t.contains("Mouse: no")),
             "apagado se lee «Mouse: no»: {off:?}"
         );
-        assert_eq!(on.len(), 3, "siguen siendo 3 filas: {on:?}");
+        assert_eq!(on.len(), 4, "siguen siendo 4 filas: {on:?}");
     }
 
     #[test]
@@ -5614,6 +5798,7 @@ mod tests {
             app.url_input.is_none()
                 && app.theme_menu.is_none()
                 && app.bands_menu.is_none()
+                && app.mode_menu.is_none()
                 && app.settings_panel.is_none(),
             "sin modales abiertos"
         );
@@ -5953,6 +6138,220 @@ mod tests {
             joined.contains("guardar"),
             "el pie del sub-modal explica Enter: {joined}"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // T1 (modos-visualizador): selector de Modo dentro del panel + fallback a
+    // barras
+    // -------------------------------------------------------------------------
+
+    static MODE_MENU_TEST_LOCK: std::sync::Mutex<()> =
+        std::sync::Mutex::new(());
+
+    struct ModeMenuTestGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        mode: config::VisualizerMode,
+    }
+
+    impl Drop for ModeMenuTestGuard {
+        fn drop(&mut self) {
+            config::activate_visualizer_mode(self.mode);
+        }
+    }
+
+    /// Serializa los tests que mutan el modo activo global y lo restaura al
+    /// salir (incluso si el test falla).
+    fn mode_menu_test_setup() -> ModeMenuTestGuard {
+        let lock = MODE_MENU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        ModeMenuTestGuard {
+            _lock: lock,
+            mode: config::active_visualizer_mode(),
+        }
+    }
+
+    #[test]
+    fn settings_enter_on_mode_opens_mode_submodal_keeping_panel() {
+        let _setup = mode_menu_test_setup();
+        let mut app = test_app();
+        open_settings_panel(&mut app);
+        app.settings_panel.as_mut().expect("abierto").selected = 3;
+        handle_settings_panel_key(theme_menu_key(KeyCode::Enter), &mut app, |_| Ok(()));
+        assert!(
+            app.settings_panel.is_some(),
+            "el panel sigue abierto debajo del sub-modal"
+        );
+        assert!(
+            app.mode_menu.is_some(),
+            "Enter en Modo abre el selector de modos"
+        );
+    }
+
+    #[test]
+    fn mode_submodal_navigation_clamps_and_previews_live() {
+        let _setup = mode_menu_test_setup();
+        config::activate_visualizer_mode(config::VisualizerMode::Barras);
+        let mut app = test_app();
+        open_settings_panel(&mut app);
+        open_mode_menu(&mut app);
+        let selected = |app: &App| {
+            app.mode_menu.as_ref().expect("sub-modal abierto").selected
+        };
+        assert_eq!(selected(&app), 0, "arranca en el modo activo (barras)");
+
+        // Sin envoltura, como los otros selectores.
+        handle_mode_menu_key(theme_menu_key(KeyCode::Up), &mut app, |_| Ok(()));
+        assert_eq!(selected(&app), 0, "↑ en la primera fila no se mueve");
+        for _ in 0..7 {
+            handle_mode_menu_key(theme_menu_key(KeyCode::Down), &mut app, |_| Ok(()));
+        }
+        assert_eq!(selected(&app), 5, "↓ frena en circular sin envolver");
+
+        // Navegar previsualiza en vivo: el modo activo sigue al cursor.
+        assert_eq!(
+            config::active_visualizer_mode(),
+            config::VisualizerMode::Circular
+        );
+    }
+
+    #[test]
+    fn dispatch_routes_to_mode_submodal_when_open() {
+        let _setup = mode_menu_test_setup();
+        let Some(mut engine) = engine_or_skip() else { return };
+        config::activate_visualizer_mode(config::VisualizerMode::Barras);
+        let mut app = test_app();
+        app.mode = Mode::Player;
+        open_settings_panel(&mut app);
+        app.settings_panel.as_mut().expect("abierto").selected = 3;
+        handle_settings_panel_key(theme_menu_key(KeyCode::Enter), &mut app, |_| Ok(()));
+
+        handle_key(theme_menu_key(KeyCode::Down), &mut app, &mut engine);
+
+        assert_eq!(
+            app.mode_menu.as_ref().expect("sigue abierto").selected,
+            1,
+            "con el sub-modal abierto las teclas van al sub-modal, no al panel"
+        );
+        assert_eq!(
+            app.settings_panel.as_ref().expect("panel debajo").selected,
+            3,
+            "el panel de abajo no se mueve"
+        );
+    }
+
+    #[test]
+    fn mode_submodal_enter_saves_and_returns_to_panel() {
+        let _setup = mode_menu_test_setup();
+        let path = std::env::temp_dir()
+            .join(format!("mp3tui_t1_mode_enter_{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        config::activate_visualizer_mode(config::VisualizerMode::Barras);
+        let mut app = test_app();
+        open_settings_panel(&mut app);
+        open_mode_menu(&mut app);
+        handle_mode_menu_key(theme_menu_key(KeyCode::Down), &mut app, |_| Ok(()));
+        handle_mode_menu_key(theme_menu_key(KeyCode::Enter), &mut app, |mode| {
+            config::persist_visualizer_mode_at(&path, mode)
+        });
+        assert!(app.mode_menu.is_none(), "Enter cierra el sub-modal");
+        assert!(
+            app.settings_panel.is_some(),
+            "pero VUELVE al panel, no lo cierra"
+        );
+        assert_eq!(
+            config::active_visualizer_mode(),
+            config::VisualizerMode::Onda,
+            "el modo queda aplicado"
+        );
+        let text = std::fs::read_to_string(&path).expect("modo persistido");
+        assert!(
+            text.contains("mode = \"onda\""),
+            "el modo se persiste como hoy: {text:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn mode_submodal_esc_restores_and_returns_to_panel() {
+        let _setup = mode_menu_test_setup();
+        config::activate_visualizer_mode(config::VisualizerMode::Barras);
+        let mut app = test_app();
+        open_settings_panel(&mut app);
+        open_mode_menu(&mut app);
+        // Previsualiza otro modo moviéndose dentro del sub-modal.
+        handle_mode_menu_key(theme_menu_key(KeyCode::Down), &mut app, |_| Ok(()));
+        assert_eq!(
+            config::active_visualizer_mode(),
+            config::VisualizerMode::Onda,
+            "navegar previsualiza"
+        );
+        handle_mode_menu_key(theme_menu_key(KeyCode::Esc), &mut app, |_| Ok(()));
+        assert!(app.mode_menu.is_none(), "Esc cierra el sub-modal");
+        assert!(
+            app.settings_panel.is_some(),
+            "y VUELVE al panel, no lo cierra"
+        );
+        assert_eq!(
+            config::active_visualizer_mode(),
+            config::VisualizerMode::Barras,
+            "Esc restaura el modo previo"
+        );
+    }
+
+    #[test]
+    fn mouse_is_inert_under_mode_submodal() {
+        // El guard inerte cubre el panel y el sub-modal: se verifica.
+        let _setup = mode_menu_test_setup();
+        let Some(mut engine) = engine_or_skip() else { return };
+        let mut app = test_app();
+        app.mode = Mode::Player;
+        app.has_player = true;
+        *app.hit.borrow_mut() = sample_hit();
+        open_settings_panel(&mut app);
+        open_mode_menu(&mut app);
+        handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 30, 5),
+            &mut app,
+            &mut engine,
+        );
+        assert_eq!(engine.volume(), 0.0, "el clic no atraviesa el sub-modal");
+        assert_eq!(app.drag, None);
+    }
+
+    #[test]
+    fn mode_footer_shows_preview_hints() {
+        let _setup = mode_menu_test_setup();
+        let mut app = test_app();
+        open_settings_panel(&mut app);
+        open_mode_menu(&mut app);
+        let joined: String = footer_lines(&app, false)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            joined.contains("previsualizar"),
+            "el pie del sub-modal explica el preview: {joined}"
+        );
+        assert!(
+            joined.contains("guardar"),
+            "el pie del sub-modal explica Enter: {joined}"
+        );
+    }
+
+    #[test]
+    fn visualizer_paint_falls_back_to_bars_in_t1() {
+        // T1: dispatch explícito y temporal — los 6 modos caen al render de
+        // barras (T2–T5 implementan su pintor y este test se reescribe).
+        for mode in config::VisualizerMode::options() {
+            assert_eq!(
+                resolve_visualizer_paint(mode),
+                VisualizerPaint::Bars,
+                "fallback a barras para {}",
+                mode.as_str()
+            );
+        }
     }
 
     #[test]

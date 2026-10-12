@@ -57,6 +57,10 @@ pub struct Config {
     pub mouse: bool,
     /// `[visualizer] style`: ascii, unicode o auto (según `WT_SESSION`).
     pub visualizer_style: VisualizerStyle,
+    /// `[visualizer] mode`: barras (default), onda, espejo, caida, vu o
+    /// circular (T1 modos-visualizador: solo barras dibuja distinto; el resto
+    /// cae al render de barras hasta T2–T5).
+    pub visualizer_mode: VisualizerMode,
     /// Avisos de la carga: campos inválidos, claves desconocidas o archivo
     /// ilegible. Vacío cuando todo (o el archivo mismo) está bien.
     pub warnings: Vec<String>,
@@ -72,6 +76,7 @@ impl Default for Config {
             library: LibraryConfig::default(),
             mouse: true,
             visualizer_style: VisualizerStyle::default(),
+            visualizer_mode: VisualizerMode::default(),
             warnings: Vec::new(),
         }
     }
@@ -1523,6 +1528,261 @@ pub fn persist_visualizer_style(style: &str) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
+// Modo del visualizador (T1 modos-visualizador)
+// ---------------------------------------------------------------------------
+
+/// Modo de dibujo del visualizador (`[visualizer] mode`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VisualizerMode {
+    /// Las 32 barras estilo cava (comportamiento actual).
+    #[default]
+    Barras,
+    /// Osciloscopio con muestras crudas del tap (T2).
+    Onda,
+    /// 32 bandas arriba+abajo desde el centro (T3).
+    Espejo,
+    /// Peak-hold + caída por segmentos (T3).
+    Caida,
+    /// Medidor RMS, mono como el tap actual (T4).
+    Vu,
+    /// Plot polar grueso de las 32 bandas (T5).
+    Circular,
+}
+
+impl VisualizerMode {
+    /// Valor que `[visualizer] mode` acepta en config.toml.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Barras => "barras",
+            Self::Onda => "onda",
+            Self::Espejo => "espejo",
+            Self::Caida => "caida",
+            Self::Vu => "vu",
+            Self::Circular => "circular",
+        }
+    }
+
+    /// Los 6 valores en orden estable de menú (sub-selector de Modo, T1).
+    pub fn options() -> [Self; 6] {
+        [
+            Self::Barras,
+            Self::Onda,
+            Self::Espejo,
+            Self::Caida,
+            Self::Vu,
+            Self::Circular,
+        ]
+    }
+}
+
+/// Modo configurado que cambia en caliente al previsualizar/aplicar desde
+/// el selector de Modo. Misma receta que la celda del estilo: un solo punto
+/// de acceso; el dispatch de render lo lee por frame.
+static ACTIVE_VISUALIZER_MODE: OnceLock<RwLock<VisualizerMode>> =
+    OnceLock::new();
+
+fn visualizer_mode_cell() -> &'static RwLock<VisualizerMode> {
+    ACTIVE_VISUALIZER_MODE
+        .get_or_init(|| RwLock::new(config().visualizer_mode))
+}
+
+/// Modo configurado activo (el aplicado; la previsualización lo cambia en
+/// vivo y `Esc` lo restaura).
+pub fn active_visualizer_mode() -> VisualizerMode {
+    *visualizer_mode_cell()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Previsualización (↑/↓ del selector): cambia el modo en vivo.
+pub fn preview_visualizer_mode(mode: VisualizerMode) {
+    *visualizer_mode_cell()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = mode;
+}
+
+/// Aplica el modo (Enter del selector, después de persistir).
+pub fn activate_visualizer_mode(mode: VisualizerMode) {
+    preview_visualizer_mode(mode);
+}
+
+// ---------------------------------------------------------------------------
+// Persistencia del modo (T1 modos-visualizador, espejo de la del estilo)
+// ---------------------------------------------------------------------------
+
+/// Actualiza (o inserta) solo la clave `mode` dentro de `[visualizer]` de un
+/// texto TOML, preservando el resto — comentarios, otras claves, otras
+/// secciones y los finales de línea CRLF. Sin sección `[visualizer]`, la
+/// agrega al final.
+pub fn update_visualizer_mode(text: &str, mode: &str) -> String {
+    let crlf = text.contains("\r\n");
+    let eol = if crlf { "\r\n" } else { "\n" };
+
+    // Encabezado de sección: `[sección]` (+ comentario opcional). Un
+    // comentario que menciona `[visualizer]` no abre sección.
+    fn header_section(line: &str) -> Option<&str> {
+        let t = line.trim_start();
+        let rest = t.strip_prefix('[')?;
+        let end = rest.find(']')?;
+        let after = rest[end + 1..].trim();
+        if after.is_empty() || after.starts_with('#') {
+            Some(rest[..end].trim())
+        } else {
+            None
+        }
+    }
+
+    // Cola de comentario de una línea `clave = valor …` respetando comillas.
+    fn line_comment(after_equals: &str) -> &str {
+        let mut quote: Option<char> = None;
+        for (i, c) in after_equals.char_indices() {
+            match quote {
+                Some(q) if c == q => quote = None,
+                Some(_) => {}
+                None => match c {
+                    '"' | '\'' => quote = Some(c),
+                    '#' => return after_equals[i..].trim_end(),
+                    _ => {}
+                },
+            }
+        }
+        ""
+    }
+
+    let mut lines: Vec<String> =
+        text.split('\n').map(str::to_string).collect();
+
+    let Some(start) =
+        lines.iter().position(|l| header_section(l) == Some("visualizer"))
+    else {
+        // Sin sección: agregarla al final, sin tocar lo existente.
+        let mut out = text.to_string();
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push_str(eol);
+        }
+        out.push_str(&format!("[visualizer]{eol}mode = \"{mode}\"{eol}"));
+        return out;
+    };
+
+    // Fin de la sección: la próxima cabecera (de cualquier sección).
+    let end = lines
+        .iter()
+        .skip(start + 1)
+        .position(|l| header_section(l).is_some())
+        .map(|offset| start + 1 + offset)
+        .unwrap_or(lines.len());
+
+    // ¿Ya hay una clave `mode` dentro de la sección?
+    for i in (start + 1)..end {
+        let line = &lines[i];
+        let t = line.trim_start();
+        if t.starts_with('#') {
+            continue;
+        }
+        let Some(rest) = t.strip_prefix("mode") else {
+            continue;
+        };
+        let Some(after) = rest.trim_start().strip_prefix('=') else {
+            // «modes», «mode2», etc.: no es la clave.
+            continue;
+        };
+        let indent = &line[..line.len() - t.len()];
+        let comment = line_comment(after);
+        let mut new_line = format!("{indent}mode = \"{mode}\"");
+        if !comment.is_empty() {
+            new_line.push(' ');
+            new_line.push_str(comment);
+        }
+        if line.ends_with('\r') {
+            new_line.push('\r');
+        }
+        lines[i] = new_line;
+        return lines.join("\n");
+    }
+
+    // Clave ausente: insertarla justo debajo del encabezado.
+    let mut inserted = format!("mode = \"{mode}\"");
+    if crlf {
+        inserted.push('\r');
+    }
+    lines.insert(start + 1, inserted);
+    lines.join("\n")
+}
+
+/// Escribe el `mode` en `path` de forma atómica (archivo temporal +
+/// rename). Crea el archivo (y su directorio) si no existe. Nunca toca la
+/// config real: las pruebas usan rutas temporales vía esta función.
+pub(crate) fn persist_visualizer_mode_at(
+    path: &Path,
+    mode: &str,
+) -> Result<(), String> {
+    let existing = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            String::new()
+        }
+        Err(err) => {
+            return Err(format!("no se pudo leer '{}': {err}", path.display()));
+        }
+    };
+    let updated = update_visualizer_mode(&existing, mode);
+
+    // Igual que con el estilo: ante formas válidas que el editor por líneas no
+    // reconoce (tabla inline, claves con punto o entre comillas) podría
+    // duplicar claves; se valida el resultado y, si no queda TOML válido con
+    // el modo pedido, no se toca el archivo.
+    let persisted = updated
+        .parse::<toml::Table>()
+        .ok()
+        .and_then(|table| {
+            table
+                .get("visualizer")?
+                .get("mode")?
+                .as_str()
+                .map(|saved| saved == mode)
+        })
+        .unwrap_or(false);
+    if !persisted {
+        return Err(format!(
+            "no se pudo guardar el modo sin romper '{}'; agregá `mode = \"{mode}\"` en [visualizer] a mano",
+            path.display()
+        ));
+    }
+
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && let Err(err) = fs::create_dir_all(parent)
+    {
+        return Err(format!("no se pudo guardar el modo: {err}"));
+    }
+
+    let mut tmp_os = path.as_os_str().to_os_string();
+    tmp_os.push(".tmp");
+    let tmp = PathBuf::from(tmp_os);
+    if let Err(err) = fs::write(&tmp, updated.as_bytes()) {
+        return Err(format!("no se pudo guardar el modo: {err}"));
+    }
+    match fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let _ = fs::remove_file(&tmp);
+            Err(format!("no se pudo guardar el modo: {err}"))
+        }
+    }
+}
+
+/// Persiste el modo en la config del usuario (ruta por defecto o
+/// `MP3TUI_CONFIG`).
+pub fn persist_visualizer_mode(mode: &str) -> Result<(), String> {
+    let Some((path, _)) = resolve_path() else {
+        return Err(
+            "no se pudo guardar el modo: sin ruta de config".to_string(),
+        );
+    };
+    persist_visualizer_mode_at(&path, mode)
+}
+
+// ---------------------------------------------------------------------------
 // Persistencia del toggle de mouse (T4, espejo de la del tema / bandas)
 // ---------------------------------------------------------------------------
 
@@ -1699,8 +1959,9 @@ pub fn persist_mouse_enabled(enabled: bool) -> Result<(), String> {
     persist_mouse_enabled_at(&path, enabled)
 }
 
-/// `[visualizer] style`: auto (default), ascii o unicode. Merge campo a campo
-/// como el resto: lo inválido avisa y cae al default sin tocar lo demás.
+/// `[visualizer]`: `style` (auto/ascii/unicode) y `mode`
+/// (barras/onda/espejo/caida/vu/circular). Merge campo a campo como el resto:
+/// lo inválido avisa y cae al default sin tocar lo demás.
 fn parse_visualizer(
     section: &toml::Table,
     config: &mut Config,
@@ -1725,6 +1986,30 @@ fn parse_visualizer(
                 None => warnings.push(
                     "[visualizer] style debe ser un texto entre comillas, \
                      p. ej. style = \"ascii\"; se usa «auto»"
+                        .to_string(),
+                ),
+            },
+            "mode" => match value.as_str() {
+                Some(raw) => {
+                    match raw.trim().to_ascii_lowercase().as_str() {
+                        "barras" => config.visualizer_mode = VisualizerMode::Barras,
+                        "onda" => config.visualizer_mode = VisualizerMode::Onda,
+                        "espejo" => config.visualizer_mode = VisualizerMode::Espejo,
+                        "caida" => config.visualizer_mode = VisualizerMode::Caida,
+                        "vu" => config.visualizer_mode = VisualizerMode::Vu,
+                        "circular" => {
+                            config.visualizer_mode = VisualizerMode::Circular
+                        }
+                        _ => warnings.push(format!(
+                            "[visualizer] mode «{raw}» no reconocido \
+                             (válidos: barras, onda, espejo, caida, vu, circular); \
+                             se usa «barras»"
+                        )),
+                    }
+                }
+                None => warnings.push(
+                    "[visualizer] mode debe ser un texto entre comillas, \
+                     p. ej. mode = \"barras\"; se usa «barras»"
                         .to_string(),
                 ),
             },
@@ -2963,6 +3248,219 @@ zoom = 2");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let err = persist_mouse_enabled_at(&dir, true)
+            .expect_err("un directorio no es escribible");
+        assert!(!err.is_empty(), "mensaje de error no vacío");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // -------------------------------------------------------------------------
+    // T1 (modos-visualizador): `[visualizer] mode` — opciones, parseo,
+    // reescritura y persistencia
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn visualizer_mode_defaults_to_barras_and_parses_all_values() {
+        assert_eq!(parse("").visualizer_mode, VisualizerMode::Barras);
+        for (raw, expected) in [
+            ("barras", VisualizerMode::Barras),
+            ("onda", VisualizerMode::Onda),
+            ("espejo", VisualizerMode::Espejo),
+            ("caida", VisualizerMode::Caida),
+            ("vu", VisualizerMode::Vu),
+            ("circular", VisualizerMode::Circular),
+        ] {
+            let config = parse(&format!("[visualizer]\nmode = \"{raw}\"\n"));
+            assert_eq!(config.visualizer_mode, expected, "mode={raw}");
+            assert!(config.warnings.is_empty(), "{:?}", config.warnings);
+        }
+    }
+
+    #[test]
+    fn visualizer_mode_invalid_or_unknown_warns_and_keeps_default() {
+        let bad = parse("[visualizer]\nmode = \"cascada\"");
+        assert_eq!(bad.visualizer_mode, VisualizerMode::Barras);
+        assert_eq!(bad.warnings.len(), 1, "{:?}", bad.warnings);
+        assert!(bad.warnings[0].contains("mode"), "{:?}", bad.warnings);
+
+        let not_a_string = parse("[visualizer]\nmode = 42");
+        assert_eq!(
+            not_a_string.visualizer_mode,
+            VisualizerMode::Barras
+        );
+        assert_eq!(not_a_string.warnings.len(), 1, "{:?}", not_a_string.warnings);
+
+        let unknown = parse("[visualizer]\ntempo = 2");
+        assert_eq!(unknown.visualizer_mode, VisualizerMode::Barras);
+        assert_eq!(unknown.warnings.len(), 1, "{:?}", unknown.warnings);
+        assert!(unknown.warnings[0].contains("tempo"), "{:?}", unknown.warnings);
+    }
+
+    #[test]
+    fn visualizer_mode_does_not_drag_other_fields() {
+        let config =
+            parse("[visualizer]\nstyle = \"ascii\"\nmode = \"espejo\"\n[ui]\nmouse = false\n");
+        assert_eq!(config.visualizer_style, VisualizerStyle::Ascii);
+        assert_eq!(config.visualizer_mode, VisualizerMode::Espejo);
+        assert!(!config.mouse);
+        assert!(config.warnings.is_empty(), "{:?}", config.warnings);
+    }
+
+    #[test]
+    fn visualizer_mode_options_list_six_values_in_stable_menu_order() {
+        assert_eq!(
+            VisualizerMode::options(),
+            [
+                VisualizerMode::Barras,
+                VisualizerMode::Onda,
+                VisualizerMode::Espejo,
+                VisualizerMode::Caida,
+                VisualizerMode::Vu,
+                VisualizerMode::Circular,
+            ],
+            "orden estable del sub-modal: barras, onda, espejo, caida, vu, circular"
+        );
+        assert_eq!(VisualizerMode::Barras.as_str(), "barras");
+        assert_eq!(VisualizerMode::Onda.as_str(), "onda");
+        assert_eq!(VisualizerMode::Espejo.as_str(), "espejo");
+        assert_eq!(VisualizerMode::Caida.as_str(), "caida");
+        assert_eq!(VisualizerMode::Vu.as_str(), "vu");
+        assert_eq!(VisualizerMode::Circular.as_str(), "circular");
+    }
+
+    #[test]
+    fn update_visualizer_mode_creates_section_when_missing() {
+        assert_eq!(
+            update_visualizer_mode("", "onda"),
+            "[visualizer]\nmode = \"onda\"\n",
+            "archivo vacío: crea la sección"
+        );
+
+        let existing = "[library]\nroots = []\n";
+        let out = update_visualizer_mode(existing, "vu");
+        assert!(
+            out.starts_with(existing),
+            "el contenido existente se preserva: {out:?}"
+        );
+        assert!(
+            out.ends_with("[visualizer]\nmode = \"vu\"\n"),
+            "se agrega [visualizer] al final: {out:?}"
+        );
+    }
+
+    #[test]
+    fn update_visualizer_mode_replaces_and_inserts_preserving_comments() {
+        let out = update_visualizer_mode(
+            "[visualizer]\nmode = \"barras\"  # viejo\n",
+            "onda",
+        );
+        assert_eq!(
+            out,
+            "[visualizer]\nmode = \"onda\" # viejo\n",
+            "reemplaza solo el valor y conserva el comentario"
+        );
+
+        // La otra clave de la sección queda intacta: mode se inserta justo
+        // después del encabezado.
+        let out = update_visualizer_mode("[visualizer]\nstyle = \"ascii\"\n", "espejo");
+        assert_eq!(
+            out,
+            "[visualizer]\nmode = \"espejo\"\nstyle = \"ascii\"\n",
+            "inserta mode justo después del encabezado"
+        );
+
+        // Un comentario que menciona [visualizer] no abre una sección.
+        let out = update_visualizer_mode(
+            "# [visualizer]\n[library]\nroots = []\n",
+            "caida",
+        );
+        assert!(
+            out.starts_with("# [visualizer]\n")
+                && out.ends_with("[visualizer]\nmode = \"caida\"\n"),
+            "{out:?}"
+        );
+
+        let crlf = "[visualizer]\r\nmode = \"barras\"\r\n";
+        assert_eq!(
+            update_visualizer_mode(crlf, "circular"),
+            "[visualizer]\r\nmode = \"circular\"\r\n",
+            "reemplazo con CRLF: solo cambia el valor"
+        );
+    }
+
+    #[test]
+    fn persist_visualizer_mode_never_writes_invalid_toml() {
+        // Igual que style: formas válidas de TOML que el editor por líneas
+        // no reconoce → el archivo queda intacto, nunca roto.
+        let cases = [
+            ("inline", "visualizer = { mode = \"barras\" }\n"),
+            ("dotted", "visualizer.mode = \"barras\"\n"),
+            ("quoted", "[visualizer]\n\"mode\" = \"barras\"\n"),
+        ];
+        for (label, original) in cases {
+            let path = std::env::temp_dir().join(format!(
+                "mp3tui_mode_invalid_{label}_{}.toml",
+                std::process::id()
+            ));
+            std::fs::write(&path, original).expect("escribe el original");
+
+            let result = persist_visualizer_mode_at(&path, "onda");
+            let text = std::fs::read_to_string(&path).expect("sigue existiendo");
+            let parsed = text.parse::<toml::Table>();
+            let _ = std::fs::remove_file(&path);
+
+            match result {
+                Ok(()) => {
+                    let table = parsed.unwrap_or_else(|e| {
+                        panic!("{label}: Ok pero dejó TOML inválido: {e}\n{text}")
+                    });
+                    let mode = table
+                        .get("visualizer")
+                        .and_then(|t| t.get("mode"))
+                        .and_then(|n| n.as_str());
+                    assert_eq!(mode, Some("onda"), "{label}: modo guardado");
+                }
+                Err(_) => assert_eq!(text, original, "{label}: archivo intacto si falla"),
+            }
+        }
+    }
+
+    #[test]
+    fn persist_visualizer_mode_at_updates_or_creates_and_reports_errors() {
+        let path = std::env::temp_dir()
+            .join(format!("mp3tui_mode_cfg_{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        // 1. No existe: lo crea con la sección mínima.
+        persist_visualizer_mode_at(&path, "onda").expect("crea el archivo");
+        let text = std::fs::read_to_string(&path).expect("recién creado");
+        assert_eq!(text, "[visualizer]\nmode = \"onda\"\n");
+
+        // 2. Existe: solo cambia mode; comentarios, style y otras secciones
+        //    intactos, sin archivo temporal colgando.
+        let original =
+            "# mío\n[visualizer]\nstyle = \"ascii\"\nmode = \"barras\"\n[ui]\nmouse = false\n";
+        std::fs::write(&path, original).unwrap();
+        persist_visualizer_mode_at(&path, "espejo").expect("actualiza");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            text,
+            "# mío\n[visualizer]\nstyle = \"ascii\"\nmode = \"espejo\"\n[ui]\nmouse = false\n"
+        );
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        assert!(
+            !std::path::PathBuf::from(&tmp).exists(),
+            "sin archivo temporal colgando"
+        );
+
+        // 3. Destino no escribible (directorio): error corto, sin pánico.
+        let dir = std::env::temp_dir()
+            .join(format!("mp3tui_mode_dir_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = persist_visualizer_mode_at(&dir, "onda")
             .expect_err("un directorio no es escribible");
         assert!(!err.is_empty(), "mensaje de error no vacío");
 

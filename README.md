@@ -51,7 +51,7 @@ Windows.
 | `r` | Modo repetir (`repeat` en el pie: off → una → todas) |
 | `[` / `]` | Velocidad (`vel` en el pie) 0.50x – 2.00x (pasos de 0.25x) |
 | `u` | URL: diálogo para reproducir URL o archivo |
-| `Ctrl+P` | Config: panel de configuración (Temas/Mouse/Bandas) |
+| `Ctrl+P` | Config: panel de configuración (Temas/Mouse/Bandas/Modo) |
 | `Tab` / `Ctrl+Tab` | Biblioteca (en el pie: `biblio`): abrir o cerrar el panel del explorador |
 | `b` | Buscar: abre el panel del explorador con la búsqueda |
 | `Esc` `Esc` | Salir: el primer `Esc` muestra «Apretá Esc de nuevo para salir» y el segundo, dentro de 2 segundos, cierra la app (otra tecla lo cancela) |
@@ -139,7 +139,7 @@ Con el mouse activado (por defecto):
 - **Footer de atajos:** cada atajo es un chip (la tecla resaltada y su acción);
   clickearlo hace lo mismo que apretar esa tecla.
 - Con el prompt de URL, el panel de configuración o sus submenús
-  (temas/bandas) abiertos, el mouse no actúa sobre lo que queda debajo.
+  (temas/bandas/modo) abiertos, el mouse no actúa sobre lo que queda debajo.
 
 La captura del mouse reemplaza la selección de texto nativa de la terminal (en
 Windows Terminal se sigue pudiendo seleccionar con `Shift` + arrastre). Para
@@ -179,6 +179,13 @@ aplica el estilo y guarda su `style` en la sección `[visualizer]` de este
 archivo (creándola si no existe) y vuelve al panel, y `Esc` cancela, restaura
 el estilo anterior y vuelve al panel.
 
+Desde el panel (`Ctrl+P` → `Modo`) se abre el selector de modo: `↑`/`↓`
+previsualizan cada modo en vivo, `Enter` aplica el modo y guarda su `mode`
+en la sección `[visualizer]` de este archivo (creándola si no existe) y
+vuelve al panel, y `Esc` cancela, restaura el modo anterior y vuelve al
+panel. En T1 todos los modos dibujan las barras (fallback temporal hasta
+T2–T5); `barras` es el comportamiento actual.
+
 Desde el panel (`Ctrl+P` → `Mouse`) `Enter` alterna la captura del mouse en
 el momento (la fila muestra `Mouse: sí` / `Mouse: no`) y guarda su valor en
 la clave `mouse` de la sección `[ui]` de este archivo (creándola si no
@@ -191,8 +198,8 @@ Espeja el pie del panel:
 
 | Tecla | Acción |
 | --- | --- |
-| `↑` / `↓` | Mover la selección entre Temas / Mouse / Bandas |
-| `Enter` | Abrir el submenú (Temas/Bandas) o alternar (Mouse) |
+| `↑` / `↓` | Mover la selección entre Temas / Mouse / Bandas / Modo |
+| `Enter` | Abrir el submenú (Temas/Bandas/Modo) o alternar (Mouse) |
 | `Esc` | Cerrar el panel |
 
 ```toml
@@ -236,6 +243,7 @@ roots = ["C:/Musica"]
 
 [visualizer]
 style = "auto" # auto (según la terminal), ascii o unicode
+mode = "barras" # barras (default), onda, espejo, caida, vu o circular
 ```
 
 Notas del comportamiento de la config:
@@ -253,6 +261,10 @@ Notas del comportamiento de la config:
   tenue (para terminales sin unicode, como conhost legacy) y `auto` (default)
   elige solo: unicode con `WT_SESSION` (Windows Terminal), ascii sin ella. Un
   valor inválido avisa y se usa `auto`. El gradiente de color no cambia.
+- `[visualizer] mode` elige el modo del visualizador: `barras` (default, el
+  comportamiento actual), `onda`, `espejo`, `caida`, `vu` o `circular`. Un
+  valor inválido avisa y se usa `barras`. En T1 todos los modos dibujan las
+  barras (fallback temporal hasta T2–T5).
 - Si dos acciones distintas quedan mapeadas a la misma tecla, gana la de
   mayor prioridad en el dispatch y se genera un warning que lo explicita
   (la perdedora vuelve a sus defaults libres).
