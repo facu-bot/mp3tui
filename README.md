@@ -52,9 +52,9 @@ Windows.
 | `[` / `]` | Velocidad 0.50x – 2.00x (pasos de 0.25x) |
 | `u` | Abrir diálogo para reproducir URL o archivo |
 | `t` | Abrir el selector de temas (↑/↓ previsualiza, Enter guarda, Esc cancela) |
-| `b` / `Tab` / `Ctrl+Tab` | Abrir o cerrar el panel del explorador |
-| `/` | Abrir el panel del explorador con la búsqueda |
-| `q` / `Esc` | Salir |
+| `Tab` / `Ctrl+Tab` | Abrir o cerrar el panel del explorador |
+| `b` | Abrir el panel del explorador con la búsqueda |
+| `Esc` `Esc` | Salir: el primer `Esc` muestra «Apretá Esc de nuevo para salir» y el segundo, dentro de 2 segundos, cierra la app (otra tecla lo cancela) |
 
 **Modos de repetir (`r`) al terminar una pista naturalmente:**
 
@@ -90,9 +90,9 @@ audio (arranque sin archivo) el explorador sigue ocupando toda la pantalla.
 | `s` | Aleatorio |
 | `r` | Modo repetir |
 | `t` | Selector de temas |
-| `/` | Búsqueda incremental (vive en el panel) |
-| `Esc` / `Tab` / `Ctrl+Tab` / `b` | Cerrar el panel (el reproductor de fondo queda solo) |
-| `q` | Salir |
+| `b` | Búsqueda incremental (vive en el panel) |
+| `Esc` / `Tab` / `Ctrl+Tab` | Cerrar el panel (el reproductor de fondo queda solo) |
+| `Esc` `Esc` | Salir (con el panel cerrado; el primer `Esc` con el panel abierto lo cierra) |
 
 Mientras el panel está abierto **los atajos de reproducción siguen
 activos**: puedes pausar, hacer seek, cambiar de pista o ajustar la
@@ -105,8 +105,8 @@ El footer de atajos muestra este contexto y se actualiza al abrir/cerrar.
 
 Sin sesión de audio (arranque sin archivo) la lista ocupa toda la pantalla y
 se maneja con las mismas teclas que el panel lateral, con dos diferencias:
-`Esc` / `q` salen de la app (no hay panel que cerrar ni reproductor
-al que volver) y `Enter` pasa al modo reproducción con la pista sonando.
+`Esc` `Esc` sale de la app (no hay panel que cerrar ni reproductor
+al que volver; el primer `Esc` muestra el aviso) y `Enter` pasa al modo reproducción con la pista sonando.
 `Tab` no sale: solo alterna el panel, que sin sesión no hace nada.
 `Ctrl+C` sale siempre, en cualquier modo.
 
@@ -219,7 +219,7 @@ mp3tui permite reproducir música remota directamente desde la terminal o desde 
   - Solo guarda título y enlace original (nunca URLs temporales expirables de YouTube ni audio en disco).
   - Se eliminan credenciales embebidas en la URL (`user:pass@host`); los parámetros de consulta (`query`) se conservan.
   - Aparece en el explorador (`Tab`) arriba de la biblioteca local bajo el grupo `"Agregadas por URL"` con el distintivo `[URL]`.
-  - Se reproducen directamente con `Enter` sin volver a pegar el enlace y se filtran con la búsqueda (`/`).
+  - Se reproducen directamente con `Enter` sin volver a pegar el enlace y se filtran con la búsqueda (`b`).
 - **Navegación de biblioteca:** la reproducción por URL es puntual; los atajos de pista siguiente/anterior (`n`/`p`) y aleatorio (`s`) continúan operando sobre la biblioteca local escaneada. Al terminar una URL remota de forma natural entra la biblioteca local: con repetir **off** suena la primera pista (con aleatorio, la primera del orden mezclado) y al final de la lista el reproductor queda en «Fin de la pista»; con repetir **todas** avanza igual y envuelve; con repetir **una** se repite la misma URL (si es una página se vuelve a resolver con yt-dlp).
 
 ## Limitaciones conocidas

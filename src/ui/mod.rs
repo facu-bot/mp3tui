@@ -10,7 +10,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -267,10 +267,63 @@ struct App {
     pub history_path: Option<PathBuf>,
     /// Menú de temas abierto (T12): `Some` mientras el modal está activo.
     theme_menu: Option<ThemeMenuState>,
+    /// Doble Esc para salir: el primer Esc arma, el segundo sale.
+    quit_guard: QuitGuard,
 }
 
 /// Estado del menú de temas (T12): selección con previsualización en vivo y
 /// el tema con el que se abrió (para el marcador y para restaurar con Esc).
+/// Ventana para confirmar la salida con un segundo Esc.
+const QUIT_CONFIRM_WINDOW: Duration = Duration::from_secs(2);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuitDecision {
+    Arm,
+    Quit,
+}
+
+/// Doble pulsación para salir: el primer «quit» arma la guarda y muestra el
+/// aviso; un segundo dentro de `QUIT_CONFIRM_WINDOW` sale. Cualquier otra tecla
+/// (o el vencimiento de la ventana) la desarma. El reloj llega por parámetro
+/// para poder testear la ventana sin esperar.
+#[derive(Debug, Default)]
+struct QuitGuard {
+    armed_at: Option<Instant>,
+    /// Marca si la tecla que se está procesando pasó por la guarda; si no,
+    /// `handle_key` la desarma al terminar.
+    touched: bool,
+}
+
+impl QuitGuard {
+    fn on_quit_key(&mut self, now: Instant) -> QuitDecision {
+        self.touched = true;
+        if self.is_armed(now) {
+            self.armed_at = None;
+            QuitDecision::Quit
+        } else {
+            self.armed_at = Some(now);
+            QuitDecision::Arm
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed_at = None;
+    }
+
+    fn is_armed(&self, now: Instant) -> bool {
+        self.armed_at
+            .is_some_and(|armed| now.saturating_duration_since(armed) <= QUIT_CONFIRM_WINDOW)
+    }
+}
+
+/// Pedido de salida por teclado: pasa por la guarda de doble Esc. (Ctrl+C
+/// sigue saliendo de inmediato.)
+fn request_quit(app: &mut App) {
+    if app.quit_guard.on_quit_key(Instant::now()) == QuitDecision::Quit {
+        app.should_quit = true;
+    }
+}
+
 struct ThemeMenuState {
     /// Índice en `config::builtin_themes()`.
     selected: usize,
@@ -386,6 +439,7 @@ pub fn run(engine: &mut AudioEngine, start: StartMode) -> io::Result<()> {
         pending_history: None,
         history_path: crate::history::history_path(),
         theme_menu: None,
+        quit_guard: QuitGuard::default(),
     };
 
     if let Some((url, kind)) = start_url_info {
@@ -579,6 +633,14 @@ fn status_of(engine: &AudioEngine) -> Status {
 }
 
 fn handle_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine) {
+    app.quit_guard.touched = false;
+    dispatch_key(key, app, engine);
+    if !app.quit_guard.touched {
+        app.quit_guard.disarm();
+    }
+}
+
+fn dispatch_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine) {
     if key.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
     {
@@ -617,7 +679,7 @@ fn handle_player_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine) {
     let keys = &config::config().keys;
     let code = key.code;
     if config::pressed(&keys.quit, code) {
-        app.should_quit = true;
+        request_quit(app);
     } else if config::pressed(&keys.play_pause, code) {
         toggle_play(app, engine);
     } else if config::pressed(&keys.volume_up, code) {
@@ -668,7 +730,7 @@ fn handle_list_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine) {
     } else if config::pressed(&keys.explorer, code) {
         toggle_explorer(app);
     } else if config::pressed(&keys.quit, code) {
-        app.should_quit = true;
+        request_quit(app);
     } else if config::pressed(&keys.select, code) {
         play_selected(app, engine);
     } else if config::pressed(&keys.play_pause, code) {
@@ -1373,7 +1435,7 @@ fn go_back(app: &mut App) {
     } else if app.has_player {
         app.mode = Mode::Player;
     } else {
-        app.should_quit = true;
+        request_quit(app);
     }
 }
 
@@ -1520,6 +1582,13 @@ fn repeat_shuffle_spans(repeat: RepeatMode, shuffle: bool) -> Vec<Span<'static>>
 }
 
 fn error_line(app: &App) -> Line<'static> {
+    if app.quit_guard.is_armed(Instant::now()) {
+        let keys = &config::config().keys;
+        return Line::from(Span::styled(
+            format!("Apretá {} de nuevo para salir", key_labels(&keys.quit)),
+            Style::default().fg(theme().warn),
+        ));
+    }
     match &app.error {
         Some(err) => Line::from(Span::styled(
             format!("Error:  {err}"),
@@ -2557,7 +2626,7 @@ fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
     if compact {
         let keys = &config::config().keys;
         return vec![Line::from(format!(
-            " {}: pausa   {}: salir",
+            " {}: pausa   {}×2: salir",
             key_labels(&keys.play_pause),
             key_labels(&keys.quit),
         ))];
@@ -2578,7 +2647,7 @@ fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
                 key_labels(&keys.explorer),
             )),
             Line::from(format!(
-                " {}: pausa   {}/{}: ±5s   {}: shuffle   {}: repeat   {}: temas   {}: salir",
+                " {}: pausa   {}/{}: ±5s   {}: shuffle   {}: repeat   {}: temas   {}×2: salir",
                 key_labels(&keys.play_pause),
                 key_labels(&keys.seek_back),
                 key_labels(&keys.seek_fwd),
@@ -2612,7 +2681,7 @@ fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
                 key_labels(&keys.open_url),
             )),
             Line::from(format!(
-                " {}: shuffle   {}: repeat   {}/{}: vel   {}: temas   {}: biblio   {}: salir",
+                " {}: shuffle   {}: repeat   {}/{}: vel   {}: temas   {}: biblio   {}×2: salir",
                 key_labels(&keys.shuffle),
                 key_labels(&keys.repeat),
                 key_labels(&keys.speed_down),
@@ -2646,7 +2715,7 @@ fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
                 key_labels(&keys.repeat),
             )),
             Line::from(format!(
-                " {}: URL   {}: temas   {}: volver   {}: salir",
+                " {}: URL   {}: temas   {}: volver   {}×2: salir",
                 key_labels(&keys.open_url),
                 key_labels(&keys.theme_menu),
                 key_labels(&keys.back),
@@ -2882,6 +2951,7 @@ mod tests {
             pending_history: None,
             history_path: Some(test_temp_history_path()),
             theme_menu: None,
+            quit_guard: QuitGuard::default(),
         }
     }
 
@@ -3020,10 +3090,13 @@ mod tests {
         assert!(app.mode == Mode::Player, "el player de fondo queda");
         assert!(!app.should_quit, "no sale de la app");
 
-        // Explorador a pantalla completa sin player: sale (como antes de T13).
+        // Explorador a pantalla completa sin player: sale, pero con doble Esc
+        // (el primero arma la guarda, el segundo sale).
         let mut bare = test_app();
         go_back(&mut bare);
-        assert!(bare.should_quit, "sin player Esc sale");
+        assert!(!bare.should_quit, "un Esc solo arma la salida");
+        go_back(&mut bare);
+        assert!(bare.should_quit, "sin player, Esc Esc sale");
 
         // Player sin panel (estado clásico): back vuelve al modo player.
         let mut classic = test_app();
@@ -3173,7 +3246,7 @@ mod tests {
             .map(|line| line_text(line))
             .collect::<Vec<_>>()
             .join("\n");
-        for hint in ["s: shuffle", "r: repeat", "n/p: pista", "/: buscar", "q/Esc: salir", "←/→: ±5s", "[/]: vel"] {
+        for hint in ["s: shuffle", "r: repeat", "n/p: pista", "b: buscar", "Esc×2: salir", "←/→: ±5s", "[/]: vel"] {
             assert!(player.contains(hint), "footer del player falta '{hint}': {player}");
         }
 
@@ -3183,7 +3256,7 @@ mod tests {
             .map(|line| line_text(line))
             .collect::<Vec<_>>()
             .join("\n");
-        for hint in ["s: shuffle", "r: repeat", "n/p: pista", "/: buscar", "q/Esc: salir", "←/→: ±5s", "[/]: vel"] {
+        for hint in ["s: shuffle", "r: repeat", "n/p: pista", "b: buscar", "Esc×2: salir", "←/→: ±5s", "[/]: vel"] {
             assert!(browser.contains(hint), "footer del explorador falta '{hint}': {browser}");
         }
 
@@ -3198,12 +3271,12 @@ mod tests {
         for hint in [
             "↑/↓: mover",
             "Enter: reproducir",
-            "Esc/b/Tab: cerrar",
+            "Esc/Tab: cerrar",
             "espacio: pausa",
             "←/→: ±5s",
             "[/]: vel",
             "n/p: pista sig/ant",
-            "q/Esc: salir",
+            "Esc×2: salir",
             "volumen ↑/↓: con el panel cerrado",
         ] {
             assert!(panel.contains(hint), "footer del panel falta '{hint}': {panel}");
@@ -3477,6 +3550,140 @@ mod tests {
 
     fn theme_menu_key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn quit_guard_needs_two_presses_within_the_window() {
+        let t0 = Instant::now();
+        let mut guard = QuitGuard::default();
+        assert!(!guard.is_armed(t0), "arranca desarmado");
+
+        assert_eq!(guard.on_quit_key(t0), QuitDecision::Arm, "primer Esc arma");
+        assert!(guard.is_armed(t0 + Duration::from_millis(500)));
+
+        assert_eq!(
+            guard.on_quit_key(t0 + Duration::from_millis(800)),
+            QuitDecision::Quit,
+            "segundo Esc dentro de la ventana sale"
+        );
+    }
+
+    #[test]
+    fn quit_guard_expires_and_rearms() {
+        let t0 = Instant::now();
+        let mut guard = QuitGuard::default();
+        guard.on_quit_key(t0);
+        let late = t0 + QUIT_CONFIRM_WINDOW + Duration::from_millis(1);
+        assert!(!guard.is_armed(late), "vencida la ventana ya no está armado");
+        assert_eq!(
+            guard.on_quit_key(late),
+            QuitDecision::Arm,
+            "un Esc tarde vuelve a armar, no sale"
+        );
+    }
+
+    #[test]
+    fn quit_guard_other_key_disarms() {
+        let t0 = Instant::now();
+        let mut guard = QuitGuard::default();
+        guard.on_quit_key(t0);
+        guard.disarm();
+        assert!(!guard.is_armed(t0));
+        assert_eq!(guard.on_quit_key(t0), QuitDecision::Arm);
+    }
+
+    fn engine_or_skip() -> Option<AudioEngine> {
+        AudioEngine::new().ok()
+    }
+
+    #[test]
+    fn esc_in_player_arms_then_second_esc_quits() {
+        let Some(mut engine) = engine_or_skip() else { return };
+        let mut app = test_app();
+        app.mode = Mode::Player;
+        app.explorer_open = false;
+
+        handle_key(theme_menu_key(KeyCode::Esc), &mut app, &mut engine);
+        assert!(!app.should_quit, "un solo Esc no sale");
+        assert!(app.quit_guard.is_armed(Instant::now()), "queda armado con aviso");
+        assert!(
+            line_text(&error_line(&app)).contains("Esc de nuevo"),
+            "muestra el aviso: {}",
+            line_text(&error_line(&app))
+        );
+
+        handle_key(theme_menu_key(KeyCode::Esc), &mut app, &mut engine);
+        assert!(app.should_quit, "el segundo Esc sale");
+    }
+
+    #[test]
+    fn other_key_between_escs_cancels_the_exit() {
+        let Some(mut engine) = engine_or_skip() else { return };
+        let mut app = test_app();
+        app.mode = Mode::Player;
+        app.explorer_open = false;
+
+        handle_key(theme_menu_key(KeyCode::Esc), &mut app, &mut engine);
+        handle_key(theme_menu_key(KeyCode::Char('s')), &mut app, &mut engine);
+        assert!(!app.quit_guard.is_armed(Instant::now()), "otra tecla desarma");
+        handle_key(theme_menu_key(KeyCode::Esc), &mut app, &mut engine);
+        assert!(!app.should_quit, "tras desarmar, un Esc solo vuelve a armar");
+    }
+
+    #[test]
+    fn q_no_longer_quits() {
+        let Some(mut engine) = engine_or_skip() else { return };
+        let mut app = test_app();
+        app.mode = Mode::Player;
+        app.explorer_open = false;
+        handle_key(theme_menu_key(KeyCode::Char('q')), &mut app, &mut engine);
+        handle_key(theme_menu_key(KeyCode::Char('q')), &mut app, &mut engine);
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn esc_with_explorer_panel_open_closes_it_without_arming() {
+        let Some(mut engine) = engine_or_skip() else { return };
+        let mut app = test_app();
+        app.mode = Mode::Player;
+        app.has_player = true;
+        app.explorer_open = true;
+
+        handle_key(theme_menu_key(KeyCode::Esc), &mut app, &mut engine);
+        assert!(!app.explorer_open, "Esc cierra el panel");
+        assert!(!app.quit_guard.is_armed(Instant::now()), "y no arma la salida");
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn esc_in_fullscreen_browser_without_player_needs_two_presses() {
+        let Some(mut engine) = engine_or_skip() else { return };
+        let mut app = test_app();
+        app.mode = Mode::Browser;
+        app.has_player = false;
+        app.explorer_open = false;
+
+        handle_key(theme_menu_key(KeyCode::Esc), &mut app, &mut engine);
+        assert!(!app.should_quit, "un Esc no sale ni sin reproductor");
+        handle_key(theme_menu_key(KeyCode::Esc), &mut app, &mut engine);
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn b_opens_search_and_tab_toggles_explorer_from_player() {
+        let Some(mut engine) = engine_or_skip() else { return };
+        let mut app = test_app();
+        app.mode = Mode::Player;
+        app.has_player = true;
+        app.explorer_open = false;
+
+        handle_key(theme_menu_key(KeyCode::Tab), &mut app, &mut engine);
+        assert!(app.explorer_open, "Tab abre el explorador");
+        handle_key(theme_menu_key(KeyCode::Tab), &mut app, &mut engine);
+        assert!(!app.explorer_open, "Tab lo cierra");
+
+        handle_key(theme_menu_key(KeyCode::Char('b')), &mut app, &mut engine);
+        assert!(app.search.is_some(), "b abre la búsqueda");
     }
 
     #[test]

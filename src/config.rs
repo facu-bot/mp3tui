@@ -836,7 +836,7 @@ impl Default for Keys {
             codes.to_vec()
         }
         Self {
-            quit: keys(&[KeyCode::Char('q'), KeyCode::Esc]),
+            quit: keys(&[KeyCode::Esc]),
             play_pause: keys(&[KeyCode::Char(' ')]),
             volume_up: keys(&[KeyCode::Up]),
             volume_down: keys(&[KeyCode::Down]),
@@ -846,10 +846,10 @@ impl Default for Keys {
             next_track: keys(&[KeyCode::Char('n')]),
             shuffle: keys(&[KeyCode::Char('s')]),
             repeat: keys(&[KeyCode::Char('r')]),
-            search: keys(&[KeyCode::Char('/')]),
+            search: keys(&[KeyCode::Char('b')]),
             speed_up: keys(&[KeyCode::Char(']')]),
             speed_down: keys(&[KeyCode::Char('[')]),
-            explorer: keys(&[KeyCode::Char('b'), KeyCode::Tab]),
+            explorer: keys(&[KeyCode::Tab]),
             move_up: keys(&[KeyCode::Up]),
             move_down: keys(&[KeyCode::Down]),
             page_up: keys(&[KeyCode::PageUp]),
@@ -1320,6 +1320,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn default_keys_use_b_search_tab_explorer_and_esc_only_to_quit() {
+        let keys = Keys::default();
+        assert_eq!(keys.search, vec![KeyCode::Char('b')], "b busca");
+        assert_eq!(keys.explorer, vec![KeyCode::Tab], "Tab abre/cierra el explorador");
+        assert_eq!(keys.quit, vec![KeyCode::Esc], "solo Esc sale (doble pulsación)");
+    }
+
+    #[test]
+    fn default_keys_have_no_collisions_warning() {
+        // Los defaults nuevos no generan avisos de colisión (Esc compartido
+        // entre «back» y «quit» es la colisión heredada permitida).
+        let config = parse("");
+        assert!(
+            config.warnings.is_empty(),
+            "sin avisos con la config vacía: {:?}",
+            config.warnings
+        );
+    }
+
+    #[test]
     fn rose_pine_uses_main_variant_palette() {
         // rose-pine/palette, variante principal (no Moon ni Dawn).
         let theme = builtin_theme("rose-pine").expect("rose-pine existe");
@@ -1502,19 +1522,20 @@ mod tests {
         let config = parse(
             r##"
             [keybindings]
-            play_pause = "q"
+            play_pause = "enter"
             search = "space"
             "##,
         );
-        // «q» la gana quit; el default de play_pause (space) quedó en manos
-        // de search, así que play_pause termina sin bindear — y lo dice.
-        assert_eq!(config.keys.quit, Keys::default().quit);
+        // Enter la gana select (va antes en el orden de resolución); el
+        // default de play_pause (space) quedó en manos de search, así que
+        // play_pause termina sin bindear — y lo dice.
+        assert_eq!(config.keys.select, Keys::default().select);
         assert_eq!(config.keys.search, vec![KeyCode::Char(' ')]);
         assert!(config.keys.play_pause.is_empty());
         assert_eq!(config.warnings.len(), 1, "warnings: {:?}", config.warnings);
         let warning = &config.warnings[0];
         assert!(warning.contains("queda sin ninguna tecla"), "{warning}");
-        assert!(warning.contains("quit"), "{warning}");
+        assert!(warning.contains("select"), "{warning}");
     }
 
     #[test]
@@ -1537,16 +1558,13 @@ mod tests {
         // el panel — que sin player no-opea.
         let config = parse("");
         assert_eq!(config.keys.back, vec![KeyCode::Esc]);
-        assert_eq!(
-            config.keys.explorer,
-            vec![KeyCode::Char('b'), KeyCode::Tab]
-        );
+        assert_eq!(config.keys.explorer, vec![KeyCode::Tab]);
 
-        // El remapeo explícito del usuario se respeta; el choque con
-        // explorer (que por default tenía Tab) se resuelve con warning.
+        // El remapeo explícito del usuario se respeta; explorer pierde Tab,
+        // su única tecla por default, y queda sin bindear con warning.
         let config = parse("[keybindings]\nback = \"esc,tab\"");
         assert_eq!(config.keys.back, vec![KeyCode::Esc, KeyCode::Tab]);
-        assert_eq!(config.keys.explorer, vec![KeyCode::Char('b')]);
+        assert!(config.keys.explorer.is_empty());
         assert_eq!(config.warnings.len(), 1, "{:?}", config.warnings);
         assert!(
             config.warnings[0].contains("explorer"),
