@@ -8,7 +8,7 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use symphonia::core::io::MediaSource;
 use ureq::ResponseExt;
 
@@ -69,6 +69,12 @@ impl CancelHandle {
 /// lector avance, evitando acumular el archivo completo en RAM.
 const SEQUENTIAL_READ_AHEAD_CAP: usize = 4 * 1024 * 1024; // 4 MiB
 
+/// Mensaje con el que se rechaza una lectura cuando el servidor manda las
+/// cabeceras y deja de enviar cuerpo por más del presupuesto configurado en
+/// [`HttpTimeouts::stall`]. Se hace explícito para que la UI lo muestre en vez
+/// de colgarse esperando al timeout del kernel.
+const STALL_ERROR_MESSAGE: &str = "el servidor dejó de enviar datos";
+
 /// Cuánto prefijo ya consumido se acumula antes de recortar `data`. La poda se
 /// hace en lotes para no recorrer el buffer entero en cada lectura.
 const SEQUENTIAL_PRUNE_BATCH: usize = 512 * 1024; // 512 KiB
@@ -106,6 +112,8 @@ struct SequentialShared {
     state: Mutex<BufferState>,
     condvar: Arc<Condvar>,
     canceled: Arc<AtomicBool>,
+    /// Presupuesto de inactividad del lector en el modo secuencial.
+    stall_deadline: Duration,
 }
 
 /// Productor interno que llena el buffer compartido desde el hilo de red (modo secuencial).
@@ -122,9 +130,25 @@ impl StreamProducer {
         Self::new_sequential(content_length, is_seekable)
     }
 
+    /// Solo para tests: usa el presupuesto de inactividad por defecto.
+    #[cfg(test)]
     pub(crate) fn new_sequential(
         content_length: Option<u64>,
         is_seekable: bool,
+    ) -> (Self, HttpStream) {
+        Self::new_sequential_with_stall(
+            content_length,
+            is_seekable,
+            HttpTimeouts::default().stall,
+        )
+    }
+
+    /// Igual que [`Self::new_sequential`] pero con un presupuesto de
+    /// inactividad configurable para el lector.
+    pub(crate) fn new_sequential_with_stall(
+        content_length: Option<u64>,
+        is_seekable: bool,
+        stall_deadline: Duration,
     ) -> (Self, HttpStream) {
         let canceled = Arc::new(AtomicBool::new(false));
         let condvar = Arc::new(Condvar::new());
@@ -138,6 +162,7 @@ impl StreamProducer {
             }),
             condvar: Arc::clone(&condvar),
             canceled: Arc::clone(&canceled),
+            stall_deadline,
         });
         let cancel = CancelHandle {
             canceled: Arc::clone(&canceled),
@@ -229,6 +254,8 @@ struct RangedShared {
     canceled: Arc<AtomicBool>,
     total_len: u64,
     chunk_size: usize,
+    /// Presupuesto de inactividad del lector en el modo con `Range`.
+    stall_deadline: Duration,
 }
 
 enum StreamStorage {
@@ -346,6 +373,13 @@ fn read_sequential(
         .lock()
         .map_err(|_| io::Error::other("lock del buffer compartido envenenado"))?;
 
+    // El presupuesto de inactividad se calcula al entrar a la lectura y se
+    // reinicia en cada llamada: mientras haya datos que entregar, o el stream
+    // termine, o falle el productor, o pidan cancelar, la espera retorna de
+    // inmediato; solo una lectura en vuelo sin ningún progreso lo agota y
+    // falla en vez de colgarse.
+    let deadline = Instant::now() + shared.stall_deadline;
+
     loop {
         if shared.canceled.load(Ordering::SeqCst) {
             return Err(io::Error::new(
@@ -384,9 +418,18 @@ fn read_sequential(
             return Ok(0);
         }
 
-        state = shared
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, STALL_ERROR_MESSAGE));
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        // Se espera sin retener el `Mutex` (patrón del `Condvar`) y solo hasta
+        // el presupuesto restante; al despertar, la cabecera del bucle vuelve a
+        // evaluar el predicado, así que si llegaron datos, cancelación, fin o
+        // error no se pierde tiempo.
+        (state, _) = shared
             .condvar
-            .wait(state)
+            .wait_timeout(state, remaining)
             .map_err(|_| io::Error::other("condvar del buffer envenenado"))?;
     }
 }
@@ -401,6 +444,11 @@ fn read_ranged(shared: &RangedShared, pos: &mut u64, buf: &mut [u8]) -> io::Resu
         .state
         .lock()
         .map_err(|_| io::Error::other("lock del buffer compartido envenenado"))?;
+
+    // Presupuesto de inactividad idéntico al secuencial: se calcula al entrar
+    // y se reinicia en cada llamada, de modo que solo una lectura en vuelo sin
+    // ningún progreso lo agota.
+    let deadline = Instant::now() + shared.stall_deadline;
 
     loop {
         if shared.canceled.load(Ordering::SeqCst) {
@@ -434,9 +482,14 @@ fn read_ranged(shared: &RangedShared, pos: &mut u64, buf: &mut [u8]) -> io::Resu
         state.wanted_offset = Some(*pos);
         shared.condvar.notify_all();
 
-        state = shared
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, STALL_ERROR_MESSAGE));
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        (state, _) = shared
             .condvar
-            .wait(state)
+            .wait_timeout(state, remaining)
             .map_err(|_| io::Error::other("condvar del buffer envenenado"))?;
     }
 }
@@ -552,6 +605,12 @@ pub struct HttpTimeouts {
     pub connect: Duration,
     /// Timeout para recibir las cabeceras de respuesta HTTP.
     pub recv_response: Duration,
+    /// Presupuesto de inactividad del lector: si el servidor ya mandó las
+    /// cabeceras y deja de enviar cuerpo por más de este tiempo, la lectura
+    /// falla en vez de quedarse esperando para siempre. Se mide mirando el
+    /// buffer compartido, no el socket, así que una pausa legítima de la
+    /// reproducción (sin lectura en vuelo) no lo dispara.
+    pub stall: Duration,
 }
 
 impl Default for HttpTimeouts {
@@ -559,6 +618,7 @@ impl Default for HttpTimeouts {
         Self {
             connect: Duration::from_secs(10),
             recv_response: Duration::from_secs(15),
+            stall: Duration::from_secs(30),
         }
     }
 }
@@ -952,6 +1012,7 @@ pub(crate) fn open_with_params(
             canceled: Arc::clone(&canceled),
             total_len,
             chunk_size,
+            stall_deadline: timeouts.stall,
         });
 
         let cancel = CancelHandle {
@@ -1025,7 +1086,8 @@ pub(crate) fn open_with_params(
             content_length,
         };
 
-        let (producer, stream) = StreamProducer::new_sequential(content_length, false);
+        let (producer, stream) =
+            StreamProducer::new_sequential_with_stall(content_length, false, timeouts.stall);
         let mut body_reader = response.into_body().into_reader();
         let cancel = producer.cancel_handle();
 
@@ -1341,6 +1403,7 @@ mod tests {
         let timeouts = HttpTimeouts {
             connect: Duration::from_millis(150),
             recv_response: Duration::from_millis(150),
+            ..HttpTimeouts::default()
         };
         let (mut stream, _info) = open_with(&url, timeouts).unwrap();
         let mut data = Vec::new();
@@ -1572,6 +1635,129 @@ mod tests {
             thread::sleep(Duration::from_millis(50));
         }
         panic!("el productor no se liberó al cancelar: la conexión siguió abierta");
+    }
+
+    /// Un servidor que acepta la petición, manda las cabeceras y después deja
+    /// de enviar cuerpo deja al lector esperando para siempre. El deadline de
+    /// inactividad tiene que hacer fallar la lectura con un error claro en vez
+    /// de colgarse hasta que timeoutee el kernel.
+    #[test]
+    fn test_sequential_reader_times_out_when_server_stalls_after_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut req = [0u8; 1024];
+            let _ = socket.read(&mut req);
+
+            // Declara más cuerpo del que envía y después se queda callado.
+            let response = "HTTP/1.1 200 OK\r\nContent-Type: audio/mpeg\r\nContent-Length: 4096\r\nConnection: close\r\n\r\n";
+            let _ = socket.write_all(response.as_bytes());
+            let _ = socket.write_all(b"pocos bytes");
+            let _ = socket.flush();
+            thread::sleep(Duration::from_secs(5));
+        });
+
+        let url = format!("http://127.0.0.1:{port}/stall.mp3");
+        let timeouts = HttpTimeouts {
+            stall: Duration::from_millis(200),
+            ..HttpTimeouts::default()
+        };
+        let (mut stream, _info) = open_with(&url, timeouts).unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut data = Vec::new();
+            let res = stream.read_to_end(&mut data);
+            tx.send(res).unwrap();
+        });
+
+        let res = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("la lectura debe fallar por deadline, no quedarse colgada");
+        let err = res.expect_err("esperaba error de stall");
+        assert!(
+            err.to_string().contains("dejó de enviar datos"),
+            "mensaje inesperado: {err}"
+        );
+    }
+
+    /// El mismo deadline tiene que cubrir el camino con `Range`: si el
+    /// downloader pide un chunk y el servidor corta el cuerpo a mitad, el lector
+    /// no puede esperar indefinidamente ese chunk.
+    #[test]
+    fn test_ranged_reader_times_out_when_server_stalls_mid_chunk() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let total_len = 8192usize;
+        let chunk_size = 4096usize;
+        let payload: Arc<Vec<u8>> =
+            Arc::new((0..total_len).map(|i| (i % 251) as u8).collect());
+        let payload_server = Arc::clone(&payload);
+
+        thread::spawn(move || {
+            while let Ok((mut socket, _)) = listener.accept() {
+                let payload = Arc::clone(&payload_server);
+                thread::spawn(move || {
+                    let mut req_buf = [0u8; 2048];
+                    let n = match socket.read(&mut req_buf) {
+                        Ok(n) if n > 0 => n,
+                        _ => return,
+                    };
+                    let req_str = String::from_utf8_lossy(&req_buf[..n]);
+                    let range_header = req_str
+                        .lines()
+                        .find(|l| l.to_ascii_lowercase().starts_with("range: bytes="))
+                        .map(|l| l.trim().to_string());
+                    let Some(rh) = range_header else { return };
+                    let after = rh.split('=').nth(1).unwrap_or("0-0");
+                    let parts: Vec<&str> = after.split('-').collect();
+                    let start: usize = parts[0].trim().parse().unwrap_or(0);
+                    let end: usize = parts[1].trim().parse().unwrap_or(total_len - 1);
+                    let resp = format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Type: audio/mp4\r\nContent-Range: bytes {start}-{end}/{total_len}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        payload[start..=end].len()
+                    );
+                    let _ = socket.write_all(resp.as_bytes());
+                    if start == 0 {
+                        let _ = socket.write_all(&payload[0..=end]);
+                        let _ = socket.flush();
+                    } else {
+                        // Manda un resto parcial y se queda callado.
+                        let _ = socket.write_all(&payload[start..start + 16]);
+                        let _ = socket.flush();
+                        thread::sleep(Duration::from_secs(5));
+                    }
+                });
+            }
+        });
+
+        let url = format!("http://127.0.0.1:{port}/audio.m4a");
+        let timeouts = HttpTimeouts {
+            stall: Duration::from_millis(200),
+            ..HttpTimeouts::default()
+        };
+        let (mut stream, _) =
+            open_with_params(&url, timeouts, chunk_size).expect("open stream");
+
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            stream.seek(SeekFrom::Start(chunk_size as u64)).unwrap();
+            let mut data = Vec::new();
+            let res = stream.read_to_end(&mut data);
+            tx.send(res).unwrap();
+        });
+
+        let res = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("la lectura ranged debe fallar por deadline, no quedarse colgada");
+        let err = res.expect_err("esperaba error de stall");
+        assert!(
+            err.to_string().contains("dejó de enviar datos"),
+            "mensaje inesperado: {err}"
+        );
     }
 
     #[test]
@@ -2233,6 +2419,7 @@ mod tests {
             canceled,
             total_len: 250,
             chunk_size: 100,
+            stall_deadline: Duration::from_secs(30),
         });
 
         let handle = DownloadRangesHandle {
