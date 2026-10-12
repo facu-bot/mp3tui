@@ -668,6 +668,28 @@ pub(crate) fn persist_theme_name_at(
     };
     let updated = update_theme_name(&existing, name);
 
+    // El editor por líneas solo entiende `[theme]` + `name = ...`. Ante otras
+    // formas válidas (tabla inline, claves con punto o entre comillas) podría
+    // duplicar claves y dejar la config ilegible: se valida el resultado y, si
+    // no queda TOML válido con el nombre pedido, no se toca el archivo.
+    let persisted = updated
+        .parse::<toml::Table>()
+        .ok()
+        .and_then(|table| {
+            table
+                .get("theme")?
+                .get("name")?
+                .as_str()
+                .map(|saved| saved == name)
+        })
+        .unwrap_or(false);
+    if !persisted {
+        return Err(format!(
+            "no se pudo guardar el tema sin romper '{}'; agregá `name = \"{name}\"` en [theme] a mano",
+            path.display()
+        ));
+    }
+
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
         && let Err(err) = fs::create_dir_all(parent)
@@ -1937,6 +1959,44 @@ mod tests {
             "[library]\r\nroots = []\r\n[theme]\r\nname = \"nord\"\r\n",
             "creación con CRLF y sin salto final previo"
         );
+    }
+
+    #[test]
+    fn persist_theme_name_never_writes_invalid_toml() {
+        // Formas válidas de TOML que el editor por líneas no reconoce: el
+        // resultado tiene que seguir siendo TOML válido con el nombre pedido, o
+        // el archivo tiene que quedar intacto (nunca una config rota).
+        let cases = [
+            ("inline", "theme = { accent = \"#112233\" }\n"),
+            ("dotted", "theme.accent = \"#112233\"\n"),
+            ("quoted", "[theme]\n\"name\" = \"nord\"\n"),
+        ];
+        for (label, original) in cases {
+            let path = std::env::temp_dir().join(format!(
+                "mp3tui_theme_invalid_{label}_{}.toml",
+                std::process::id()
+            ));
+            std::fs::write(&path, original).expect("escribe el original");
+
+            let result = persist_theme_name_at(&path, "dracula");
+            let text = std::fs::read_to_string(&path).expect("sigue existiendo");
+            let parsed = text.parse::<toml::Table>();
+            let _ = std::fs::remove_file(&path);
+
+            match result {
+                Ok(()) => {
+                    let table = parsed.unwrap_or_else(|e| {
+                        panic!("{label}: Ok pero dejó TOML inválido: {e}\n{text}")
+                    });
+                    let name = table
+                        .get("theme")
+                        .and_then(|t| t.get("name"))
+                        .and_then(|n| n.as_str());
+                    assert_eq!(name, Some("dracula"), "{label}: nombre guardado");
+                }
+                Err(_) => assert_eq!(text, original, "{label}: archivo intacto si falla"),
+            }
+        }
     }
 
     #[test]

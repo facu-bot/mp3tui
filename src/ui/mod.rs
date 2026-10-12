@@ -3507,6 +3507,24 @@ mod tests {
     }
 
     #[test]
+    fn theme_menu_renders_inside_tiny_terminals() {
+        // Más angosta que 24 columnas o más baja que 3 filas: el modal no puede
+        // salirse del frame (ratatui entra en pánico al escribir fuera del buffer).
+        let menu = ThemeMenuState {
+            selected: 0,
+            original_name: config::active_theme_name(),
+            original_theme: config::active_theme(),
+        };
+        for (w, h) in [(10, 2), (23, 10), (40, 2), (1, 1), (0, 0)] {
+            let backend = ratatui::backend::TestBackend::new(w, h);
+            let mut terminal = ratatui::Terminal::new(backend).expect("terminal de prueba");
+            terminal
+                .draw(|frame| render_theme_menu(frame, &menu))
+                .unwrap_or_else(|e| panic!("{w}x{h}: {e}"));
+        }
+    }
+
+    #[test]
     fn theme_menu_navigation_previews_live() {
         let _setup = theme_menu_test_setup();
         let mut app = test_app();
