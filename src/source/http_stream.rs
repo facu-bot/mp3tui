@@ -948,6 +948,19 @@ pub(crate) fn open_with_params(
         .and_then(|v| v.to_str().ok());
 
     let range_total = content_range.and_then(parse_content_range_total);
+    let range_start = content_range.and_then(parse_content_range_start);
+
+    // El probe pidió `bytes=0-{chunk_size-1}`: si la respuesta es 206, el cuerpo
+    // tiene que empezar en 0. Un 206 con otro offset no es «el servidor ignora
+    // Range» (eso es un 200) y su cuerpo no es el comienzo del archivo: sembrar
+    // el chunk 0 con esos bytes, o caer al camino secuencial que los lee como si
+    // empezaran en 0, corrompe el audio en silencio.
+    if status == 206 && range_start != Some(0) {
+        return Err(StreamError::HttpStatus(
+            206,
+            "rango que no empieza en 0".to_string(),
+        ));
+    }
 
     let effective_url = {
         let u = response.get_uri().to_string();
@@ -1896,6 +1909,48 @@ mod tests {
         stream.read_to_end(&mut read_data).expect("read_to_end");
         assert_eq!(read_data.len(), total_len);
         assert_eq!(read_data, *payload);
+    }
+
+    /// El probe pide `bytes=0-{chunk-1}`: si contesta 206, el `Content-Range`
+    /// tiene que empezar en 0. Un 206 con otro offset significa que el cuerpo no
+    /// es el comienzo del archivo, así que no puede sembrar el chunk 0 ni caer
+    /// al camino secuencial (que lo leería como si empezara en 0).
+    #[test]
+    fn test_probe_206_with_offset_not_zero_is_rejected() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        thread::spawn(move || {
+            while let Ok((mut socket, _)) = listener.accept() {
+                thread::spawn(move || {
+                    let mut req_buf = [0u8; 2048];
+                    let n = match socket.read(&mut req_buf) {
+                        Ok(n) if n > 0 => n,
+                        _ => return,
+                    };
+                    let req_str = String::from_utf8_lossy(&req_buf[..n]);
+                    if !req_str.to_ascii_lowercase().contains("range: bytes=0-") {
+                        return;
+                    }
+                    // Contesta 206, pero dice que el cuerpo empieza en 4096.
+                    let body = [0x42u8; 4096];
+                    let resp = "HTTP/1.1 206 Partial Content\r\nContent-Type: audio/mp4\r\nContent-Range: bytes 4096-8191/12288\r\nContent-Length: 4096\r\nConnection: close\r\n\r\n";
+                    let _ = socket.write_all(resp.as_bytes());
+                    let _ = socket.write_all(&body);
+                });
+            }
+        });
+
+        let url = format!("http://127.0.0.1:{port}/audio.m4a");
+        let result = open_with_params(&url, HttpTimeouts::default(), 4096);
+        let Err(err) = result else {
+            panic!("un 206 que no empieza en 0 no puede aceptarse como chunk 0");
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("206") && msg.contains("no empieza en 0"),
+            "el error tiene que explicar el rango inesperado: {msg}"
+        );
     }
 
     #[test]
