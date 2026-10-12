@@ -29,6 +29,11 @@ const DECAY: f32 = 0.16;
 /// attack/decay); solo el pico tiene decay propio (testeado en
 /// `vu_decays_without_samples_and_peak_falls_with_peak_fall`).
 const PEAK_FALL: f32 = 1.0 / 48.0;
+/// Piso de la escala dBFS del medidor VU: por debajo de esto (o en
+/// silencio) el nivel mapeado es 0.0.
+const VU_FLOOR_DB: f32 = -60.0;
+/// Techo de la escala dBFS del medidor VU: 0 dBFS (escala completa) → 1.0.
+const VU_CEIL_DB: f32 = 0.0;
 /// Tamaño del staging de lectura (igual al ring del tap: 8192 muestras).
 const TAP_READ_MAX: usize = 1 << 13;
 /// Ganancia previa a la compensación de potencia: la energía real de una
@@ -52,8 +57,8 @@ pub struct SpectrumAnalyzer {
     staging: Vec<f32>,
     pending: usize,
     bands: [f32; NUM_BANDS],
-    /// Nivel VU mono para el modo `vu` (T4 modos-visualizador): RMS suavizado
-    /// de la señal del tap actual; ver `update_vu`.
+    /// Nivel VU mono para el modo `vu`: nivel dBFS (`db_meter_level` del
+    /// RMS) suavizado de la señal del tap actual; ver `update_vu`.
     vu: f32,
     /// Pico del medidor VU (T4): máximo visto del nivel, con decay
     /// `PEAK_FALL`, nunca por debajo del nivel actual.
@@ -180,19 +185,21 @@ impl SpectrumAnalyzer {
         &self.bands
     }
 
-    /// Nivel del medidor VU (modo `vu` de T4): RMS suavizado en 0.0..=1.0.
+    /// Nivel del medidor VU (modo `vu`): nivel dBFS del RMS mapeado a
+    /// 0.0..=1.0 (ver `db_meter_level`), suavizado con attack/decay.
     pub fn vu(&self) -> f32 {
         self.vu
     }
 
-    /// Pico del medidor VU (modo `vu` de T4): máximo visto del nivel, en
+    /// Pico del medidor VU (modo `vu`): máximo visto del nivel, en
     /// 0.0..=1.0. Siempre >= el nivel actual.
     pub fn vu_peak(&self) -> f32 {
         self.vu_peak
     }
 
-    /// RMS del ring mono actual (0.0..=1.0 con clamp del llamador): raíz de la
-    /// media cuadrática de las muestras acumuladas; sin historia devuelve 0.
+    /// RMS lineal del ring mono actual (0.0..=1.0, sin mapear a dBFS):
+    /// raíz de la media cuadrática de las muestras acumuladas; sin
+    /// historia devuelve 0. Alimenta `db_meter_level` en `update_vu`.
     fn rms_level(&self) -> f32 {
         let take = self.filled.min(FFT_SIZE);
         if take == 0 {
@@ -202,14 +209,15 @@ impl SpectrumAnalyzer {
         (sum / take as f32).sqrt()
     }
 
-    /// Nivel VU mono del modo `vu` (T4 modos-visualizador): sigue al RMS con
-    /// el mismo suavizado attack/decay de las bandas (sin jitter) y el pico
-    /// sube en el acto y baja con `PEAK_FALL`, sin quedar nunca debajo del
-    /// nivel.
+    /// Nivel VU mono del modo `vu`: sigue el nivel dBFS (`db_meter_level`
+    /// del RMS, no el RMS lineal) con el mismo suavizado attack/decay de
+    /// las bandas (sin jitter) y el pico sube en el acto y baja con
+    /// `PEAK_FALL`, sin quedar nunca debajo del nivel.
     ///
-    /// Sin ganancia extra: el VU mide RMS honesto, a diferencia de las
-    /// bandas (`GAIN = 5.0`). Un seno a escala completa da ≈ 0.707 y usa el
-    /// 70% de la escala, dejando headroom (testeado en
+    /// Escala dBFS, no lineal: música típica (-18..-12 dBFS de RMS) usa
+    /// 70-80% de la escala en vez de 12-25% (ver `db_meter_level` y
+    /// `VU_FLOOR_DB`/`VU_CEIL_DB`); un seno a escala completa (-3 dBFS)
+    /// converge cerca del techo, ~0.95 (testeado en
     /// `vu_is_a_single_mono_level_from_current_tap`).
     ///
     /// Decisión mono documentada (nota T1/T4): el tap ya promedia a mono en
@@ -220,8 +228,9 @@ impl SpectrumAnalyzer {
     fn update_vu(&mut self, target: Option<f32>) {
         match target {
             Some(rms) => {
-                let rms = rms.clamp(0.0, 1.0);
-                self.vu += (rms - self.vu) * if rms > self.vu { ATTACK } else { DECAY };
+                let level = db_meter_level(rms);
+                self.vu +=
+                    (level - self.vu) * if level > self.vu { ATTACK } else { DECAY };
             }
             None => {
                 // Sin muestras nuevas el RMS del ring sería rancio: el nivel
@@ -295,7 +304,17 @@ fn shape(energy: f32) -> f32 {
     (energy * GAIN).powf(EXPO).min(1.0)
 }
 
-
+/// RMS lineal (0.0..=1.0) → nivel del medidor VU en 0.0..=1.0, mapeando
+/// dBFS (`20·log10(rms)`) linealmente entre `VU_FLOOR_DB` y `VU_CEIL_DB`,
+/// con clamp en ambos extremos. Silencio y cualquier RMS por debajo de
+/// 1e-6 dan 0.0 directo (evita `log10(0) == -inf` y NaN).
+fn db_meter_level(rms: f32) -> f32 {
+    if !rms.is_finite() || rms <= 1e-6 {
+        return 0.0;
+    }
+    let db = 20.0 * rms.log10();
+    ((db - VU_FLOOR_DB) / (VU_CEIL_DB - VU_FLOOR_DB)).clamp(0.0, 1.0)
+}
 
 #[cfg(test)]
 mod tests {
@@ -345,8 +364,51 @@ mod tests {
         assert!(analyzer.waveform(0).is_empty());
     }
 
-    // T4 (modos-visualizador): medidor VU MONO con RMS de la señal.
+    // T4 (modos-visualizador): medidor VU MONO con RMS de la señal, mapeado
+    // a una escala dBFS (ver `db_meter_level`).
     // ------------------------------------------------------------------
+
+    #[test]
+    fn db_meter_level_maps_known_dbfs_anchors() {
+        // -60 dBFS (piso) y silencio → 0.0; 0 dBFS (techo) → 1.0; -3 dBFS
+        // (seno a escala completa) → ~0.95; -12 dBFS → ~0.8.
+        assert_eq!(db_meter_level(0.0), 0.0, "silencio");
+        assert!(
+            db_meter_level(0.001).abs() < 1e-3,
+            "-60 dBFS exacto es el piso, obtenido {}",
+            db_meter_level(0.001)
+        );
+        let full_scale_sine = std::f32::consts::FRAC_1_SQRT_2; // ≈ 0.707
+        assert!(
+            (db_meter_level(full_scale_sine) - 0.95).abs() < 0.01,
+            "seno a escala completa (-3 dBFS) ≈ 0.95, obtenido {}",
+            db_meter_level(full_scale_sine)
+        );
+        assert!(
+            (db_meter_level(0.251) - 0.8).abs() < 0.01,
+            "-12 dBFS ≈ 0.8, obtenido {}",
+            db_meter_level(0.251)
+        );
+        assert!(
+            (db_meter_level(1.0) - 1.0).abs() < 1e-5,
+            "0 dBFS es el techo, obtenido {}",
+            db_meter_level(1.0)
+        );
+    }
+
+    #[test]
+    fn db_meter_level_clamps_and_never_panics_or_nans() {
+        // Por encima de 0 dBFS (rms > 1.0, no pasa en la práctica pero no
+        // debe romper): clamp al techo.
+        assert_eq!(db_meter_level(2.0), 1.0, "sobre el techo: clamp a 1.0");
+        // Silencio y RMS por debajo del umbral: siempre 0.0, nunca NaN/-inf
+        // (log10(0) sería -inf sin el corte explícito).
+        for rms in [0.0f32, 1e-7, 1e-6, -0.0f32] {
+            let level = db_meter_level(rms);
+            assert!(level.is_finite(), "rms={rms} dio {level}");
+            assert_eq!(level, 0.0, "rms={rms} por debajo del umbral");
+        }
+    }
 
     #[test]
     fn vu_starts_silent() {
@@ -374,16 +436,12 @@ mod tests {
             analyzer.pending = 1;
             analyzer.analyze();
         }
-        // Seno a escala completa: RMS = 1/√2 ≈ 0.707 (sin ganancia extra: el
-        // VU mide honesto, sin el GAIN de las barras), con headroom.
+        // Seno a escala completa (RMS ≈ 0.707, -3 dBFS) converge cerca del
+        // techo de la escala dBFS del medidor (ver `db_meter_level`): ~0.95,
+        // no ~0.707 de un RMS lineal sin mapear.
         assert!(
-            (analyzer.vu() - 0.707).abs() < 0.05,
-            "el nivel converge al RMS del mono, obtenido {}",
-            analyzer.vu()
-        );
-        assert!(
-            analyzer.vu() < 0.8,
-            "queda headroom en el medidor (obtenido {})",
+            (analyzer.vu() - 0.95).abs() < 0.05,
+            "el nivel converge al mapeo dBFS del mono, obtenido {}",
             analyzer.vu()
         );
         assert!(

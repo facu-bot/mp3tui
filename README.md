@@ -185,7 +185,8 @@ en la sección `[visualizer]` de este archivo (creándola si no existe) y
 vuelve al panel, y `Esc` cancela, restaura el modo anterior y vuelve al
 panel. `onda` dibuja el osciloscopio con las muestras crudas del audio,
 `espejo` las 32 bandas en espejo vertical desde una línea central y `vu` el
-medidor de nivel mono con RMS y marca de pico (decae en ~800 ms); `circular`
+medidor de nivel mono en escala dBFS (-60..0) con marca de pico (decae en
+~800 ms); `circular`
 el plot polar grueso de las 32 bandas (radios desde el centro con el
 gradiente del tema, centro tenue). `barras` es el
 comportamiento actual.
@@ -268,15 +269,17 @@ Notas del comportamiento de la config:
 - `[visualizer] mode` elige el modo del visualizador: `barras` (default, el
   comportamiento actual), `onda` (osciloscopio con las muestras crudas del
   audio, la más reciente a la derecha), `espejo` (las 32 bandas en espejo
-  vertical desde una línea central tenue), `vu` (medidor de nivel mono con
-  RMS, barra horizontal con gradiente del tema, marca de pico en
-  `spectrum_high` que decae en ~800 ms y escala tenue; mono porque el tap ya
-  promedia los canales — ver nota T4) o `circular` (plot polar grueso de las
-  32 bandas como radios desde el centro, con el gradiente del tema por
-  distancia al centro y centro tenue; compensa el aspecto ~1:2 de la celda).
-  Un valor inválido avisa y se usa `barras`. El valor `caida` (modo
-  eliminado) avisa específicamente y cae a `barras`, autocorrigiendo además
-  el archivo real al cargar.
+  vertical desde una línea central tenue), `vu` (medidor de nivel mono en
+  escala dBFS: el RMS se mapea de -60 dBFS → 0% a 0 dBFS → 100% con clamp
+  en los extremos, así música típica usa un rango visible de la barra en
+  vez de quedarse cerca del piso; barra horizontal con gradiente del tema,
+  marca de pico en `spectrum_high` que decae en ~800 ms y escala tenue;
+  mono porque el tap ya promedia los canales — ver nota T4) o `circular`
+  (plot polar grueso de las 32 bandas como radios desde el centro, con el
+  gradiente del tema por distancia al centro y centro tenue; compensa el
+  aspecto ~1:2 de la celda). Un valor inválido avisa y se usa `barras`. El
+  valor `caida` (modo eliminado) avisa específicamente y cae a `barras`,
+  autocorrigiendo además el archivo real al cargar.
 - Si dos acciones distintas quedan mapeadas a la misma tecla, gana la de
   mayor prioridad en el dispatch y se genera un warning que lo explicita
   (la perdedora vuelve a sus defaults libres).

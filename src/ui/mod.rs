@@ -3598,8 +3598,9 @@ fn paint_mirror(
     }
 }
 
-/// T4 (modos-visualizador): medidor VU MONO horizontal con el RMS del tap
-/// actual (ver `SpectrumAnalyzer::vu`: un solo nivel, decisión documentada
+/// T4 (modos-visualizador): medidor VU MONO horizontal con el nivel dBFS
+/// del tap actual (ver `SpectrumAnalyzer::vu`/`db_meter_level`: un solo
+/// nivel en escala -60..0 dBFS, no RMS lineal; decisión mono documentada
 /// ahí — el estéreo exigiría tocar el hot path del callback de audio).
 ///
 /// Decisiones (testeadas en los tests `paint_vu_*`):
