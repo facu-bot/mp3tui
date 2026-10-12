@@ -1002,25 +1002,14 @@ fn normalize_key(key: KeyCode) -> KeyCode {
     }
 }
 
-/// Resuelve colisiones de teclas entre acciones distintas. El dispatch
-/// (if/else if con orden fijo) haría que la acción posterior quede sombreada
-/// en silencio: el usuario remapea, "no le funciona" y no hay ningún aviso —
-/// a diferencia del resto de los casos inválidos de la config, que sí avisan.
+/// Resuelve colisiones de teclas entre acciones distintas y avisa con un
+/// warning: el dispatch (por orden fijo) dejaría la acción perdedora
+/// sombreada en silencio.
 ///
-/// Reglas:
-/// 1. Se recorren las acciones en orden de prioridad del dispatch: primero
-///    las del explorador que se chequean antes (`back`, `select`), después el
-///    orden del player y por último la navegación del explorador. Si un par
-///    se resuelve distinto en cada modo (seek/speed van arriba en el player y
-///    abajo en el explorador) manda el orden del player: es el modo de
-///    arranque y el par coexiste ahí.
-/// 2. Colisión heredada de los defaults (Esc en `back`/`quit`, ↑/↓ en
-///    volumen/mover): no se avisa ni se modifica nada, el dispatch la
-///    resuelve por orden como siempre.
-/// 3. Si no, gana la primera en el orden; la perdedora pierde esa tecla y,
-///    si queda sin teclas, vuelve a sus defaults que estén libres (o queda
-///    sin bindear si ninguno está libre). Cada pérdida genera un warning que
-///    dice quién gana, quién pierde y cómo quedó la perdedora.
+/// Se recorren las acciones en orden de prioridad del dispatch; gana la
+/// primera y la perdedora pierde esa tecla (si queda sin teclas, vuelve a
+/// sus defaults que estén libres). Las colisiones heredadas de los defaults
+/// se dejan como están.
 fn resolve_key_collisions(keys: &mut Keys, warnings: &mut Vec<String>) {
     let defaults = Keys::default();
 

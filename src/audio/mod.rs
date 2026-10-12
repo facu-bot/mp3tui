@@ -239,18 +239,11 @@ struct Shared {
     /// Estado mutable por sesión protegido por mutex. `session.id` es la
     /// fuente autoritativa de verdad para resolver carreras entre sesiones.
     session: Mutex<SessionState>,
-    /// Copia atómica de `session.id` utilizada como camino rápido sin bloqueo
-    /// (lock-free fast path) para chequeos frecuentes en el hilo URL (`is_current`)
-    /// y en el loop de decodificación.
-    ///
-    /// Seguridad:
-    /// 1. Los IDs de sesión crecen de forma estrictamente monótona (con wrapping tras u64::MAX).
-    /// 2. Un chequeo atómico con ordenamiento `Acquire` es conservador: si observa
-    ///    un ID distinto al de la sesión del hilo, el hilo es definitivamente obsoleto
-    ///    y puede abortar de inmediato sin adquirir el lock.
-    /// 3. Toda mutación sensible (publicar cancel_handle, cambiar is_seekable o escribir
-    ///    errores) re-valida `session.id == session_id` bajo el mutex `session`
-    ///    (fuente autoritativa).
+    /// Copia atómica de `session.id` para chequeos frecuentes sin lock
+    /// (`is_current`, loop de decodificación). Los IDs crecen de forma
+    /// monótona, así que un chequeo `Acquire` que ve un ID distinto marca al
+    /// hilo como obsoleto sin tomar el mutex; las mutaciones sensibles
+    /// re-validan el id bajo `session`.
     session_id: AtomicU64,
     /// Sticky: la última reproducción falló (apertura, decode o device).
     /// A diferencia de `error` (que se consume con `take_error`), este flag

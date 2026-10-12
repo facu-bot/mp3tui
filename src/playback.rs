@@ -166,22 +166,14 @@ pub const URL_REPLAY_TOO_SOON_MSG: &str = "La canción terminó enseguida; no se
 
 /// Regla única de fin natural de pista, igual para local y para URL.
 ///
-/// - `One` repite la misma pista, incluida una URL, siempre que la sesión de
-///   URL haya durado al menos [`MIN_URL_REPLAY`] (`played`); por debajo del
-///   umbral → `StopTooSoon` (la UI avisa con [`URL_REPLAY_TOO_SOON_MSG`]).
-///   Un archivo local se repite sin mínimo: no hay red que agotar.
-/// - `Off` avanza sin envolver: al final de la lista (o del orden de shuffle,
-///   donde cada pista suena una vez por ciclo) → `Stop`.
-/// - `All` avanza y envuelve, también dentro del orden de shuffle.
-/// - Una URL no está en la lista: `finished_url` descarta cualquier posición
-///   residual de la selección local y el avance entra a la biblioteca desde el
-///   inicio del orden de navegación (con shuffle, el primer elemento del
-///   orden mezclado).
-/// - Un tema local que quedó fuera de la vista (filtro/rescann) no tiene
-///   posición: `current == None` sin `finished_url` → `Stop` (no se confunde
-///   con un fin de URL, que sí entra a la biblioteca).
-/// - `One` gobierna aunque la lista esté vacía: la pista terminada es el
-///   propio objetivo del replay; `Off`/`All` sin lista → `Stop`.
+/// - `One` repite la misma pista. Una URL solo se repite si duró al menos
+///   [`MIN_URL_REPLAY`]; por debajo devuelve `StopTooSoon` (la UI avisa con
+///   [`URL_REPLAY_TOO_SOON_MSG`]). Un archivo local no tiene mínimo.
+/// - `Off` avanza sin envolver y `All` avanza envolviendo; al agotarse la
+///   lista (o el orden de shuffle) devuelven `Stop`.
+/// - Una URL terminada (`finished_url`) entra a la biblioteca desde el inicio
+///   del orden de navegación; una pista local fuera de la vista
+///   (`current == None`) no.
 pub fn natural_end_action(
     repeat: RepeatMode,
     shuffle: bool,

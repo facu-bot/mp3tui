@@ -240,20 +240,11 @@ impl SpectrumAnalyzer {
         (sum / take as f32).sqrt()
     }
 
-    /// Nivel VU mono del modo `vu`: sigue el nivel dBFS (`db_meter_level`
-    /// del RMS, no el RMS lineal) con el mismo suavizado attack/decay de
-    /// las bandas (sin jitter) y el pico sube en el acto y baja con
-    /// `PEAK_FALL`, sin quedar nunca debajo del nivel.
-    ///
-    /// Escala dBFS, no lineal: música típica (-18..-12 dBFS de RMS) usa
-    /// 70-80% de la escala en vez de 12-25% (ver `db_meter_level` y
-    /// `VU_FLOOR_DB`/`VU_CEIL_DB`); un seno a escala completa (-3 dBFS)
-    /// converge cerca del techo, ~0.95.
-    ///
-    /// El tap ya promedia a mono en el callback (`tap.push_slice(&mono)` en
-    /// `src/audio/mod.rs`, que suma los canales y divide); un VU estéreo L/R
-    /// exigiría llevar los canales por separado por ese hot path (sin
-    /// refactors del motor). El render solo lee con `vu()`/`vu_peak()`.
+    /// Actualiza el nivel y el pico del modo `vu` a partir del RMS, en
+    /// escala dBFS (ver `db_meter_level`) y con el suavizado attack/decay de
+    /// las bandas. El pico sube en el acto y baja con `PEAK_FALL`, sin quedar
+    /// nunca debajo del nivel. La fuente ya es mono (el tap promedia en el
+    /// callback de audio).
     fn update_vu(&mut self, target: Option<f32>) {
         match target {
             Some(rms) => {

@@ -2639,17 +2639,11 @@ enum BarCellKind {
 }
 
 /// Mapea (ancho, fracción reproducida, secciones precargadas) a un estilo por
-/// celda, de izquierda a derecha. Función pura: la barra la usa para pintar y
-/// los tests la cubren sin tocar terminales.
+/// celda, de izquierda a derecha. Función pura, cubierta por tests.
 ///
-/// Reglas:
-/// - `played` y cada fracción `[s, e)` fuera de `[0,1]` se clampan.
-/// - Un rango degenerado (e <= s tras clampar) no pinta nada.
-/// - La celda `i` cubre el intervalo `[i/ancho, (i+1)/ancho)`: se pinta
-///   `Buffered` si algún rango la toca (overlap no vacío). Un rango diminuto
-///   no vacío pinta al menos la celda que toca; un rango vacío, ninguna.
-/// - Las celdas reproducidas conservan `Played`/`Tip` aunque un rango las cubra.
-/// - `ancho == 0` devuelve un vec vacío (nunca panica).
+/// Clampea `played` y las fracciones a `[0, 1]`; una celda se marca
+/// `Buffered` si algún rango la toca. Las celdas ya reproducidas conservan
+/// `Played`/`Tip`. `width == 0` devuelve vacío.
 fn progress_bar_cells(width: usize, played: f64, buffered: &[(f32, f32)]) -> Vec<BarCellKind> {
     if width == 0 {
         return Vec::new();
@@ -3401,36 +3395,12 @@ fn resolve_visualizer_paint(mode: config::VisualizerMode) -> VisualizerPaint {
     }
 }
 
-/// Plot polar GRUESO de las 32 bandas (intencionalmente
-/// grueso: la terminal no da para más, y así está acordado). Anillo pulsante
-/// rasterizado celda a celda, no 32 radios finos: cada celda se evalúa por su
-/// propia posición, así el contorno es continuo en vez de 32 picos aislados.
+/// Plot polar grueso de las 32 bandas: anillo pulsante rasterizado celda a
+/// celda (no 32 radios finos), así el contorno es continuo.
 ///
-/// Decisiones del render:
-/// - Centro flotante en la mitad del área útil; cada celda usa su propio
-///   centro `(x+0.5, y+0.5)`. `dx` en unidades de ancho de celda; `dy` se
-///   multiplica por 2 para compensar el aspecto ~1:2 de la celda (como las
-///   barras); `r = hypot(dx, dy·2)`.
-/// - `max_r = min(ancho/2, alto) - 0.5` (margen); si `max_r < 2` degrada a
-///   solo fondo, sin pánico. `base_r = 0.45·max_r` (hueco interior);
-///   `span = max_r - base_r`.
-/// - Ángulo → banda, simétrico izquierda/derecha: θ medido desde el norte
-///   sobre el vector compensado `(dx, dy·2)`, plegado con `a = |θ|/π ∈
-///   [0,1]` (0 = arriba, 1 = abajo); las columnas espejo dan el mismo `a`.
-///   El bajo queda ABAJO: `pos = (1-a)·(NUM_BANDS-1)` (banda 0 en `a=1`,
-///   agudos arriba), interpolado linealmente entre `floor(pos)` y
-///   `ceil(pos)` para que el contorno sea continuo entre bandas.
-/// - Celda llena (`band_full_glyph`) cuando hay nivel (`> 0`) y
-///   `base_r <= r <= base_r + nivel·span`, con gradiente radial
-///   `t = (r - base_r)/span` por `spectrum_color` (low junto al hueco →
-///   high en el borde exterior).
-/// - Anillo base: celdas con `|r - base_r| < 0.5` que no quedaron llenas de
-///   energía van con el mismo glifo en `theme.dim` (círculo visible en
-///   silencio, sin punto central). Hueco (`r < base_r - 0.5`): fondo, igual
-///   que las barras (`.` tenue en ascii, vacío en unicode).
-/// - Niveles con clamp a 0..1 por banda, antes de interpolar (así un nivel
-///   fuera de rango pinta igual que su valor límite sin importar con qué
-///   banda vecina interpole).
+/// Eje simétrico izquierda/derecha, con los graves abajo y los agudos arriba;
+/// el nivel de cada banda se interpola entre vecinas. El hueco interior queda
+/// como anillo base tenue, visible aun en silencio.
 fn paint_circular(
     buffer: &mut ratatui::buffer::Buffer,
     inner: Rect,
@@ -3602,25 +3572,11 @@ fn paint_mirror(
     }
 }
 
-/// Medidor VU MONO horizontal con el nivel dBFS
-/// del tap actual (ver `SpectrumAnalyzer::vu`/`db_meter_level`: un solo
-/// nivel en escala -60..0 dBFS, no RMS lineal; decisión mono documentada
-/// ahí — el estéreo exigiría tocar el hot path del callback de audio).
+/// Medidor VU mono horizontal sobre el nivel dBFS del tap
+/// (`vu`/`db_meter_level`), con los mismos glifos y gradiente que las barras.
 ///
-/// Decisiones del render:
-/// - Barra llena de izquierda a derecha con el gradiente del tema por columna
-///   (`spectrum_color`, como las barras: `spectrum_low` a la izquierda,
-///   `spectrum_high` a la derecha) y celda parcial con los mismos glifos de
-///   las barras (`band_full_glyph`/`band_frac_glyph`: `@`/rampa en ascii con
-///   fondo de puntos `.`, `█`/octavos en unicode — sin lógica duplicada).
-/// - Marca de pico con el decay `PEAK_FALL` del analizador (el render solo
-///   lee `peak`): tick vertical en `spectrum_high` sobre las filas de barra,
-///   con `band_full_glyph` (`█`/`@`) caiga el pico en el borde exacto de la
-///   columna o no — tapa la barra donde coincide para que siempre se vea.
-/// - Eje/escala tenue en `dim` en la última fila (`-` con tics `|` en ascii,
-///   `─` con tics `┼` en unicode, en 0/25/50/75/100%).
-/// - Panel muy bajo (1–2 filas): una sola fila de barra arriba, sin pico ni
-///   escala (degrada graceful sin pánico); niveles fuera de rango con clamp.
+/// El pico se marca con un tick y baja con `PEAK_FALL`. En paneles de 1–2
+/// filas se dibuja solo la barra, sin pico ni escala.
 fn paint_vu(
     buffer: &mut ratatui::buffer::Buffer,
     inner: Rect,
@@ -3750,25 +3706,13 @@ fn band_frac_glyph(frac: f32, ascii: bool) -> &'static str {
     }
 }
 
-/// Osciloscopio amplitud-vs-tiempo con la ventana triggered y con ganancia
-/// automática del analizador (`SpectrumAnalyzer::scope_window`): de más
-/// vieja a más nueva, la más reciente queda a la derecha.
+/// Osciloscopio amplitud-vs-tiempo con la ventana triggered y la ganancia
+/// automática del analizador (`scope_window`), de más vieja a más nueva.
 ///
-/// Decisiones del render:
-/// - Eje cero: fila central tenue (`-` en ascii, `─` en unicode, color `dim`);
-///   la onda lo tapa donde lo cruza y asoma donde se desvía.
-/// - Cada columna (o sub-columna Braille en unicode) se pinta con la
-///   envolvente mín/máx de las muestras que le tocan, para no saltarse
-///   ninguna, y se extiende para incluir el último punto de la columna
-///   anterior: así el trazo queda continuo, sin huecos columna a columna.
-/// - Unicode: Braille (U+2800, 2×4 puntos por celda) para el doble de
-///   resolución horizontal y el cuádruple de resolución vertical; cada
-///   celda se colorea con el gradiente del tema por altura
-///   (`spectrum_color`, como las barras).
-/// - Ascii: `#` (`ASCII_RAMP[8]`) relleno en el tramo conectado, fondo de
-///   puntos tenue (igual que las barras) donde no hay trazo.
-/// - [-1, 1] mapea al alto con clamp; áreas enanas (0×0, 1×1, 1–2 filas) y
-///   sin muestras degradan sin pánico (sin muestras solo se dibuja el eje).
+/// Cada columna se pinta con la envolvente mín/máx de sus muestras y se
+/// enlaza con la anterior para que el trazo sea continuo. En unicode usa
+/// Braille (2×4 por celda) con el gradiente del tema por altura; en ascii,
+/// `#` sobre el fondo de puntos tenue.
 fn paint_wave(
     buffer: &mut ratatui::buffer::Buffer,
     inner: Rect,
