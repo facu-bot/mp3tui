@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-//! Analizador de espectro FFT (T4): ventana Hann, rustfft, bandas logarítmicas
+//! Analizador de espectro FFT: ventana Hann, rustfft, bandas logarítmicas
 //! estilo cava y suavizado temporal con attack rápido y decay lento.
 
 use std::sync::Arc;
@@ -26,8 +26,7 @@ const ATTACK: f32 = 0.55;
 const DECAY: f32 = 0.16;
 /// Caída lineal del pico VU por `analyze()`: de techo a cero en 48 frames
 /// (≈ 800 ms a 60 fps). Las barras bajan con el DECAY existente (suavizado
-/// attack/decay); solo el pico tiene decay propio (testeado en
-/// `vu_decays_without_samples_and_peak_falls_with_peak_fall`).
+/// attack/decay); solo el pico tiene decay propio.
 const PEAK_FALL: f32 = 1.0 / 48.0;
 /// Piso de la escala dBFS del medidor VU: por debajo de esto (o en
 /// silencio) el nivel mapeado es 0.0.
@@ -38,7 +37,7 @@ const VU_CEIL_DB: f32 = 0.0;
 const TAP_READ_MAX: usize = 1 << 13;
 /// Ganancia previa a la compensación de potencia: la energía real de una
 /// banda de música queda muy por debajo del máximo teórico (un seno a
-/// escala completa), y sin esto las barras casi nunca se movían (T12).
+/// escala completa), y sin esto las barras casi nunca se movían.
 const GAIN: f32 = 5.0;
 /// Exponente de la compensación (< 1 aplana: sube lo bajo sin mandar lo
 /// alto directo al clip). 0.4 ≈ raíz suave; con GAIN=5 el clip cae en
@@ -84,7 +83,7 @@ pub struct SpectrumAnalyzer {
     /// Nivel VU mono para el modo `vu`: nivel dBFS (`db_meter_level` del
     /// RMS) suavizado de la señal del tap actual; ver `update_vu`.
     vu: f32,
-    /// Pico del medidor VU (T4): máximo visto del nivel, con decay
+    /// Pico del medidor VU: máximo visto del nivel, con decay
     /// `PEAK_FALL`, nunca por debajo del nivel actual.
     vu_peak: f32,
     /// Pico suavizado de |muestra| del osciloscopio (modo `onda`): attack
@@ -184,7 +183,7 @@ impl SpectrumAnalyzer {
         // = A * N/4 en un bin. La SUMA de la banda sobre ese factor devuelve
         // A sin importar cuántos bins tenga la banda; con la media anterior,
         // cada banda se diluía en 1/k y las bandas anchas (agudos) quedaban
-        // casi muertas — el problema de «las barras se ven chicas» (T12).
+        // casi muertas — el problema de «las barras se ven chicas».
         let norm = FFT_SIZE as f32 / 4.0;
         for (band, &(low, high)) in self.band_ranges.iter().enumerate() {
             let low = low.min(n_bins - 1);
@@ -249,14 +248,12 @@ impl SpectrumAnalyzer {
     /// Escala dBFS, no lineal: música típica (-18..-12 dBFS de RMS) usa
     /// 70-80% de la escala en vez de 12-25% (ver `db_meter_level` y
     /// `VU_FLOOR_DB`/`VU_CEIL_DB`); un seno a escala completa (-3 dBFS)
-    /// converge cerca del techo, ~0.95 (testeado en
-    /// `vu_is_a_single_mono_level_from_current_tap`).
+    /// converge cerca del techo, ~0.95.
     ///
-    /// Decisión mono documentada (nota T1/T4): el tap ya promedia a mono en
-    /// el callback (`tap.push_slice(&mono)` en `src/audio/mod.rs`, que suma
-    /// los canales y divide); un VU estéreo L/R exigiría llevar los canales
-    /// por separado por ese hot path, fuera del margen de T4 (sin refactors
-    /// del motor). El render solo lee con `vu()`/`vu_peak()`.
+    /// El tap ya promedia a mono en el callback (`tap.push_slice(&mono)` en
+    /// `src/audio/mod.rs`, que suma los canales y divide); un VU estéreo L/R
+    /// exigiría llevar los canales por separado por ese hot path (sin
+    /// refactors del motor). El render solo lee con `vu()`/`vu_peak()`.
     fn update_vu(&mut self, target: Option<f32>) {
         match target {
             Some(rms) => {
@@ -441,7 +438,7 @@ impl Default for SpectrumAnalyzer {
 }
 
 /// Energía de banda → altura 0..=1: ganancia fija + compresión de potencia,
-/// con clip en 1.0. Objetivo de T12: con música real a volumen normal las
+/// con clip en 1.0. Objetivo: con música real a volumen normal las
 /// barras usan un rango amplio de la altura disponible y los picos siguen
 /// notándose (llegan al tope, no todo el tiempo).
 fn shape(energy: f32) -> f32 {
@@ -464,7 +461,7 @@ fn db_meter_level(rms: f32) -> f32 {
 mod tests {
     use super::*;
 
-    // T9 (modos-visualizador): osciloscopio triggered con ganancia
+    // Osciloscopio triggered con ganancia
     // automática (ver `scope_window`/`trigger_window`/`wave_gain`).
     // ------------------------------------------------------------------
 
@@ -597,7 +594,7 @@ mod tests {
         );
     }
 
-    // T4 (modos-visualizador): medidor VU MONO con RMS de la señal, mapeado
+    // Medidor VU MONO con RMS de la señal, mapeado
     // a una escala dBFS (ver `db_meter_level`).
     // ------------------------------------------------------------------
 
@@ -652,11 +649,10 @@ mod tests {
 
     #[test]
     fn vu_is_a_single_mono_level_from_current_tap() {
-        // Decisión estéreo-vs-mono con test en mano (nota T1/T4): el tap ya
-        // promedia a MONO en el callback (`tap.push_slice(&mono)` en
-        // `src/audio/mod.rs`); sacar L/R exigiría tocar ese hot path, fuera
-        // del margen de T4. El VU expone UN solo (nivel, pico) desde el ring
-        // mono actual, sin canales por separado.
+        // El tap ya promedia a MONO en el callback (`tap.push_slice(&mono)`
+        // en `src/audio/mod.rs`); sacar L/R exigiría tocar ese hot path. El
+        // VU expone UN solo (nivel, pico) desde el ring mono actual, sin
+        // canales por separado.
         let mut analyzer = SpectrumAnalyzer::new();
         analyzer.sample_rate = 44_100;
         analyzer.band_ranges = SpectrumAnalyzer::compute_ranges(44_100);
@@ -754,7 +750,7 @@ mod tests {
             "un seno a escala completa llega al tope"
         );
 
-        // El objetivo de T12: música real (energías bajas) se ve.
+        // El objetivo: música real (energías bajas) se ve.
         let quiet = shape(0.05);
         assert!(quiet >= 0.3, "señal débil visible, obtenido {quiet}");
 

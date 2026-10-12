@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
-//! Motor de audio (T2): decodificación con symphonia, salida con cpal y un ring
-//! buffer compartido con muestras PCM para el visualizador FFT (T4).
+//! Motor de audio: decodificación con symphonia, salida con cpal y un ring
+//! buffer compartido con muestras PCM para el visualizador FFT.
 
 use std::fmt;
 use std::fs::File;
@@ -32,7 +32,7 @@ const TAP_BUF_SAMPLES: usize = 1 << 13;
 /// Espera máxima, al aplicar un seek, a que el callback vacíe el ring viejo.
 const SEEK_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 
-/// Velocidad de reproducción (T8): multiplicador sobre el paso del resampler,
+/// Velocidad de reproducción: multiplicador sobre el paso del resampler,
 /// en pasos de 0.25 entre 0.5x y 2.0x.
 pub const SPEED_MIN: f32 = 0.5;
 pub const SPEED_MAX: f32 = 2.0;
@@ -143,7 +143,7 @@ pub fn hint_from_url_and_content_type(url: &str, content_type: Option<&str>) -> 
     hint
 }
 
-/// Consumidor de muestras mono para el visualizador FFT (T4).
+/// Consumidor de muestras mono para el visualizador FFT.
 pub struct VisualizerTap {
     consumer: Option<HeapCons<f32>>,
     sample_rate: u32,
@@ -756,7 +756,7 @@ impl AudioEngine {
             .and_then(|mut guard| guard.take())
     }
 
-    /// Handle compartido para leer las muestras mono que suena el device (T4).
+    /// Handle compartido para leer las muestras mono que suena el device.
     pub fn visualizer(&self) -> Arc<Mutex<VisualizerTap>> {
         Arc::clone(&self.tap)
     }
@@ -1359,7 +1359,7 @@ fn run_decode(
             ));
         }
 
-        // Velocidad variable (T8): la UI escribe `shared.speed` y se aplica
+        // Velocidad variable: la UI escribe `shared.speed` y se aplica
         // acá, en el hilo dueño del resampler. Si la velocidad es != 1 pero
         // src == device no había resampler (rate matching era identidad), se
         // crea con paso base 1.0 para poder aplicar el multiplicador igual.
@@ -1422,7 +1422,7 @@ struct LinearResampler {
     /// Paso base del rate matching (src_rate / dst_rate). El paso efectivo
     /// es `step_base * speed`.
     step_base: f64,
-    /// Multiplicador de velocidad (T8), clampeado a `[SPEED_MIN, SPEED_MAX]`.
+    /// Multiplicador de velocidad, clampeado a `[SPEED_MIN, SPEED_MAX]`.
     speed: f32,
     frac: f64,
     channels: usize,

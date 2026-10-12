@@ -23,14 +23,14 @@ struct Cli {
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    // Config (T9): se carga una vez acá para que los avisos salgan a stderr
+    // Config: se carga una vez acá para que los avisos salgan a stderr
     // antes de que la TUI tome la pantalla; cada campo inválido cayó a su
     // default en config::parse.
     for warning in &config::init().warnings {
         eprintln!("mp3tui: config: {warning}");
     }
 
-    // Sin target: biblioteca por defecto (T15: carpetas conocidas del sistema
+    // Sin target: biblioteca por defecto (carpetas conocidas del sistema
     // que existan, unidas a las [library] roots configuradas).
     // Con URL: reproducción remota (directa o via yt-dlp) en background.
     // Con carpeta: explorador solo en esa carpeta (la CLI tiene prioridad).

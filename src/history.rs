@@ -1,8 +1,9 @@
-//! Historial de URLs reproducidas (T1).
+//! Historial de URLs reproducidas.
 //!
 //! Guarda hasta 20 entradas (título + URL original), ordenadas de la más
 //! reciente a la más antigua. Se persiste en formato TOML en el directorio de
-//! configuración (`%APPDATA%\mp3tui\history.toml` o el directorio indicado por
+//! configuración (la misma carpeta que `config.toml`: `%APPDATA%\mp3tui` en
+//! Windows, `~/.config/mp3tui` en Linux/macOS; o el directorio indicado por
 //! `MP3TUI_CONFIG`).
 
 use std::fs;

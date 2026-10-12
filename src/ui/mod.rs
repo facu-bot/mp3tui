@@ -1,9 +1,9 @@
 #![allow(dead_code)]
 
 //! Interfaz de terminal: layout con ratatui y loop de eventos no bloqueante.
-//! Reproducción (T3+T4) y explorador de biblioteca (T5). Con sesión de audio
+//! Reproducción y explorador de biblioteca. Con sesión de audio
 //! el reproductor (info + visualizador) es el fondo permanente y el
-//! explorador se superpone como panel lateral con Ctrl+Tab/b/Tab (T13); a
+//! explorador se superpone como panel lateral con Ctrl+Tab/b/Tab; a
 //! pantalla completa solo cuando no hay player (arranque por directorio).
 
 use std::io;
@@ -42,7 +42,7 @@ const EIGHTH_BLOCKS: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇
 const ASCII_RAMP: [&str; 10] =
     [" ", ".", ":", "-", "=", ";", "+", "*", "#", "@"];
 
-// Paleta compartida por todo el programa (T9/T12): la celda runtime de
+// Paleta compartida por todo el programa: la celda runtime de
 // config, que cambia en caliente al previsualizar/aplicar temas desde el menú
 // (default: la del `[theme] name` cargado al arrancar). Copia de 11 `Color`
 // por llamada; barato por frame.
@@ -82,7 +82,7 @@ pub enum StartMode {
         kind: crate::source::UrlKind,
         roots: Vec<PathBuf>,
     },
-    /// Sin argumento (T15: carpetas conocidas + `[library]` roots) o con
+    /// Sin argumento (carpetas conocidas + `[library]` roots) o con
     /// carpeta: explorador de la biblioteca, agrupado por carpeta de origen.
     Browse(Vec<PathBuf>),
 }
@@ -188,7 +188,7 @@ fn handle_ytdlp_result(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Pantalla de fondo. Con sesión de audio siempre es `Player`; el explorador
-/// se superpone como panel lateral (`App::explorer_open`, T13) sin
+/// se superpone como panel lateral (`App::explorer_open`) sin
 /// reemplazarlo. `Browser` a pantalla completa es el caso sin player
 /// (arranque por directorio): no hay fondo que mostrar detrás de la lista.
 enum Mode {
@@ -231,10 +231,10 @@ type YtDlpMessage = (
 
 struct App {
     mode: Mode,
-    /// Panel lateral del explorador superpuesto sobre el reproductor (T13).
+    /// Panel lateral del explorador superpuesto sobre el reproductor.
     /// Solo tiene efecto en `Mode::Player`.
     explorer_open: bool,
-    /// Raíces escaneadas (T14/T15): CLI, o bien las carpetas conocidas del
+    /// Raíces escaneadas: CLI, o bien las carpetas conocidas del
     /// sistema unidas a las `[library]` roots de la config.
     roots: Vec<PathBuf>,
     /// Última biblioteca conocida; `None` mientras no terminó el primer escaneo.
@@ -276,17 +276,17 @@ struct App {
     pub history: crate::history::History,
     pub pending_history: Option<(String, String)>,
     pub history_path: Option<PathBuf>,
-    /// Menú de temas abierto (T12): `Some` mientras el modal está activo.
+    /// Menú de temas abierto: `Some` mientras el modal está activo.
     theme_menu: Option<ThemeMenuState>,
-    /// Selector de bandas abierto (T3): `Some` mientras el sub-modal está
+    /// Selector de bandas abierto: `Some` mientras el sub-modal está
     /// activo (el panel sigue abierto debajo).
     bands_menu: Option<BandsMenuState>,
-    /// Selector de modo abierto (T1 modos-visualizador): `Some` mientras el
+    /// Selector de modo abierto: `Some` mientras el
     /// sub-modal está activo (el panel sigue abierto debajo).
     mode_menu: Option<ModeMenuState>,
-    /// Panel de configuración abierto (T1): `Some` mientras el modal está activo.
+    /// Panel de configuración abierto: `Some` mientras el modal está activo.
     settings_panel: Option<SettingsPanelState>,
-    /// Captura del mouse en vivo (T4): arranca con el valor de `[ui] mouse`
+    /// Captura del mouse en vivo: arranca con el valor de `[ui] mouse`
     /// y el toggle del panel la cambia en el momento (+ persiste).
     /// `handle_mouse` la respeta por encima del chequeo de modales.
     mouse_enabled: bool,
@@ -420,7 +420,7 @@ fn footer_chip_spans(text: &str) -> (Vec<Span<'static>>, Vec<(u16, u16, String)>
 /// «Esc×2»): la primera de la lista. `None` si no es un atajo.
 fn key_for_chip(keys_text: &str) -> Option<KeyCode> {
     let first = keys_text.split(['/', ' ']).next()?.trim_end_matches("×2");
-    // «Ctrl+P: config» (T1): la acción `settings` exige Ctrl, así que el
+    // «Ctrl+P: config»: la acción `settings` exige Ctrl, así que el
     // prefijo se resuelve solo contra sus teclas (sin distinguir mayúsculas:
     // el chip muestra «P» y el binding es «p»).
     if let Some(rest) = first.strip_prefix("Ctrl+") {
@@ -569,7 +569,7 @@ fn mouse_action(hit: &HitMap, drag: Option<Drag>, event: MouseEvent) -> (MouseAc
 }
 
 /// Aplica un evento de mouse (clic/arrastre en barras, rueda) si el estado
-/// vivo `mouse_enabled` (T4: arranca con `[ui] mouse`, el toggle lo cambia)
+/// vivo `mouse_enabled` (arranca con `[ui] mouse`, el toggle lo cambia)
 /// lo permite.
 fn handle_mouse(event: MouseEvent, app: &mut App, engine: &mut AudioEngine) {
     if !app.mouse_enabled {
@@ -680,7 +680,7 @@ fn request_quit(app: &mut App) {
     }
 }
 
-/// Estado del menú de temas (T12): selección con previsualización en vivo y
+/// Estado del menú de temas: selección con previsualización en vivo y
 /// el tema con el que se abrió (para el marcador y para restaurar con Esc).
 struct ThemeMenuState {
     /// Índice en `config::builtin_themes()`.
@@ -691,7 +691,7 @@ struct ThemeMenuState {
     original_theme: Theme,
 }
 
-/// Estado del selector de bandas (T3): selección con previsualización en
+/// Estado del selector de bandas: selección con previsualización en
 /// vivo y el estilo con el que se abrió (para el marcador y para restaurar
 /// con Esc). Espejo de `ThemeMenuState` sobre los 3 valores fijos.
 struct BandsMenuState {
@@ -701,7 +701,7 @@ struct BandsMenuState {
     original: config::VisualizerStyle,
 }
 
-/// Estado del selector de modo (T1 modos-visualizador): selección con
+/// Estado del selector de modo: selección con
 /// previsualización en vivo y el modo con el que se abrió (para el marcador
 /// y para restaurar con Esc). Espejo de `BandsMenuState` sobre los 5 valores
 /// fijos.
@@ -712,13 +712,13 @@ struct ModeMenuState {
     original: config::VisualizerMode,
 }
 
-/// Filas fijas del panel de configuración: Temas (T2) abre su sub-modal,
-/// Bandas (T3) el suyo, Mouse (T4) su toggle y Modo (T1 modos-visualizador)
+/// Filas fijas del panel de configuración: Temas abre su sub-modal,
+/// Bandas el suyo, Mouse su toggle y Modo
 /// el suyo. El orden es estable: la cuarta fila va AL FINAL, sin reordenar
 /// las existentes.
 const SETTINGS_ROWS: [&str; 4] = ["Temas", "Mouse", "Bandas", "Modo"];
 
-/// Estado del panel de configuración (T1: shell sin contenido): selección por
+/// Estado del panel de configuración (shell sin contenido): selección por
 /// índice sobre `SETTINGS_ROWS`.
 struct SettingsPanelState {
     /// Índice en `SETTINGS_ROWS`.
@@ -820,7 +820,7 @@ pub fn run(engine: &mut AudioEngine, start: StartMode) -> io::Result<()> {
         has_player,
         track_label,
         status: status_of(engine),
-        // Avisos de la config (T9) e historial: en la primera pantalla, además del
+        // Avisos de la config  e historial: en la primera pantalla, además del
         // stderr que ya imprimió main. Con config limpia queda `None`.
         error: initial_error,
         should_quit: false,
@@ -1059,28 +1059,28 @@ fn dispatch_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine) {
     }
 
     // Menú de temas: con el menú abierto las teclas van al menú —vale igual
-    // como sub-modal del panel (T2), que sigue abierto debajo y retoma al
+    // como sub-modal del panel, que sigue abierto debajo y retoma al
     // cerrar el sub-modal con Enter/Esc—.
     if app.theme_menu.is_some() {
         handle_theme_menu_key(key, app, config::persist_theme_name);
         return;
     }
 
-    // Selector de bandas (T3): sub-modal del panel con la misma prioridad
+    // Selector de bandas: sub-modal del panel con la misma prioridad
     // que el de temas (nunca están abiertos los dos a la vez).
     if app.bands_menu.is_some() {
         handle_bands_menu_key(key, app, config::persist_visualizer_style);
         return;
     }
 
-    // Selector de modo (T1 modos-visualizador): sub-modal del panel con la
+    // Selector de modo: sub-modal del panel con la
     // misma prioridad que los otros dos (nunca hay dos abiertos a la vez).
     if app.mode_menu.is_some() {
         handle_mode_menu_key(key, app, config::persist_visualizer_mode);
         return;
     }
 
-    // Panel de configuración (T1): con el panel abierto las teclas van al
+    // Panel de configuración: con el panel abierto las teclas van al
     // panel (los modales son excluyentes: el primero que está abierto gana).
     if app.settings_panel.is_some() {
         handle_settings_panel_key(key, app, config::persist_mouse_enabled);
@@ -1095,7 +1095,7 @@ fn dispatch_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine) {
     }
 
     match app.mode {
-        // Panel lateral abierto (T13): la lista manda las flechas, pero los
+        // Panel lateral abierto: la lista manda las flechas, pero los
         // atajos de reproducción (pausa, seek, n/p…) siguen activos.
         Mode::Player if app.explorer_open => handle_list_key(key, app, engine),
         Mode::Player => handle_player_key(key, app, engine),
@@ -1145,9 +1145,9 @@ fn handle_player_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine) {
 }
 
 /// Teclas de la lista del explorador: navegar y reproducir. Con el panel
-/// lateral abierto (T13) corre en `Mode::Player` y suma los atajos de
+/// lateral abierto corre en `Mode::Player` y suma los atajos de
 /// reproducción (pausa, seek, n/p, velocidad…) sobre la lista; con el
-/// explorador a pantalla completa (sin player) es el modo viejo de T5.
+/// explorador a pantalla completa (sin player) es el modo sin sesión de audio.
 fn handle_list_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine) {
     let keys = &config::config().keys;
     let view_len = app.view.len();
@@ -1158,7 +1158,7 @@ fn handle_list_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine) {
         open_settings_panel(app);
     // El orden importa: «back» antes que «quit» — Esc cierra el panel (o
     // sale del explorador sin player) aunque Esc también esté en «quit».
-    // Tab no está en «back» (T14): cae en «explorer» y no-opea sin player.
+    // Tab no está en «back»: cae en «explorer» y no-opea sin player.
     } else if config::pressed(&keys.back, code) {
         go_back(app);
     } else if config::pressed(&keys.explorer, code) {
@@ -1393,7 +1393,7 @@ fn cancel_pending_ytdlp(app: &mut App) {
     app.pending_history = None;
 }
 
-// --- Menú de temas (T12) ----------------------------------------------------
+// --- Menú de temas ----------------------------------------------------
 
 fn open_theme_menu(app: &mut App) {
     let name = config::active_theme_name();
@@ -1448,7 +1448,7 @@ fn handle_theme_menu_key(
     }
 }
 
-// --- Selector de bandas (T3: sub-modal del panel) ---------------------------
+// --- Selector de bandas (sub-modal del panel) ---------------------------
 
 fn open_bands_menu(app: &mut App) {
     let current = config::active_visualizer_style();
@@ -1503,7 +1503,7 @@ fn handle_bands_menu_key(
     }
 }
 
-// --- Selector de modo (T1 modos-visualizador: sub-modal del panel) ---------
+// --- Selector de modo (sub-modal del panel) ---------
 
 fn open_mode_menu(app: &mut App) {
     let current = config::active_visualizer_mode();
@@ -1559,7 +1559,7 @@ fn handle_mode_menu_key(
     }
 }
 
-// --- Panel de configuración (T1: shell) -------------------------------------
+// --- Panel de configuración (shell) -------------------------------------
 
 /// Aplica la captura del mouse en la terminal en el momento (efecto
 /// inmediato del toggle; el cierre del panel no la toca: el toggle manda).
@@ -1571,7 +1571,7 @@ fn apply_mouse_capture(enabled: bool) {
     }
 }
 
-/// Alterna el mouse en vivo (T4): cambia el estado, aplica la captura en el
+/// Alterna el mouse en vivo: cambia el estado, aplica la captura en el
 /// momento y persiste `[ui] mouse`. Como Temas/Bandas, se aplica primero y
 /// un fallo de guardado solo deja el aviso; el panel sigue abierto.
 fn toggle_mouse(app: &mut App, persist: impl FnOnce(bool) -> Result<(), String>) {
@@ -1601,7 +1601,7 @@ fn handle_settings_panel_key(
             let delta = if matches!(key.code, KeyCode::Up) { -1 } else { 1 };
             panel.selected = move_selection(panel.selected, delta, SETTINGS_ROWS.len());
         }
-        // T2/T3/T4 + T1 modos-visualizador: Enter en «Temas» abre el
+        // Enter en «Temas» abre el
         // ThemeMenuState existente como sub-modal, Enter en «Bandas» abre el
         // selector de estilos, Enter en «Modo» abre el selector de modos (el
         // panel sigue abierto debajo; el dispatch prioriza al sub-modal y
@@ -1656,7 +1656,7 @@ fn bands_menu_lines(menu: &BandsMenuState) -> Vec<Line<'static>> {
         .collect()
 }
 
-/// Modal centrado del selector de bandas (T3), mismo estilo que el de temas.
+/// Modal centrado del selector de bandas, mismo estilo que el de temas.
 fn render_bands_menu(frame: &mut Frame<'_>, menu: &BandsMenuState) {
     let area = frame.area();
     let width = 44.min(area.width.saturating_sub(4)).max(24);
@@ -1706,7 +1706,7 @@ fn mode_menu_lines(menu: &ModeMenuState) -> Vec<Line<'static>> {
         .collect()
 }
 
-/// Modal centrado del selector de modo (T1 modos-visualizador), mismo estilo
+/// Modal centrado del selector de modo, mismo estilo
 /// que el de bandas.
 fn render_mode_menu(frame: &mut Frame<'_>, menu: &ModeMenuState) {
     let area = frame.area();
@@ -1872,7 +1872,7 @@ fn submit_url_prompt_with(
     }
 }
 
-/// Lanza el escaneo de `app.roots` en un thread aparte (T14: una o varias
+/// Lanza el escaneo de `app.roots` en un thread aparte (una o varias
 /// carpetas, agrupadas por carpeta de origen). Si ya hay un escaneo en
 /// curso no lanza otro (el resultado viejo sigue siendo válido).
 fn start_scan(app: &mut App) {
@@ -1925,7 +1925,7 @@ fn toggle_play(app: &mut App, engine: &mut AudioEngine) {
 
 /// Enter en la lista: reproduce la pista seleccionada. Con el explorador a
 /// pantalla completa pasa al modo reproducción; con el panel lateral abierto
-/// (T13) el panel se mantiene y el reproductor de fondo arranca la pista. Si
+/// el panel se mantiene y el reproductor de fondo arranca la pista. Si
 /// el archivo no se puede abrir, seguimos donde estábamos con el error visible.
 fn play_selected(app: &mut App, engine: &mut AudioEngine) {
     let Some(item) = app.view.get(app.selected).copied() else {
@@ -2142,8 +2142,8 @@ fn handle_natural_end_with(
     }
 }
 
-/// Acción de «back» (Esc, T14) desde la lista: con el panel lateral abierto
-/// (T13) lo cierra y deja el reproductor de fondo; con el explorador a
+/// Acción de «back» (Esc) desde la lista: con el panel lateral abierto
+/// lo cierra y deja el reproductor de fondo; con el explorador a
 /// pantalla completa vuelve al player si hay sesión y si no sale de la app.
 fn go_back(app: &mut App) {
     if app.explorer_open {
@@ -2155,11 +2155,11 @@ fn go_back(app: &mut App) {
     }
 }
 
-/// 'b' / Tab / Ctrl+Tab: alterna el panel lateral del explorador (T13).
+/// 'b' / Tab / Ctrl+Tab: alterna el panel lateral del explorador.
 /// Al abrirlo re-sincroniza la selección con la pista sonando y reescanea
 /// las raíces en background (si ya hay un escaneo en curso, no lanza otro).
 /// Sin sesión de audio no hace nada: el explorador ya ocupa toda la
-/// pantalla (T14: así Tab sin player no sale de la app).
+/// pantalla (así Tab sin player no sale de la app).
 fn toggle_explorer(app: &mut App) {
     if !app.has_player {
         return;
@@ -2188,18 +2188,18 @@ fn render(frame: &mut Frame<'_>, app: &App, engine: &AudioEngine) {
         render_settings_panel(frame, panel, app.mouse_enabled);
     }
 
-    // El sub-modal de bandas (T3) va encima del panel.
+    // El sub-modal de bandas  va encima del panel.
     if let Some(menu) = &app.bands_menu {
         render_bands_menu(frame, menu);
     }
 
-    // El sub-modal de modo (T1 modos-visualizador) va encima del panel, como
+    // El sub-modal de modo  va encima del panel, como
     // el de bandas (nunca están abiertos los dos a la vez).
     if let Some(menu) = &app.mode_menu {
         render_mode_menu(frame, menu);
     }
 
-    // El sub-modal de temas (T2) va encima del panel: se dibuja último.
+    // El sub-modal de temas  va encima del panel: se dibuja último.
     if let Some(menu) = &app.theme_menu {
         render_theme_menu(frame, menu);
     }
@@ -2230,7 +2230,7 @@ fn render_url_prompt(frame: &mut Frame<'_>, input: &str) {
     frame.render_widget(Paragraph::new(vec![line]), inner);
 }
 
-/// Modal centrado de temas (T12), al estilo del prompt de URL.
+/// Modal centrado de temas, al estilo del prompt de URL.
 fn render_theme_menu(frame: &mut Frame<'_>, menu: &ThemeMenuState) {
     let area = frame.area();
     let width = 44.min(area.width.saturating_sub(4)).max(24);
@@ -2255,7 +2255,7 @@ fn render_theme_menu(frame: &mut Frame<'_>, menu: &ThemeMenuState) {
     frame.render_widget(Paragraph::new(theme_menu_lines(menu)), inner);
 }
 
-/// Modal centrado del panel (T1), con el mismo estilo del modal de temas:
+/// Modal centrado del panel, con el mismo estilo del modal de temas:
 /// fondo limpio + borde acentuado con título.
 fn render_settings_panel(
     frame: &mut Frame<'_>,
@@ -2285,7 +2285,7 @@ fn render_settings_panel(
     frame.render_widget(Paragraph::new(settings_panel_lines(panel, mouse_enabled)), inner);
 }
 
-/// Filas del panel (T4: «Mouse» muestra el estado vivo; el resto fijas): la
+/// Filas del panel («Mouse» muestra el estado vivo; el resto fijas): la
 /// selección va resaltada como en el menú de temas.
 fn settings_panel_lines(
     panel: &SettingsPanelState,
@@ -2328,7 +2328,7 @@ fn accent_title(text: &str) -> Span<'static> {
     )
 }
 
-/// Mejora 3: iconos Unicode en los estados de reproducción.
+/// Iconos Unicode en los estados de reproducción.
 fn status_parts(status: Status) -> (&'static str, Color) {
     match status {
         Status::Playing => ("▶  Reproduciendo", theme().ok),
@@ -2392,12 +2392,12 @@ fn error_line(app: &App) -> Line<'static> {
 }
 
 /// Áreas del reproductor: info (8 filas), visualizador (resto) y pie. Con el
-/// panel lateral abierto (T13) info + visualizador se achican al 64% del
+/// panel lateral abierto info + visualizador se achican al 64% del
 /// ancho y el explorador ocupa el 36% derecho superpuesto (más barras
 /// visibles pero el espectro sigue animando); el pie crece a 5 filas (3 de
 /// texto) para los atajos del panel y sigue a todo lo ancho para no cortarse.
 ///
-/// Mejora 6: footer comprimible — si `area.height < 30`, el pie se reduce a
+/// Footer comprimible — si `area.height < 30`, el pie se reduce a
 /// 2 filas (1 de borde + 1 de contenido) independientemente del panel.
 fn player_areas(area: Rect, explorer_open: bool) -> (Rect, Rect, Rect, Option<Rect>) {
     // Umbral de compresión: con exactamente 30 filas se usa el layout completo.
@@ -2448,7 +2448,7 @@ fn render_player(frame: &mut Frame<'_>, app: &App, engine: &AudioEngine) {
         player_areas(frame.area(), app.explorer_open);
     app.hit.borrow_mut().player = Some(info_area.union(visual_area));
 
-    // Mejora 5: el foco visual va al panel cuando está abierto; info y
+    // El foco visual va al panel cuando está abierto; info y
     // visualizador quedan con borde apagado en ese caso.
     let player_focused = !app.explorer_open;
 
@@ -2461,7 +2461,7 @@ fn render_player(frame: &mut Frame<'_>, app: &App, engine: &AudioEngine) {
     render_footer(frame, footer_area, app, compact);
 }
 
-/// Panel lateral del explorador (T13): la biblioteca superpuesta sobre el
+/// Panel lateral del explorador: la biblioteca superpuesta sobre el
 /// costado derecho, con el mismo bloque, título, scroll y marcadores de
 /// selección/reproducción que el explorador a pantalla completa.
 fn render_explorer_panel(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -2469,7 +2469,7 @@ fn render_explorer_panel(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn render_player_info(frame: &mut Frame<'_>, area: Rect, app: &App, engine: &AudioEngine, focused: bool) {
-    // Mejora 5: borde acentuado cuando el player tiene el foco.
+    // Borde acentuado cuando el player tiene el foco.
     let border_color = if focused { theme().accent } else { theme().dim };
     let block = Block::bordered()
         .border_style(Style::default().fg(border_color))
@@ -2477,7 +2477,7 @@ fn render_player_info(frame: &mut Frame<'_>, area: Rect, app: &App, engine: &Aud
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // Mejora 8: buscar metadatos del track actual en la biblioteca.
+    // Buscar metadatos del track actual en la biblioteca.
     let track_meta: Option<(String, Option<String>)> = app.current_path.as_ref()
         .and_then(|path| app.library.as_ref()?.index_of(path))
         .and_then(|idx| app.library.as_ref()?.get(idx))
@@ -2516,7 +2516,7 @@ fn render_player_info(frame: &mut Frame<'_>, area: Rect, app: &App, engine: &Aud
 
     let mut info_lines = vec![file_line];
 
-    // Mejora 8: línea de artista/álbum (solo si hay artista conocido).
+    // Línea de artista/álbum (solo si hay artista conocido).
     if let Some((artist, album_opt)) = &track_meta {
         let mut spans = vec![
             Span::styled("Meta:    ", Style::default().fg(theme().dim)),
@@ -2540,7 +2540,7 @@ fn render_player_info(frame: &mut Frame<'_>, area: Rect, app: &App, engine: &Aud
         row += 1;
     }
 
-    // Mejora 4: barras de volumen y progreso con caracteres ━/╸/░.
+    // Barras de volumen y progreso con caracteres ━/╸/░.
     let volume = engine.volume().clamp(0.0, 1.0);
     let percent = (volume * 100.0).round() as u16;
     let vol_suffix = format!("{percent}%");
@@ -2625,7 +2625,7 @@ fn render_player_info(frame: &mut Frame<'_>, area: Rect, app: &App, engine: &Aud
     }
 }
 
-/// Estado de una celda de la barra de progreso (T2 precarga).
+/// Estado de una celda de la barra de progreso.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BarCellKind {
     /// Parte ya reproducida (━).
@@ -2682,7 +2682,7 @@ fn progress_bar_cells(width: usize, played: f64, buffered: &[(f32, f32)]) -> Vec
     cells
 }
 
-/// Mejora 4: construye una barra de progreso visual con ━, ╸ y ░.
+/// Construye una barra de progreso visual con ━, ╸ y ░.
 ///
 /// Formato: `label [━━━━╸░░░░]  suffix`
 /// `filled_ratio` en `[0.0, 1.0]`. `total_width` es el ancho disponible de
@@ -2759,7 +2759,7 @@ fn speed_label(speed: f32) -> String {
     format!("{speed:.2}x")
 }
 
-/// Explorador a pantalla completa: solo cuando no hay sesión de audio (T13);
+/// Explorador a pantalla completa: solo cuando no hay sesión de audio;
 /// con player el explorador va como panel lateral en `render_player`. Sin
 /// sesión no hay nada que visualizar, así que la lista se queda con toda la
 /// altura en vez de mostrar un bloque Visualizador vacío.
@@ -2807,7 +2807,7 @@ fn render_browser_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ]),
     };
 
-    // Con !has_player (único caso que llega acá, T13) no hay sesión: la
+    // Con!has_player (único caso que llega acá) no hay sesión: la
     // línea de estado es siempre «Explorando» + repeat/shuffle si están.
     let mut spans = vec![
         Span::styled("Estado:  ", Style::default().fg(theme().dim)),
@@ -2821,7 +2821,7 @@ fn render_browser_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
     );
 }
 
-/// Mejora 5: `focused` controla el color del borde (acento cuando tiene foco,
+/// `focused` controla el color del borde (acento cuando tiene foco,
 /// apagado cuando el panel del explorador tiene el foco).
 fn render_library(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
     let folder = library_folder_label(app);
@@ -2889,7 +2889,7 @@ fn item_group<'a>(app: &'a App, item: &ViewItem) -> Option<&'a str> {
     }
 }
 
-/// ¿La vista agrupa más de una carpeta o incluye historial (T14/T1)?
+/// ¿La vista agrupa más de una carpeta o incluye historial?
 /// Con una sola carpeta en pantalla (y sin historial) los encabezados solo ensucian,
 /// así que no se dibujan. Si hay historial, siempre se dibuja "Agregadas por URL"
 /// y el grupo correspondiente a las pistas locales.
@@ -2912,7 +2912,7 @@ fn view_is_grouped(app: &App) -> bool {
     false
 }
 
-/// Filas que ocupan `[from..=to]` (T14): una por item más un encabezado
+/// Filas que ocupan `[from..=to]`: una por item más un encabezado
 /// cada vez que cambia de grupo; el grupo de `from` también cuenta si es
 /// distinto del item anterior, que queda fuera de la vista.
 fn rows_between(app: &App, from: usize, to: usize, grouped: bool) -> usize {
@@ -2939,7 +2939,7 @@ fn rows_between(app: &App, from: usize, to: usize, grouped: bool) -> usize {
 }
 
 /// Primer track visible para que `selected` entre en `height` filas con los
-/// encabezados incluidos (T14): arranca del candidato centrado clásico
+/// encabezados incluidos: arranca del candidato centrado clásico
 /// (`scroll_offset`) y sube mientras `[start..=selected]` no entre en el
 /// alto. Nunca supera `selected`, así que el cursor siempre queda a la vista.
 fn visible_start(app: &App, height: usize, grouped: bool) -> usize {
@@ -3013,7 +3013,7 @@ fn history_row_line(
     Line::from(spans)
 }
 
-/// Filas visibles de la biblioteca (T14/T1): encabezados de grupo
+/// Filas visibles de la biblioteca: encabezados de grupo
 /// intercalados ("Agregadas por URL" y carpetas). Los encabezados
 /// no son seleccionables — `selected` sigue siendo un índice sobre `view`
 /// y las flechas los saltan solas.
@@ -3079,7 +3079,7 @@ fn library_rows(app: &App, width: u16, height: u16) -> Vec<Line<'static>> {
     lines
 }
 
-/// Encabezado de carpeta (T14): nombre en acento y negrita seguido de un
+/// Encabezado de carpeta: nombre en acento y negrita seguido de un
 /// guion fino que completa el ancho de la lista.
 fn folder_header_line(folder: &str, width: u16) -> Line<'static> {
     let width = width as usize;
@@ -3194,7 +3194,7 @@ fn folder_label(root: &Path) -> String {
         .unwrap_or_else(|| root.to_string_lossy().into_owned())
 }
 
-/// Carpeta que nombra a la biblioteca en el título (T14): con una raíz, su
+/// Carpeta que nombra a la biblioteca en el título: con una raíz, su
 /// nombre; con varias, cuántas hay.
 fn library_folder_label(app: &App) -> String {
     match app.roots.as_slice() {
@@ -3203,7 +3203,7 @@ fn library_folder_label(app: &App) -> String {
     }
 }
 
-/// Mejora 7: una fila de la biblioteca con título en `theme().text` y
+/// Una fila de la biblioteca con título en `theme().text` y
 /// artista/álbum en `theme().dim`. Ocupa exactamente `width` celdas.
 fn row_line(
     track: &Track,
@@ -3333,7 +3333,7 @@ fn format_duration(duration: Duration) -> String {
     }
 }
 
-/// Mejora 5: `focused` controla el color del borde del visualizador.
+/// `focused` controla el color del borde del visualizador.
 fn render_visualizer(frame: &mut Frame<'_>, area: Rect, analyzer: &SpectrumAnalyzer, focused: bool) {
     let border_color = if focused { theme().accent } else { theme().dim };
     let block = Block::bordered()
@@ -3390,8 +3390,7 @@ enum VisualizerPaint {
     Circular,
 }
 
-/// Dispatch puro del modo al pintor: cada modo va al suyo, sin fallback
-/// (testeado en `visualizer_paint_routes_all_modes_to_their_painters`).
+/// Dispatch puro del modo al pintor: cada modo va al suyo, sin fallback.
 fn resolve_visualizer_paint(mode: config::VisualizerMode) -> VisualizerPaint {
     match mode {
         config::VisualizerMode::Barras => VisualizerPaint::Bars,
@@ -3402,12 +3401,12 @@ fn resolve_visualizer_paint(mode: config::VisualizerMode) -> VisualizerPaint {
     }
 }
 
-/// T5 (modos-visualizador): plot polar GRUESO de las 32 bandas (intencionalmente
+/// Plot polar GRUESO de las 32 bandas (intencionalmente
 /// grueso: la terminal no da para más, y así está acordado). Anillo pulsante
 /// rasterizado celda a celda, no 32 radios finos: cada celda se evalúa por su
 /// propia posición, así el contorno es continuo en vez de 32 picos aislados.
 ///
-/// Decisiones (testeadas en los tests `paint_circular_*`):
+/// Decisiones del render:
 /// - Centro flotante en la mitad del área útil; cada celda usa su propio
 ///   centro `(x+0.5, y+0.5)`. `dx` en unidades de ancho de celda; `dy` se
 ///   multiplica por 2 para compensar el aspecto ~1:2 de la celda (como las
@@ -3500,7 +3499,7 @@ fn paint_circular(
     }
 }
 
-/// T3 (modos-visualizador): espejo vertical de las 32 bandas desde una línea
+/// Espejo vertical de las 32 bandas desde una línea
 /// central tenue (`-` en ascii, `─` en unicode, color `dim`, como el eje de
 /// la onda). Cada banda crece arriba Y abajo con los mismos niveles y glifos
 /// de `paint_bands` (helpers `band_slot`/`band_full_glyph`/`band_frac_glyph`,
@@ -3603,12 +3602,12 @@ fn paint_mirror(
     }
 }
 
-/// T4 (modos-visualizador): medidor VU MONO horizontal con el nivel dBFS
+/// Medidor VU MONO horizontal con el nivel dBFS
 /// del tap actual (ver `SpectrumAnalyzer::vu`/`db_meter_level`: un solo
 /// nivel en escala -60..0 dBFS, no RMS lineal; decisión mono documentada
 /// ahí — el estéreo exigiría tocar el hot path del callback de audio).
 ///
-/// Decisiones (testeadas en los tests `paint_vu_*`):
+/// Decisiones del render:
 /// - Barra llena de izquierda a derecha con el gradiente del tema por columna
 ///   (`spectrum_color`, como las barras: `spectrum_low` a la izquierda,
 ///   `spectrum_high` a la derecha) y celda parcial con los mismos glifos de
@@ -3733,14 +3732,14 @@ fn band_slot(band: usize, total: u32) -> Option<(u16, u16)> {
 }
 
 /// Glifo de celda llena de barra: `@` (nivel lleno de la rampa) en ascii,
-/// `█` en unicode. T3 lo extrae de `paint_bands` para reusarlo en espejo.
+/// `█` en unicode. Extraído de `paint_bands` para reusarlo en espejo.
 fn band_full_glyph(ascii: bool) -> &'static str {
     if ascii { "@" } else { "█" }
 }
 
 /// Glifo de la celda parcial de una barra con fracción `frac` en 0.0..1.0:
 /// rampa ASCII de 10 niveles o bloques de octavo en unicode (mismo gradiente
-/// que la celda llena). T3 lo extrae de `paint_bands` para reusarlo en espejo.
+/// que la celda llena). Extraído de `paint_bands` para reusarlo en espejo.
 fn band_frac_glyph(frac: f32, ascii: bool) -> &'static str {
     if ascii {
         let idx = ((frac * 10.0) as usize).min(9);
@@ -3755,7 +3754,7 @@ fn band_frac_glyph(frac: f32, ascii: bool) -> &'static str {
 /// automática del analizador (`SpectrumAnalyzer::scope_window`): de más
 /// vieja a más nueva, la más reciente queda a la derecha.
 ///
-/// Decisiones (testeadas en los tests `paint_wave_*`):
+/// Decisiones del render:
 /// - Eje cero: fila central tenue (`-` en ascii, `─` en unicode, color `dim`);
 ///   la onda lo tapa donde lo cruza y asoma donde se desvía.
 /// - Cada columna (o sub-columna Braille en unicode) se pinta con la
@@ -3976,8 +3975,8 @@ fn wave_sample_row(sample: f32, height: u16) -> u16 {
 }
 
 /// Pinta las 32 barras dentro del área interior del bloque, sin widgets.
-/// Mejora 1: usa bloques de octavo de celda para la celda parcial superior.
-/// Mejora 2: el gap entre barras está garantizado cuando el slot mide >= 2:
+/// Usa bloques de octavo de celda para la celda parcial superior.
+/// El gap entre barras está garantizado cuando el slot mide >= 2:
 ///   - slot >= 2 → bar_width = slot - 1 ≥ 1 (gap de 1 col)
 ///   - slot == 1 → bar_width = 1 (sin espacio: no hay gap posible)
 ///
@@ -4093,12 +4092,12 @@ fn spectrum_color(t: f32, theme: &Theme) -> (u8, u8, u8) {
     }
 }
 
-/// El pie de atajos creció a dos líneas (T6): shuffle/repeat/n-p/buscar no
+/// El pie de atajos creció a dos líneas: shuffle/repeat/n-p/buscar no
 /// entraban en una. Con la búsqueda abierta muestra su propio contexto.
 /// Pie de atajos: se arma desde la config para que muestre siempre las
 /// teclas reales aunque el usuario las remapee.
 ///
-/// Mejora 6: `compact` activo cuando `area.height < 30`; muestra una sola
+/// `compact` activo cuando `area.height < 30`; muestra una sola
 /// línea con los atajos críticos.
 fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
     if app.url_input.is_some() {
@@ -4114,23 +4113,23 @@ fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
         )];
     }
 
-    // Selector de bandas (T3): mismo patrón que el menú de temas.
+    // Selector de bandas: mismo patrón que el menú de temas.
     if app.bands_menu.is_some() {
         return vec![Line::from(
             " ↑/↓: previsualizar estilo   ·   Enter: guardar   ·   Esc: cancelar ",
         )];
     }
 
-    // Selector de modo (T1 modos-visualizador): mismo patrón que el de bandas.
+    // Selector de modo: mismo patrón que el de bandas.
     if app.mode_menu.is_some() {
         return vec![Line::from(
             " ↑/↓: previsualizar modo   ·   Enter: guardar   ·   Esc: cancelar ",
         )];
     }
 
-    // Panel de configuración (T2/T3/T4 + T1 modos-visualizador): Enter abre
+    // Panel de configuración: Enter abre
     // el sub-modal de Temas en la primera fila, el de Bandas en la tercera y
-    // el de Modo en la cuarta; en «Mouse» alterna la captura en vivo (T5: el
+    // el de Modo en la cuarta; en «Mouse» alterna la captura en vivo (el
     // pie dice `abrir/alternar` por eso). Los `·` son tramos sueltos entre
     // chips: el parser de chips separa por tres espacios, así todos los
     // atajos siguen clickeables.
@@ -4160,9 +4159,9 @@ fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
 
     let keys = &config::config().keys;
     match app.mode {
-        // Panel lateral abierto (T13): 3 líneas — lista, reproducción y el
+        // Panel lateral abierto: 3 líneas — lista, reproducción y el
         // recordatorio de que ↑/↓ son volumen solo con el panel cerrado.
-        // T5: `u: URL` también vale con el panel abierto; `sig/ant` se
+        // `u: URL` también vale con el panel abierto; `sig/ant` se
         // expande porque entra en 78 reagrupando (`u` pasa a la línea 2).
         Mode::Player if app.explorer_open => vec![
             Line::from(format!(
@@ -4195,7 +4194,7 @@ fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
                 key_labels(&keys.speed_up),
             )),
         ],
-        // T5: `Tab: biblio` vuelve (deuda T1); `b` sube a la línea 1 como
+        // `Tab: biblio` vuelve; `b` sube a la línea 1 como
         // navegación y `↑/↓: vol` abrevia: es la única forma de que los 12
         // atajos entren en 2×78. Orden: navegación → reproducción → modos →
         // config/salida.
@@ -4224,7 +4223,7 @@ fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
                 key_labels(&keys.quit),
             )),
         ],
-        // T5: `sig/ant` expandido (`b` baja a la línea 2 para que entre);
+        // `sig/ant` expandido (`b` baja a la línea 2 para que entre);
         // `Inicio/Fin` se documenta y sale el `Esc: volver` inexacto (sin
         // player Esc arma la salida: lo cubre `Esc×2: salir`).
         Mode::Browser => vec![
@@ -4568,7 +4567,7 @@ mod tests {
         assert_eq!(above.fg, theme.dim);
     }
 
-    // T2 (modos-visualizador): osciloscopio `onda` con muestras crudas.
+    // Osciloscopio `onda` con muestras crudas.
     // Área 8x7 → eje cero en fila 3 (0.5 * 6 = 3.0); la onda tapa al eje
     // donde lo cruza y el eje asoma donde la onda se desvía.
     // ------------------------------------------------------------------
@@ -4774,7 +4773,7 @@ mod tests {
         assert_eq!(empty.fg, theme.dim);
     }
 
-    // T3 (modos-visualizador): espejo vertical de las 32 bandas.
+    // Espejo vertical de las 32 bandas.
     // Área 32x7 → 1 columna por banda; eje central en fila 3 (igual que la
     // onda: `wave_sample_row(0.0, 7)`), 3 filas por lado.
     // ------------------------------------------------------------------
@@ -4893,7 +4892,7 @@ mod tests {
         }
     }
 
-    // T4 (modos-visualizador): VU mono horizontal con RMS.
+    // VU mono horizontal con RMS.
     // Área 32x5 → barra en filas 0–3, escala tenue en fila 4.
     // ------------------------------------------------------------------
 
@@ -5089,7 +5088,7 @@ mod tests {
         paint_vu(&mut buffer, area, 1.0, 1.0, &theme, false);
     }
 
-    // T8 (modos-visualizador): anillo pulsante rasterizado celda a celda.
+    // Anillo pulsante rasterizado celda a celda.
     // Área de referencia 40x20 (pareja): centro flotante (20.0, 10.0),
     // max_r = min(20, 20) - 0.5 = 19.5, base_r = 0.45·max_r ≈ 8.775,
     // span ≈ 10.725. Ángulo medido desde el norte, simétrico izq/derecha
@@ -5583,7 +5582,7 @@ mod tests {
 
     #[test]
     fn go_back_closes_the_panel_and_only_quits_from_the_bare_explorer() {
-        // Panel abierto: Esc cierra el panel, no sale de la app (T14: Esc
+        // Panel abierto: Esc cierra el panel, no sale de la app (Esc
         // es la única tecla de «back»; Tab vive en «explorer»).
         let mut app = test_app();
         app.mode = Mode::Player;
@@ -5750,9 +5749,8 @@ mod tests {
             .map(|line| line_text(line))
             .collect::<Vec<_>>()
             .join("\n");
-        // T5: pie del player reequilibrado en 2 líneas — restaura
-        // `Tab: biblio` (deuda T1); `↑/↓: vol` abrevia para que entre en
-        // 78 cols.
+        // Pie del player reequilibrado en 2 líneas — restaura
+        // `Tab: biblio`; `↑/↓: vol` abrevia para que entre en 78 cols.
         for hint in ["Tab: biblio", "b: buscar", "espacio: pausa", "↑/↓: vol", "←/→: ±5s", "n/p: pista", "s: shuffle", "r: repeat", "[/]: vel", "u: URL", "Ctrl+P: config", "Esc×2: salir"] {
             assert!(player.contains(hint), "footer del player falta '{hint}': {player}");
         }
@@ -5763,7 +5761,7 @@ mod tests {
             .map(|line| line_text(line))
             .collect::<Vec<_>>()
             .join("\n");
-        // T5: `sig/ant` expandido (entra en 78 reagrupando), `Inicio/Fin`
+        // `sig/ant` expandido (entra en 78 reagrupando), `Inicio/Fin`
         // documentado y fuera el `Esc: volver` inexacto (sin player Esc arma
         // la salida, cubierto por `Esc×2: salir`).
         for hint in ["PgUp/PgDn: mover", "Enter: reproducir", "n/p: pista siguiente/anterior", "espacio: pausa", "←/→: ±5s", "[/]: vel", "s: shuffle", "r: repeat", "b: buscar", "Inicio/Fin: primera/última", "u: URL", "Ctrl+P: config", "Esc×2: salir"] {
@@ -5774,7 +5772,7 @@ mod tests {
             "sin `Esc: volver` inexacto: {browser}"
         );
 
-        // Panel lateral abierto (T13): lista + playback + aviso de volumen.
+        // Panel lateral abierto: lista + playback + aviso de volumen.
         app.mode = Mode::Player;
         app.explorer_open = true;
         let panel: String = footer_lines(&app, false)
@@ -5803,8 +5801,8 @@ mod tests {
         );
         app.explorer_open = false;
 
-        // Pie del panel de configuración (T5: `abrir/alternar` por la deuda
-        // T4 — en «Mouse» Enter alterna, no abre sub-modal).
+        // Pie del panel de configuración (`abrir/alternar`: en «Mouse»
+        // Enter alterna, no abre sub-modal).
         open_settings_panel(&mut app);
         let settings: String = footer_lines(&app, false)
             .iter()
@@ -6046,7 +6044,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // T12: menú de temas
+    // Menú de temas
     // -------------------------------------------------------------------------
 
     static THEME_MENU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -6843,7 +6841,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // T1: shell del panel de configuración (Ctrl+P)
+    // Shell del panel de configuración (Ctrl+P)
     // -------------------------------------------------------------------------
 
     #[test]
@@ -6898,9 +6896,8 @@ mod tests {
         assert_eq!(selected(&app), 2, "↑ vuelve una fila");
     }
 
-    // T4 reemplaza el candado NO-OP de T2 (`settings_enter_is_noop_...`):
-    // Enter en «Mouse» ahora alterna el estado en vivo (ver tests T4 abajo;
-    // el panel sigue abierto y la selección intacta, como antes).
+    // Enter en «Mouse» alterna el estado en vivo (el panel sigue abierto y
+    // la selección intacta, como antes).
     #[test]
     fn settings_esc_closes_panel_without_arming_quit() {
         let Some(mut engine) = engine_or_skip() else { return };
@@ -6925,7 +6922,7 @@ mod tests {
         assert_eq!(
             SETTINGS_ROWS,
             ["Temas", "Mouse", "Bandas", "Modo"],
-            "filas fijas de T1 (+ Modo al final, sin reordenar)"
+            "filas fijas (+ Modo al final, sin reordenar)"
         );
         let panel = SettingsPanelState { selected: 1 };
         let lines = settings_panel_lines(&panel, true);
@@ -6965,7 +6962,7 @@ mod tests {
     fn footer_shows_settings_chip_in_player_and_browser() {
         let mut app = test_app();
         // Reproductor y explorador (panel + pantalla completa): chip del panel
-        // sin `t` (T2 la deja libre).
+        // sin `t` (la tecla queda libre).
         for (mode, open) in [
             (Mode::Player, false),
             (Mode::Player, true),
@@ -6984,7 +6981,7 @@ mod tests {
             );
             assert!(
                 !joined.contains(": temas"),
-                "sin `t: temas` en T2 ({mode:?}/{open}): {joined}"
+                "sin `t: temas` ({mode:?}/{open}): {joined}"
             );
             for line in footer_lines(&app, false) {
                 assert!(
@@ -7066,7 +7063,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // T2: Temas dentro del panel + eliminar `t`
+    // Temas dentro del panel + eliminar `t`
     // -------------------------------------------------------------------------
 
     #[test]
@@ -7091,10 +7088,9 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // T4: toggle de Mouse en vivo + persistencia de `[ui] mouse`
+    // Toggle de Mouse en vivo + persistencia de `[ui] mouse`
     // -------------------------------------------------------------------------
-    // (Reemplaza el candado NO-OP de T3 `settings_enter_on_mouse_stays_noop`:
-    // la spec T4 ordena que Enter en «Mouse» alterne el estado + persista.)
+    // Enter en «Mouse» alterna el estado y persiste.
 
     #[test]
     fn settings_enter_on_mouse_toggles_state_and_persists() {
@@ -7308,7 +7304,7 @@ mod tests {
 
     #[test]
     fn mouse_is_inert_under_theme_submodal() {
-        // El guard inerte ya cubre el panel (T1) y el sub-modal (existente):
+        // El guard inerte ya cubre el panel  y el sub-modal (existente):
         // se verifica, no se duplica.
         let Some(mut engine) = engine_or_skip() else { return };
         let mut app = test_app();
@@ -7361,7 +7357,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // T3: selector de Bandas dentro del panel + persistencia del estilo
+    // Selector de Bandas dentro del panel + persistencia del estilo
     // -------------------------------------------------------------------------
 
     static BANDS_MENU_TEST_LOCK: std::sync::Mutex<()> =
@@ -7568,7 +7564,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // T1 (modos-visualizador): selector de Modo dentro del panel + fallback a
+    // Selector de Modo dentro del panel + fallback a
     // barras
     // -------------------------------------------------------------------------
 
@@ -8066,7 +8062,7 @@ mod tests {
         app.selected = 0;
         play_selected(&mut app, &mut engine);
 
-        // Before fix: play_selected left app.is_url = true!
+        // Una pista local debe limpiar `is_url`.
         assert!(!app.is_url, "playing local track must clear is_url");
         assert_eq!(app.current_path.as_ref(), Some(&t1));
 
@@ -8388,7 +8384,7 @@ mod tests {
         // 2. User plays a library track before resolution finishes
         play_selected(&mut app, &mut engine);
 
-        // In fixed code: ytdlp_rx must be cleared and request_id bumped
+        // La resolución pendiente se descarta y el request se renueva.
         assert!(app.ytdlp_rx.is_none(), "pending resolution must be cleared");
         assert_ne!(app.ytdlp_request_id, initial_req_id, "request id must be bumped");
         assert_ne!(app.status, Status::Resolving, "status must not stay Resolving");

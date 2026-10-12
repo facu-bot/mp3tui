@@ -1,4 +1,4 @@
-//! Configuración (T9): tema visual y atajos remapeables.
+//! Configuración tema visual y atajos remapeables.
 //!
 //! El archivo `config.toml` es opcional: sin él (o con partes inválidas) la
 //! app corre con los mismos valores por defecto que antes de existirlo.
@@ -6,15 +6,17 @@
 //! `Config::warnings` (se muestra en stderr al arrancar y en la primera
 //! pantalla de la TUI).
 //!
-//! Ruta por defecto (convención de Windows, sin dependencias extra):
-//! `%APPDATA%\mp3tui\config.toml`. La variable `MP3TUI_CONFIG` permite
-//! apuntar a otro archivo (útil para pruebas).
+//! Ruta por defecto (convención nativa de cada SO, sin dependencias extra):
+//! en Windows `%APPDATA%\mp3tui\config.toml`; en Linux/macOS
+//! `$XDG_CONFIG_HOME/mp3tui/config.toml` (o `~/.config/mp3tui/config.toml`).
+//! La variable `MP3TUI_CONFIG` permite apuntar a otro archivo (útil para
+//! pruebas).
 //!
 //! Formato soportado — un subconjunto razonable de TOML con claves planas:
 //!
 //! ```toml
 //! [theme]
-//! accent = "#957FB8"        # «#RRGGBB» o nombre: cyan, blanco, gris, ...
+//! accent = "#957FB8"        # «#RRGGBB» o nombre: cyan, blanco, gris,...
 //! spectrum_low = "#8992A7"  # gradiente del visualizador (abajo)
 //!
 //! [keybindings]
@@ -91,13 +93,31 @@ impl Default for Config {
 // Ruta y ciclo de vida
 // ---------------------------------------------------------------------------
 
-/// `%APPDATA%\mp3tui\config.toml`; `None` si la variable no existe.
+/// Ruta por defecto de `config.toml`, siguiendo la convención nativa del SO:
+///
+/// - Windows: `%APPDATA%\mp3tui\config.toml`.
+/// - Linux/macOS: `$XDG_CONFIG_HOME/mp3tui/config.toml`, o
+///   `~/.config/mp3tui/config.toml` si `XDG_CONFIG_HOME` no está definida.
+///
+/// `None` si no hay ninguna variable base disponible. `MP3TUI_CONFIG` pisa
+/// esta ruta (ver [`resolve_path`]).
 pub fn default_path() -> Option<PathBuf> {
-    let appdata = env::var_os("APPDATA")?;
-    let mut path = PathBuf::from(appdata);
-    path.push("mp3tui");
-    path.push("config.toml");
-    Some(path)
+    base_config_dir().map(|dir| dir.join("config.toml"))
+}
+
+/// Carpeta base de la config del usuario (la que contiene `config.toml`).
+/// Windows conserva `%APPDATA%\mp3tui`; el resto usa XDG con fallback a
+/// `~/.config`.
+fn base_config_dir() -> Option<PathBuf> {
+    if let Some(appdata) = env::var_os("APPDATA").filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(appdata).join("mp3tui"));
+    }
+    if let Some(xdg) = env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(xdg).join("mp3tui"));
+    }
+    env::var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .map(|home| PathBuf::from(home).join(".config").join("mp3tui"))
 }
 
 fn resolve_path() -> Option<(PathBuf, bool)> {
@@ -281,7 +301,7 @@ pub fn parse(text: &str) -> Config {
 // ---------------------------------------------------------------------------
 
 /// Paleta de la app. El default es la variante **Kanagawa Dragon** de
-/// kanagawa.nvim (T11): tonos oscuros y cálidos, acentos desaturados y
+/// kanagawa.nvim: tonos oscuros y cálidos, acentos desaturados y
 /// gradiente frío→cálido. Sigue siendo configurable campo a campo desde
 /// `[theme]` del config.toml.
 #[derive(Debug, Clone, PartialEq)]
@@ -348,7 +368,7 @@ fn parse_theme(
     warnings: &mut Vec<String>,
 ) {
     // Pass 1: `name` — resuelve la paleta base ANTES de los overrides de
-    // color, que siguen pisando lo que sea (T12).
+    // color, que siguen pisando lo que sea.
     match section.get("name") {
         None => {}
         Some(value) => match value.as_str() {
@@ -444,7 +464,7 @@ pub fn parse_color(raw: &str) -> Option<Color> {
 }
 
 // ---------------------------------------------------------------------------
-// Paletas builtin (T12)
+// Paletas builtin 
 // ---------------------------------------------------------------------------
 
 /// Las 7 paletas oficiales, en orden estable de menú. El id es el identificador
@@ -595,7 +615,7 @@ fn theme_slot<'a>(theme: &'a mut Theme, key: &str) -> Option<&'a mut Color> {
 }
 
 // ---------------------------------------------------------------------------
-// Persistencia del tema (T12)
+// Persistencia del tema 
 // ---------------------------------------------------------------------------
 
 /// Actualiza (o inserta) solo la clave `name` dentro de `[theme]` de un texto
@@ -714,7 +734,7 @@ pub(crate) fn persist_theme_name_at(
     };
     let updated = update_theme_name(&existing, name);
 
-    // El editor por líneas solo entiende `[theme]` + `name = ...`. Ante otras
+    // El editor por líneas solo entiende `[theme]` + `name =...`. Ante otras
     // formas válidas (tabla inline, claves con punto o entre comillas) podría
     // duplicar claves y dejar la config ilegible: se valida el resultado y, si
     // no queda TOML válido con el nombre pedido, no se toca el archivo.
@@ -770,7 +790,7 @@ pub fn persist_theme_name(name: &str) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
-// Tema activo en runtime (T12)
+// Tema activo en runtime 
 // ---------------------------------------------------------------------------
 
 /// Estado que cambia en caliente al previsualizar/aplicar temas desde el menú.
@@ -854,7 +874,7 @@ pub struct Keys {
     pub search: Vec<KeyCode>,
     pub speed_up: Vec<KeyCode>,
     pub speed_down: Vec<KeyCode>,
-    /// Abrir/cerrar el panel lateral del explorador (T13): `b` / `Tab` /
+    /// Abrir/cerrar el panel lateral del explorador: `b` / `Tab` /
     /// `Ctrl+Tab` (el dispatch ignora modificadores, así que las tres variantes
     /// caen en la misma acción).
     pub explorer: Vec<KeyCode>,
@@ -866,13 +886,13 @@ pub struct Keys {
     pub end: Vec<KeyCode>,
     /// Reproducir la pista seleccionada en el explorador.
     pub select: Vec<KeyCode>,
-    /// Cerrar el panel lateral del explorador / volver al player (T13); sin
+    /// Cerrar el panel lateral del explorador / volver al player; sin
     /// player en pantalla completa, sale de la app. Solo `Esc` por defecto
-    /// (T14): `Tab` vive en `explorer` y acá salía de la app sin player.
+    /// `Tab` vive en `explorer` y acá salía de la app sin player.
     pub back: Vec<KeyCode>,
-    /// Abrir prompt para reproducir URL (T6): por defecto 'u'.
+    /// Abrir prompt para reproducir URL: por defecto 'u'.
     pub open_url: Vec<KeyCode>,
-    /// Abrir el panel de configuración (T1: shell con filas Temas/Mouse/Bandas).
+    /// Abrir el panel de configuración (shell con filas Temas/Mouse/Bandas).
     /// Se dispara con Ctrl+tecla (por defecto `Ctrl+P`): a diferencia de
     /// `explorer` (donde Tab y Ctrl+Tab valen por igual porque el dispatch
     /// ignora modificadores), acá se exige Ctrl para no robarle la letra
@@ -982,7 +1002,7 @@ fn normalize_key(key: KeyCode) -> KeyCode {
     }
 }
 
-/// Resuelve colisiones de teclas entre acciones distintas (T9). El dispatch
+/// Resuelve colisiones de teclas entre acciones distintas. El dispatch
 /// (if/else if con orden fijo) haría que la acción posterior quede sombreada
 /// en silencio: el usuario remapea, "no le funciona" y no hay ningún aviso —
 /// a diferencia del resto de los casos inválidos de la config, que sí avisan.
@@ -1219,42 +1239,118 @@ pub fn pressed_ctrl(bindings: &[KeyCode], key: KeyEvent) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Biblioteca (T14)
+// Biblioteca 
 // ---------------------------------------------------------------------------
 
-/// Carpetas a escanear cuando la CLI no recibe ningún path (T14/T15). El
+/// Carpetas a escanear cuando la CLI no recibe ningún path. El
 /// set final ([`LibraryConfig::scan_roots`]) une las carpetas conocidas del
 /// sistema con las configuradas a mano; los tracks quedan agrupados por
 /// carpeta de origen en la lista del explorador.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct LibraryConfig {
     /// Raíces escritas por el usuario en `[library] roots`: se AGREGAN a las
-    /// carpetas conocidas (T15), no las reemplazan. Vacío = solo conocidas.
+    /// carpetas conocidas, no las reemplazan. Vacío = solo conocidas.
     pub roots: Vec<PathBuf>,
 }
 
-/// Carpetas conocidas típicas bajo `%USERPROFILE%` (T15): la biblioteca
-/// por defecto cubre las cuatro sin que el usuario configure nada.
+/// Carpetas conocidas típicas bajo el home: la biblioteca por defecto
+/// cubre las cuatro sin que el usuario configure nada.
 const KNOWN_DIR_NAMES: [&str; 4] = ["Music", "Downloads", "Desktop", "Documents"];
+
+/// Home del usuario: `%USERPROFILE%` en Windows, `$HOME` en el resto.
+fn home_dir() -> Option<PathBuf> {
+    env::var_os("USERPROFILE")
+        .filter(|v| !v.is_empty())
+        .or_else(|| env::var_os("HOME").filter(|v| !v.is_empty()))
+        .map(PathBuf::from)
+}
+
+/// Carpeta que XDG usa para la config (`$XDG_CONFIG_HOME` o `~/.config`):
+/// ahí vive `user-dirs.dirs`.
+fn xdg_config_home(home: &Path) -> PathBuf {
+    env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".config"))
+}
 
 /// Solo las carpetas conocidas que existen bajo `home`: una faltante se
 /// saltea en silencio, porque es un default automático y no una ruta
-/// configurada a mano (esas sí avisan en `parse_library`).
+/// configurada a mano (esas sí avisan en `parse_library`). Respeta los
+/// nombres localizados que declare `user-dirs.dirs`.
 fn known_dirs(home: &Path) -> Vec<PathBuf> {
+    known_dirs_from(home, &xdg_config_home(home))
+}
+
+/// [`known_dirs`] con la carpeta de config XDG ya resuelta por el caller
+/// (las pruebas la apuntan a un home temporal, sin depender del entorno).
+fn known_dirs_from(home: &Path, config_home: &Path) -> Vec<PathBuf> {
+    let xdg = xdg_user_dirs(config_home, home);
     KNOWN_DIR_NAMES
         .iter()
-        .map(|name| home.join(name))
+        .map(|name| {
+            xdg.get(*name).cloned().unwrap_or_else(|| home.join(name))
+        })
         .filter(|path| path.is_dir())
         .collect()
 }
 
+/// Lee `user-dirs.dirs` (XDG) y devuelve las carpetas conocidas que define,
+/// con `$HOME`/`${HOME}` ya expandidos. Vacío si el archivo no existe o no
+/// define nada: el caller cae entonces a los nombres en inglés.
+fn xdg_user_dirs(
+    config_home: &Path,
+    home: &Path,
+) -> std::collections::HashMap<&'static str, PathBuf> {
+    use std::collections::HashMap;
+
+    // Clave de `user-dirs.dirs` → nombre de KNOWN_DIR_NAMES.
+    const KEYS: [(&str, &str); 4] = [
+        ("XDG_MUSIC_DIR", "Music"),
+        ("XDG_DOWNLOAD_DIR", "Downloads"),
+        ("XDG_DESKTOP_DIR", "Desktop"),
+        ("XDG_DOCUMENTS_DIR", "Documents"),
+    ];
+
+    let Ok(text) = fs::read_to_string(config_home.join("user-dirs.dirs")) else {
+        return HashMap::new();
+    };
+
+    let home_str = home.to_string_lossy();
+    let mut dirs = HashMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        let Some((key, raw)) = line.split_once('=') else {
+            continue;
+        };
+        let Some((_, name)) = KEYS.iter().find(|(k, _)| *k == key.trim()) else {
+            continue;
+        };
+        let raw = raw.trim().trim_matches('"');
+        if raw.is_empty() {
+            continue;
+        }
+        let expanded = raw
+            .replace("${HOME}", &home_str)
+            .replace("$HOME", &home_str);
+        let path = PathBuf::from(expanded);
+        let path =
+            if path.is_absolute() { path } else { home.join(path) };
+        dirs.insert(*name, path);
+    }
+    dirs
+}
+
 impl LibraryConfig {
-    /// Set final a escanear sin argumento de CLI (T15): las carpetas
+    /// Set final a escanear sin argumento de CLI: las carpetas
     /// conocidas que existen en el sistema, unidas con las configuradas,
     /// sin duplicados y en ese orden (las conocidas primero). Si queda vacío
-    /// (sin `USERPROFILE` y sin roots) se usa el `cwd`, como en T14.
+    /// (sin home y sin roots) se usa el `cwd`.
     pub fn scan_roots(&self) -> Vec<PathBuf> {
-        let home = env::var_os("USERPROFILE").map(PathBuf::from);
+        let home = home_dir();
         self.scan_roots_with(home.as_deref())
     }
 
@@ -1295,7 +1391,7 @@ impl VisualizerStyle {
         }
     }
 
-    /// Los 3 valores en orden estable de menú (sub-selector de Bandas, T3).
+    /// Los 3 valores en orden estable de menú (sub-selector de Bandas).
     pub fn options() -> [Self; 3] {
         [Self::Auto, Self::Ascii, Self::Unicode]
     }
@@ -1318,8 +1414,8 @@ pub fn resolve_visualizer_style(
 
 /// Estilo efectivo para renderizar: estilo activo + `WT_SESSION` real del
 /// entorno. El estilo activo arranca del cargado al arrancar y cambia en
-/// caliente al previsualizar/aplicar desde el selector de Bandas (T3), igual
-/// que la celda del tema (T12): así el fondo previsualiza en vivo.
+/// caliente al previsualizar/aplicar desde el selector de Bandas, igual
+/// que la celda del tema: así el fondo previsualiza en vivo.
 pub fn effective_visualizer_style() -> VisualizerStyle {
     resolve_visualizer_style(
         active_visualizer_style(),
@@ -1328,13 +1424,12 @@ pub fn effective_visualizer_style() -> VisualizerStyle {
 }
 
 // ---------------------------------------------------------------------------
-// Estilo activo en runtime (T3)
+// Estilo activo en runtime 
 // ---------------------------------------------------------------------------
 
 /// Estilo configurado que cambia en caliente al previsualizar/aplicar desde
-/// el selector de Bandas. Misma receta que la celda del tema: un solo punto
-/// de acceso y cero cambios en el render (que ya lee
-/// `effective_visualizer_style()` por frame).
+/// el selector de Bandas: un solo punto de acceso y cero cambios en el
+/// render (que ya lee `effective_visualizer_style()` por frame).
 static ACTIVE_VISUALIZER: OnceLock<RwLock<VisualizerStyle>> =
     OnceLock::new();
 
@@ -1363,7 +1458,7 @@ pub fn activate_visualizer_style(style: VisualizerStyle) {
 }
 
 // ---------------------------------------------------------------------------
-// Persistencia del estilo de bandas (T3, espejo de la del tema)
+// Persistencia del estilo de bandas 
 // ---------------------------------------------------------------------------
 
 /// Actualiza (o inserta) solo la clave `style` dentro de `[visualizer]` de un
@@ -1539,7 +1634,7 @@ pub fn persist_visualizer_style(style: &str) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
-// Modo del visualizador (T1 modos-visualizador)
+// Modo del visualizador 
 // ---------------------------------------------------------------------------
 
 /// Modo de dibujo del visualizador (`[visualizer] mode`).
@@ -1548,13 +1643,13 @@ pub enum VisualizerMode {
     /// Las 32 barras estilo cava (comportamiento actual).
     #[default]
     Barras,
-    /// Osciloscopio con muestras crudas del tap (T2).
+    /// Osciloscopio con muestras crudas del tap.
     Onda,
-    /// 32 bandas arriba+abajo desde el centro (T3).
+    /// 32 bandas arriba+abajo desde el centro.
     Espejo,
-    /// Medidor RMS, mono como el tap actual (T4).
+    /// Medidor RMS, mono como el tap actual.
     Vu,
-    /// Plot polar grueso de las 32 bandas (T5).
+    /// Plot polar grueso de las 32 bandas.
     Circular,
 }
 
@@ -1583,8 +1678,8 @@ impl VisualizerMode {
 }
 
 /// Modo configurado que cambia en caliente al previsualizar/aplicar desde
-/// el selector de Modo. Misma receta que la celda del estilo: un solo punto
-/// de acceso; el dispatch de render lo lee por frame.
+/// el selector de Modo: un solo punto de acceso; el dispatch de render lo
+/// lee por frame.
 static ACTIVE_VISUALIZER_MODE: OnceLock<RwLock<VisualizerMode>> =
     OnceLock::new();
 
@@ -1614,7 +1709,7 @@ pub fn activate_visualizer_mode(mode: VisualizerMode) {
 }
 
 // ---------------------------------------------------------------------------
-// Persistencia del modo (T1 modos-visualizador, espejo de la del estilo)
+// Persistencia del modo visualizador
 // ---------------------------------------------------------------------------
 
 /// Actualiza (o inserta) solo la clave `mode` dentro de `[visualizer]` de un
@@ -1808,7 +1903,7 @@ fn migrate_removed_visualizer_mode_at(path: &Path, warnings: &mut Vec<String>) {
 }
 
 // ---------------------------------------------------------------------------
-// Persistencia del toggle de mouse (T4, espejo de la del tema / bandas)
+// Persistencia del toggle de mouse 
 // ---------------------------------------------------------------------------
 
 /// Actualiza (o inserta) solo la clave `mouse` dentro de `[ui]` de un texto
@@ -2111,7 +2206,7 @@ fn parse_library(
                         roots.push(path);
                     }
                     // Lista vacía o todo inválido: no hay roots propios y
-                    // la biblioteca queda en las carpetas conocidas (T15).
+                    // la biblioteca queda en las carpetas conocidas.
                     if !roots.is_empty() {
                         library.roots = roots;
                     }
@@ -2485,7 +2580,7 @@ zoom = 2");
 
     #[test]
     fn back_is_esc_only_and_tab_stays_in_explorer() {
-        // T14: Tab en `back` hacía que Tab saliera de la app sin player
+        // Tab en `back` hacía que Tab saliera de la app sin player
         // (back se chequea antes que explorer). Ahora Tab solo abre/cierra
         // el panel — que sin player no-opea.
         let config = parse("");
@@ -2510,12 +2605,15 @@ zoom = 2");
         let config = parse("");
         assert_eq!(config.library, LibraryConfig::default());
         assert!(config.library.roots.is_empty());
-        if let Some(home) = env::var_os("USERPROFILE") {
-            let music = PathBuf::from(home).join("Music");
-            if music.is_dir() {
+        if let Some(home) = home_dir() {
+            // Las carpetas conocidas que existan (con nombre localizado, si
+            // `user-dirs.dirs` las define) quedan en el set por defecto.
+            let roots = config.library.scan_roots();
+            for dir in known_dirs(&home) {
                 assert!(
-                    config.library.scan_roots().contains(&music),
-                    "si Music existe, la biblioteca por defecto la incluye"
+                    roots.contains(&dir),
+                    "la biblioteca por defecto incluye {}",
+                    dir.display()
                 );
             }
         }
@@ -2533,6 +2631,37 @@ zoom = 2");
             known_dirs(&home),
             vec![home.join("Music"), home.join("Documents")]
         );
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn known_dirs_follow_localized_xdg_names() {
+        let home = env::temp_dir().join("mp3tui_xdg_localized");
+        let _ = fs::remove_dir_all(&home);
+        let config_home = home.join(".config");
+        fs::create_dir_all(&config_home).unwrap();
+        // Carpetas reales con nombres localizados (locale es_* típico).
+        fs::create_dir_all(home.join("Música")).unwrap();
+        fs::create_dir_all(home.join("Descargas")).unwrap();
+        fs::write(
+            config_home.join("user-dirs.dirs"),
+            "# comentario\nXDG_MUSIC_DIR=\"$HOME/Música\"\nXDG_DOWNLOAD_DIR=\"${HOME}/Descargas\"\nXDG_DESKTOP_DIR=\"$HOME/Escritorio\"\n",
+        )
+        .unwrap();
+
+        // Solo las que existen y en orden de KNOWN_DIR_NAMES (Escritorio
+        // está declarada pero no existe: se saltea en silencio).
+        assert_eq!(
+            known_dirs_from(&home, &config_home),
+            vec![home.join("Música"), home.join("Descargas")]
+        );
+
+        // El parser también expande `${HOME}` y no inventa claves.
+        let dirs = xdg_user_dirs(&config_home, &home);
+        assert_eq!(dirs.get("Music").unwrap(), &home.join("Música"));
+        assert_eq!(dirs.get("Downloads").unwrap(), &home.join("Descargas"));
+        assert!(!dirs.contains_key("Documents"));
+
         let _ = fs::remove_dir_all(&home);
     }
 
@@ -2670,7 +2799,7 @@ zoom = 2");
     }
 
     // -------------------------------------------------------------------------
-    // T12: paletas builtin, [theme] name, tecla del menú y persistencia
+    // Paletas builtin, [theme] name, tecla del menú y persistencia
     // -------------------------------------------------------------------------
 
     #[test]
@@ -2775,7 +2904,7 @@ zoom = 2");
     }
 
     // -------------------------------------------------------------------------
-    // T1: acción `settings` (panel de configuración, Ctrl+P)
+    // Acción `settings` (panel de configuración, Ctrl+P)
     // -------------------------------------------------------------------------
 
     #[test]
@@ -2817,7 +2946,7 @@ zoom = 2");
 
     #[test]
     fn theme_menu_action_removed_warns_as_unknown() {
-        // T2: la acción `theme_menu` ya no existe; la tecla `t` queda libre y
+        // La acción `theme_menu` ya no existe; la tecla `t` queda libre y
         // una config vieja que la mencione avisa como acción desconocida.
         let config = parse("[keybindings]\ntheme_menu = \"t\"\n");
         assert!(
@@ -3003,7 +3132,7 @@ zoom = 2");
     }
 
     // -------------------------------------------------------------------------
-    // T3: selector de Bandas — opciones, reescritura y persistencia de style
+    // Selector de Bandas — opciones, reescritura y persistencia de style
     // -------------------------------------------------------------------------
 
     #[test]
@@ -3161,7 +3290,7 @@ zoom = 2");
         let _ = std::fs::remove_file(&path);
     }
 
-    // T4: toggle de Mouse — reescritura y persistencia de `[ui] mouse`
+    // Toggle de Mouse — reescritura y persistencia de `[ui] mouse`
     // -------------------------------------------------------------------------
 
     #[test]
@@ -3295,7 +3424,7 @@ zoom = 2");
     }
 
     // -------------------------------------------------------------------------
-    // T1 (modos-visualizador): `[visualizer] mode` — opciones, parseo,
+    // `[visualizer] mode` — opciones, parseo,
     // reescritura y persistencia
     // -------------------------------------------------------------------------
 

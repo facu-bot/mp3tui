@@ -1,4 +1,4 @@
-//! Fuente HTTP progresiva para symphonia (T3).
+//! Fuente HTTP progresiva para symphonia.
 //!
 //! Permite reproducir archivos de audio remotos mientras se descargan en segundo plano,
 //! garantizando que `stop()` o un cambio de pista nunca bloqueen la UI.

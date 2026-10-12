@@ -22,7 +22,7 @@ pub struct Track {
     pub artist: Option<String>,
     pub album: Option<String>,
     pub duration: Option<Duration>,
-    /// Carpeta de origen a mostrar como encabezado en el explorador (T14):
+    /// Carpeta de origen a mostrar como encabezado en el explorador:
     /// relativa a la raíz escaneada (con `/`), o el nombre de la raíz si el
     /// archivo vive en la raíz misma. Se resuelve en el escaneo, no al
     /// renderizar.
@@ -105,12 +105,12 @@ impl Playlist {
 
     /// Escaneo recursivo de `root` con `std::fs` (sin crates externos),
     /// manteniendo solo archivos de audio y agrupados por carpeta de origen
-    /// (T14); ver [`Self::from_dirs_scan`].
+    /// ver [`Self::from_dirs_scan`].
     pub fn from_dir_scan(root: &Path) -> Self {
         Self::from_dirs_scan(&[root.to_path_buf()])
     }
 
-    /// Escaneo recursivo de varias raíces (T14): los tracks quedan agrupados
+    /// Escaneo recursivo de varias raíces: los tracks quedan agrupados
     /// por carpeta de origen — en el orden de `roots` y, dentro de cada raíz,
     /// con las carpetas en orden alfabético y las pistas por nombre de
     /// archivo (sin distinguir mayúsculas) — para que la lista del explorador
@@ -242,7 +242,7 @@ fn collect_audio_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Encabezado a mostrar para la carpeta `dir` dentro de `root` (T14): la
+/// Encabezado a mostrar para la carpeta `dir` dentro de `root`: la
 /// ruta relativa con `/` como separador, o el nombre de la raíz si el track
 /// vive en la raíz misma (o si `dir` no está debajo de `root`).
 fn folder_header(root: &Path, dir: &Path) -> String {
@@ -321,7 +321,7 @@ mod tests {
             })
             .collect();
 
-        // T14: primero el grupo de la raíz (orden alfabético), después las
+        // Primero el grupo de la raíz (orden alfabético), después las
         // subcarpetas — ya no es un orden global por nombre.
         assert_eq!(
             names,
@@ -402,7 +402,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root_b);
     }
 
-    /// Escaneo del set por defecto (T15) contra el perfil real del usuario:
+    /// Escaneo del set por defecto contra el perfil real del usuario:
     /// diagnóstico de rendimiento, fuera de la suite normal. Imprime el
     /// total (frío, como al arrancar) y el desglose por raíz (cálido).
     /// `cargo test perf_scan_default_roots -- --ignored --nocapture`
