@@ -198,9 +198,11 @@ pub const URL_REPLAY_TOO_SOON_MSG: &str = "La canción terminó enseguida; no se
 ///   [`URL_REPLAY_TOO_SOON_MSG`]). Un archivo local no tiene mínimo.
 /// - `Off` avanza sin envolver y `All` avanza envolviendo; al agotarse la
 ///   lista (o el orden de shuffle) devuelven `Stop`.
-/// - Una URL terminada (`finished_url`) entra a la biblioteca desde el inicio
-///   del orden de navegación; una pista local fuera de la vista
-///   (`current == None`) no.
+/// - Con el shuffle activo una URL terminada (`finished_url`) ocupa un lugar
+///   del pool (entrada del historial) y ese lugar se honra. Con el shuffle
+///   apagado la URL no ocupa posición de la lista local y entra desde el
+///   inicio del orden. Una pista local fuera de la vista (`current == None`)
+///   no.
 pub fn natural_end_action(
     repeat: RepeatMode,
     shuffle: bool,
@@ -225,8 +227,10 @@ pub fn natural_end_action(
     if !finished_url && current.is_none() {
         return NextAction::Stop;
     }
-    // Una URL no ocupa una posición de la lista local.
-    let current = if finished_url { None } else { current };
+    // Una URL terminada solo ocupa posición del pool cuando el shuffle está
+    // activo (entrada del historial); con el shuffle apagado no tiene lugar en
+    // la lista local y entra desde el inicio del orden.
+    let current = if finished_url && !shuffle { None } else { current };
     match next_track(len, current, repeat, shuffle, order, 1) {
         Some(index) => NextAction::Play(index),
         None => NextAction::Stop,

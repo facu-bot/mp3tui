@@ -2050,32 +2050,49 @@ fn delete_selected_queue_item(app: &mut App) {
     app.queue_selected = app.queue_selected.min(app.queue.len().saturating_sub(1));
 }
 
-/// Posiciones de la vista que son pistas de la biblioteca (lo que recorren
-/// `n`/`p` y el fin natural; las entradas del historial quedan fuera).
-/// Regenera el orden de shuffle si la lista cambió desde que se armó
-/// (filtro/rescann).
-fn track_positions_in_view(app: &mut App) -> Vec<usize> {
-    let track_positions: Vec<usize> = app
+/// Posiciones de la vista del pool de navegación (lo que recorren `n`/`p` y
+/// el fin natural): siempre las pistas de la biblioteca, y además las
+/// entradas del historial cuando el shuffle está activo (S6/D2), para que una
+/// pista local pueda encadenar con un tema de YouTube y viceversa. Con el
+/// shuffle apagado el pool queda como antes (solo pistas locales). Regenera
+/// el orden de shuffle si la lista cambió desde que se armó (filtro/rescann).
+fn pool_positions_in_view(app: &mut App) -> Vec<usize> {
+    let pool: Vec<usize> = app
         .view
         .iter()
         .enumerate()
         .filter_map(|(pos, item)| match item {
             ViewItem::Track(_) => Some(pos),
+            ViewItem::History(_) if app.shuffle => Some(pos),
             ViewItem::History(_) => None,
         })
         .collect();
-    if app.shuffle && !track_positions.is_empty() && app.shuffle_order.len() != track_positions.len()
-    {
-        app.shuffle_order = shuffle_order(track_positions.len());
+    if app.shuffle && !pool.is_empty() && app.shuffle_order.len() != pool.len() {
+        app.shuffle_order = shuffle_order(pool.len());
     }
-    track_positions
+    pool
 }
 
-/// Índice de `track_positions` de la pista actualmente en reproducción
-/// (`None` si no está en la lista, p. ej. mientras suena una URL).
-fn current_track_index(app: &App, track_positions: &[usize]) -> Option<usize> {
-    current_view_position(app)
-        .and_then(|view_pos| track_positions.iter().position(|&p| p == view_pos))
+/// Índice dentro del pool (`pool_positions_in_view`) del ítem que acaba de
+/// terminar: para una pista local es el pool de `current_view_position(app)`;
+/// para una URL (`app.is_url`) es el pool de la entrada del historial visible
+/// cuya URL coincide con la original de `app.current_url` (`None` si esa URL no
+/// está en el historial visible, lo que conserva la caída de antes).
+fn finished_item_pool_index(app: &App, pool: &[usize]) -> Option<usize> {
+    let view_pos = if app.is_url {
+        let original_url = app.current_url.as_ref().map(|(url, _label)| url)?;
+        app.view
+            .iter()
+            .position(|item| match item {
+                ViewItem::History(idx) => {
+                    app.history.get(*idx).map(|entry| &entry.url) == Some(original_url)
+                }
+                ViewItem::Track(_) => false,
+            })?
+    } else {
+        current_view_position(app)?
+    };
+    pool.iter().position(|&pos| pos == view_pos)
 }
 
 /// Arranca la pista de una posición de la vista por el único camino de
@@ -2097,17 +2114,61 @@ fn play_view_position(app: &mut App, engine: &mut AudioEngine, target: usize) ->
     }
 }
 
+/// Arranca el objetivo del pool de navegación (el «siguiente» de `n`/`p` o
+/// del fin natural). Para una pista local usa [`play_view_position`]; para
+/// una entrada del historial la re-resuelve por el camino inyectable `replay`
+/// (en producción re-pide la página con yt-dlp y en los tests se captura sin
+/// red). Devuelve false si la posición no es jugable.
+fn play_pool_target(
+    app: &mut App,
+    engine: &mut AudioEngine,
+    target: usize,
+    replay: &mut impl FnMut(&mut App, &mut AudioEngine, UrlReplayRequest),
+) -> bool {
+    match app.view.get(target).copied() {
+        Some(ViewItem::History(hist_idx)) => {
+            if let Some(entry) = app.history.get(hist_idx) {
+                replay(
+                    app,
+                    engine,
+                    UrlReplayRequest {
+                        original_url: entry.url.clone(),
+                    },
+                );
+                true
+            } else {
+                false
+            }
+        }
+        Some(ViewItem::Track(_)) => play_view_position(app, engine, target),
+        None => false,
+    }
+}
+
 /// 'n' / 'p': salta a la siguiente/anterior pista de la playlist visible,
 /// respetando shuffle y repeat, sin salir del modo actual (en el explorador
 /// además mueve la selección). No envuelve con repeat Off/One.
 fn play_step(app: &mut App, engine: &mut AudioEngine, step: isize) {
-    let track_positions = track_positions_in_view(app);
-    if track_positions.is_empty() {
+    play_step_with(app, engine, step, dispatch_url_replay)
+}
+
+/// Idéntico a [`play_step`] pero con el replay de URL inyectable (mismo
+/// patrón que [`handle_natural_end`]/[`handle_natural_end_with`]): en
+/// producción la URL se resuelve con yt-dlp y en los tests se captura sin
+/// lanzar procesos ni tocar la red.
+fn play_step_with(
+    app: &mut App,
+    engine: &mut AudioEngine,
+    step: isize,
+    mut replay: impl FnMut(&mut App, &mut AudioEngine, UrlReplayRequest),
+) {
+    let pool = pool_positions_in_view(app);
+    if pool.is_empty() {
         return;
     }
-    let current = current_track_index(app, &track_positions);
+    let current = finished_item_pool_index(app, &pool);
     let Some(target_idx) = next_track(
-        track_positions.len(),
+        pool.len(),
         current,
         app.repeat,
         app.shuffle,
@@ -2116,16 +2177,20 @@ fn play_step(app: &mut App, engine: &mut AudioEngine, step: isize) {
     ) else {
         return;
     };
-    play_view_position(app, engine, track_positions[target_idx]);
+    play_pool_target(app, engine, pool[target_idx], &mut replay);
 }
 
 fn toggle_shuffle(app: &mut App) {
     app.shuffle = !app.shuffle;
     if app.shuffle {
+        // El orden vive sobre el pool (pistas + historial), igual que el
+        // pool que se usa al navegar / reproducir con el shuffle activo.
         let count = app
             .view
             .iter()
-            .filter(|item| matches!(item, ViewItem::Track(_)))
+            .filter(|item| {
+                matches!(item, ViewItem::Track(_)) || matches!(item, ViewItem::History(_))
+            })
             .count();
         app.shuffle_order = shuffle_order(count);
     }
@@ -2214,13 +2279,13 @@ fn handle_natural_end_with(
         return;
     }
 
-    let track_positions = track_positions_in_view(app);
-    let current = current_track_index(app, &track_positions);
+    let pool = pool_positions_in_view(app);
+    let current = finished_item_pool_index(app, &pool);
 
     match natural_end_action(
         app.repeat,
         app.shuffle,
-        track_positions.len(),
+        pool.len(),
         current,
         &app.shuffle_order,
         app.is_url,
@@ -2244,8 +2309,11 @@ fn handle_natural_end_with(
             }
         }
         NextAction::Play(target_idx) => {
-            if let Some(&target) = track_positions.get(target_idx) {
-                play_view_position(app, engine, target);
+            // Un objetivo mixto (pista local o URL del historial) se arranca
+            // por el mismo camino único del pool (`play_pool_target`): la URL
+            // se re-resuelve por el seam inyectable `replay`.
+            if let Some(&target) = pool.get(target_idx) {
+                play_pool_target(app, engine, target, &mut replay);
             }
         }
         NextAction::Stop => {}
@@ -8504,6 +8572,252 @@ mod tests {
             "la URL encolada se resuelve cuando se termina la actual"
         );
         assert!(app.queue.is_empty(), "el ítem encolado sale de la cola");
+    }
+
+    /// D2/S6 con el shuffle activo: una pista local que termina encadena con
+    /// la URL del historial que le sigue en el pool, pasando por el seam
+    /// inyectado `replay` (no se lanza yt-dlp en el test). Con un pool de
+    /// exactamente dos elementos el «siguiente» está forzado, así que no
+    /// depende de la entropía del orden.
+    #[test]
+    fn test_shuffle_natural_end_local_chains_to_history_url_via_replay() {
+        let mut app = test_app();
+        app.library = Some(crate::playlist::from_tracks_for_test(vec![
+            track_named("alpha"),
+        ]));
+        app.history.add(
+            "Video de YouTube".to_string(),
+            "https://www.youtube.com/watch?v=urlA".to_string(),
+        );
+        refresh_view(&mut app);
+        app.shuffle = true;
+        app.repeat = RepeatMode::All;
+        app.is_url = false;
+        app.current_path = Some(PathBuf::from(r"C:\x\alpha.mp3"));
+        app.status = Status::Playing;
+
+        let mut engine = match AudioEngine::new() {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        let mut dispatched: Option<UrlReplayRequest> = None;
+        handle_natural_end_with(&mut app, &mut engine, |_app, _engine, request| {
+            dispatched = Some(request);
+        });
+
+        assert_eq!(
+            dispatched.map(|r| r.original_url),
+            Some("https://www.youtube.com/watch?v=urlA".to_string()),
+            "con shuffle una pista local encadena a la URL del historial"
+        );
+    }
+
+    /// D2/S6 con el shuffle activo: una URL que termina encadena a la OTRA
+    /// URL del historial, nunca a la misma. Pool de dos URLs → el siguiente
+    /// está forzado.
+    #[test]
+    fn test_shuffle_natural_end_url_chains_to_other_history_url() {
+        let mut app = test_app();
+        app.history.add(
+            "A".to_string(),
+            "https://www.youtube.com/watch?v=uA".to_string(),
+        );
+        app.history.add(
+            "B".to_string(),
+            "https://www.youtube.com/watch?v=uB".to_string(),
+        );
+        refresh_view(&mut app);
+        app.shuffle = true;
+        app.repeat = RepeatMode::All;
+        app.is_url = true;
+        app.current_url = Some((
+            "https://www.youtube.com/watch?v=uA".to_string(),
+            "A".to_string(),
+        ));
+        app.status = Status::Playing;
+
+        let mut engine = match AudioEngine::new() {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        let mut dispatched: Option<UrlReplayRequest> = None;
+        handle_natural_end_with(&mut app, &mut engine, |_app, _engine, request| {
+            dispatched = Some(request);
+        });
+
+        let url = dispatched.map(|r| r.original_url);
+        assert_eq!(
+            url.as_deref(),
+            Some("https://www.youtube.com/watch?v=uB"),
+            "una URL terminada encadena a la otra URL del historial"
+        );
+        assert_ne!(
+            url.as_deref(),
+            Some("https://www.youtube.com/watch?v=uA"),
+            "nunca vuelve a la URL que acaba de terminar"
+        );
+    }
+
+    /// D2/S6: el shuffle no repite la pista que acaba de terminar. Con el
+    /// orden forzado `[2, 0, 1]` y una pista local en el pool 0, el siguiente
+    /// es determinista (el pool 1) y nunca vuelve a ser la pista que terminó.
+    #[test]
+    fn test_shuffle_natural_end_never_repeats_the_finished_track() {
+        let mut app = test_app();
+        let dir = std::env::temp_dir();
+        let pa = dir.join(format!("mp3tui_shuf_a_{}.wav", std::process::id()));
+        let pb = dir.join(format!("mp3tui_shuf_b_{}.wav", std::process::id()));
+        let pc = dir.join(format!("mp3tui_shuf_c_{}.wav", std::process::id()));
+        let wav = make_test_wav(4410);
+        for p in [&pa, &pb, &pc] {
+            std::fs::write(p, &wav).unwrap();
+        }
+
+        app.library = Some(crate::playlist::from_tracks_for_test(vec![
+            track_with_path(pa.clone(), "a"),
+            track_with_path(pb.clone(), "b"),
+            track_with_path(pc.clone(), "c"),
+        ]));
+        refresh_view(&mut app);
+        app.shuffle = true;
+        app.repeat = RepeatMode::Off;
+        app.is_url = false;
+        app.status = Status::Playing;
+        // Orden explícito para que la prueba sea determinista (no entropía).
+        app.shuffle_order = vec![2, 0, 1];
+        app.current_path = Some(pa.clone());
+
+        let mut engine = match AudioEngine::new() {
+            Ok(e) => e,
+            Err(_) => {
+                for p in [&pa, &pb, &pc] {
+                    let _ = std::fs::remove_file(p);
+                }
+                return;
+            }
+        };
+        handle_natural_end_with(&mut app, &mut engine, |_app, _engine, _request| {});
+
+        assert_ne!(
+            app.current_path.as_ref(),
+            Some(&pa),
+            "el siguiente nunca es la pista que acaba de terminar"
+        );
+        assert_eq!(
+            app.current_path.as_ref(),
+            Some(&pb),
+            "con el orden [2,0,1] y 'a' en el pool 0, el siguiente es 'b'"
+        );
+
+        for p in [&pa, &pb, &pc] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    /// Preservación (S4): con el shuffle APAGADO el fin natural avanza a la
+    /// siguiente pista local en orden, nunca a una URL del historial, y
+    /// `n`/`p` se comportan igual que antes.
+    #[test]
+    fn test_shuffle_off_natural_end_and_steps_stay_natural_never_url() {
+        let mut app = test_app();
+        let dir = std::env::temp_dir();
+        let p1 = dir.join(format!("mp3tui_off1_{}.wav", std::process::id()));
+        let p2 = dir.join(format!("mp3tui_off2_{}.wav", std::process::id()));
+        let p3 = dir.join(format!("mp3tui_off3_{}.wav", std::process::id()));
+        let wav = make_test_wav(4410);
+        for p in [&p1, &p2, &p3] {
+            std::fs::write(p, &wav).unwrap();
+        }
+
+        app.library = Some(crate::playlist::from_tracks_for_test(vec![
+            track_with_path(p1.clone(), "uno"),
+            track_with_path(p2.clone(), "dos"),
+            track_with_path(p3.clone(), "tres"),
+        ]));
+        // Una URL del historial adelante de la vista: no debe saltarse nunca.
+        app.history.add(
+            "Video".to_string(),
+            "https://www.youtube.com/watch?v=vX".to_string(),
+        );
+        refresh_view(&mut app);
+        app.repeat = RepeatMode::All;
+        app.is_url = false;
+        app.status = Status::Playing;
+        app.current_path = Some(p1.clone());
+
+        let mut engine = match AudioEngine::new() {
+            Ok(e) => e,
+            Err(_) => {
+                for p in [&p1, &p2, &p3] {
+                    let _ = std::fs::remove_file(p);
+                }
+                return;
+            }
+        };
+        let mut dispatched: Option<UrlReplayRequest> = None;
+        handle_natural_end_with(&mut app, &mut engine, |_app, _engine, request| {
+            dispatched = Some(request);
+        });
+
+        assert_eq!(dispatched, None, "sin shuffle el fin natural nunca dispara una URL");
+        assert_eq!(
+            app.current_path.as_ref(),
+            Some(&p2),
+            "el fin natural avanza a la siguiente pista local en orden"
+        );
+
+        app.current_path = Some(p2.clone());
+        play_step(&mut app, &mut engine, 1);
+        assert_eq!(app.current_path.as_ref(), Some(&p3), "'n' avanza a la siguiente local");
+
+        app.current_path = Some(p3.clone());
+        play_step(&mut app, &mut engine, -1);
+        assert_eq!(app.current_path.as_ref(), Some(&p2), "'p' retrocede a la anterior local");
+
+        for p in [&p1, &p2, &p3] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    /// D2/S6 con shuffle activo: `n`/`p` deben recorrer el mismo pool mixto
+    /// que el fin de pista. Con un pool de exactamente dos elementos (una
+    /// pista local + una URL del historial) el «siguiente» está forzado; el
+    /// paso tiene que despachar la URL por el seam inyectado `replay` en vez
+    /// de quedar en silencio.
+    #[test]
+    fn test_shuffle_step_dispatches_history_url_through_replay() {
+        let Some(mut engine) = engine_or_skip() else { return };
+        let mut app = test_app();
+        let dir = std::env::temp_dir();
+        let wav_path = dir.join(format!("mp3tui_step_url_{}.wav", std::process::id()));
+        std::fs::write(&wav_path, make_test_wav(4410)).unwrap();
+
+        let local = track_with_path(wav_path.clone(), "local");
+        // RED note: con play_step la URL no se despacha (quedaba en silencio);
+        // el seam play_step_with la entrega al closure capturado.
+
+        app.library = Some(crate::playlist::from_tracks_for_test(vec![local]));
+        app.history.add(
+            "Video de YouTube".to_string(),
+            "https://www.youtube.com/watch?v=stepUrl".to_string(),
+        );
+        refresh_view(&mut app);
+        app.shuffle = true;
+        app.repeat = RepeatMode::All;
+        app.current_path = Some(wav_path.clone());
+
+        let mut captured: Option<UrlReplayRequest> = None;
+        play_step_with(&mut app, &mut engine, 1, |_app, _engine, request| {
+            captured = Some(request);
+        });
+
+        assert_eq!(
+            captured.map(|r| r.original_url),
+            Some("https://www.youtube.com/watch?v=stepUrl".to_string()),
+            "con shuffle 'n' encadena la URL del historial por el seam de replay"
+        );
+
+        let _ = std::fs::remove_file(wav_path);
     }
 
     /// «Encolar» (`a`) suma la pista seleccionada de la Biblioteca como
