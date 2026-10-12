@@ -1269,6 +1269,22 @@ pub enum VisualizerStyle {
     Unicode,
 }
 
+impl VisualizerStyle {
+    /// Valor que `[visualizer] style` acepta en config.toml.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Ascii => "ascii",
+            Self::Unicode => "unicode",
+        }
+    }
+
+    /// Los 3 valores en orden estable de menú (sub-selector de Bandas, T3).
+    pub fn options() -> [Self; 3] {
+        [Self::Auto, Self::Ascii, Self::Unicode]
+    }
+}
+
 /// Resuelve el estilo efectivo de forma pura (testeable): `ascii`/`unicode`
 /// fuerzan; `auto` mira `WT_SESSION` (inyectada, NO leída acá).
 pub fn resolve_visualizer_style(
@@ -1284,12 +1300,226 @@ pub fn resolve_visualizer_style(
     }
 }
 
-/// Estilo efectivo para renderizar: config + `WT_SESSION` real del entorno.
+/// Estilo efectivo para renderizar: estilo activo + `WT_SESSION` real del
+/// entorno. El estilo activo arranca del cargado al arrancar y cambia en
+/// caliente al previsualizar/aplicar desde el selector de Bandas (T3), igual
+/// que la celda del tema (T12): así el fondo previsualiza en vivo.
 pub fn effective_visualizer_style() -> VisualizerStyle {
     resolve_visualizer_style(
-        config().visualizer_style,
+        active_visualizer_style(),
         env::var("WT_SESSION").ok().as_deref(),
     )
+}
+
+// ---------------------------------------------------------------------------
+// Estilo activo en runtime (T3)
+// ---------------------------------------------------------------------------
+
+/// Estilo configurado que cambia en caliente al previsualizar/aplicar desde
+/// el selector de Bandas. Misma receta que la celda del tema: un solo punto
+/// de acceso y cero cambios en el render (que ya lee
+/// `effective_visualizer_style()` por frame).
+static ACTIVE_VISUALIZER: OnceLock<RwLock<VisualizerStyle>> =
+    OnceLock::new();
+
+fn visualizer_cell() -> &'static RwLock<VisualizerStyle> {
+    ACTIVE_VISUALIZER.get_or_init(|| RwLock::new(config().visualizer_style))
+}
+
+/// Estilo configurado activo (el aplicado; la previsualización lo cambia en
+/// vivo y `Esc` lo restaura).
+pub fn active_visualizer_style() -> VisualizerStyle {
+    *visualizer_cell()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Previsualización (↑/↓ del selector): cambia el estilo en vivo.
+pub fn preview_visualizer_style(style: VisualizerStyle) {
+    *visualizer_cell()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = style;
+}
+
+/// Aplica el estilo (Enter del selector, después de persistir).
+pub fn activate_visualizer_style(style: VisualizerStyle) {
+    preview_visualizer_style(style);
+}
+
+// ---------------------------------------------------------------------------
+// Persistencia del estilo de bandas (T3, espejo de la del tema)
+// ---------------------------------------------------------------------------
+
+/// Actualiza (o inserta) solo la clave `style` dentro de `[visualizer]` de un
+/// texto TOML, preservando el resto — comentarios, otras claves, otras
+/// secciones y los finales de línea CRLF. Sin sección `[visualizer]`, la
+/// agrega al final.
+pub fn update_visualizer_style(text: &str, style: &str) -> String {
+    let crlf = text.contains("\r\n");
+    let eol = if crlf { "\r\n" } else { "\n" };
+
+    // Encabezado de sección: `[sección]` (+ comentario opcional). Un
+    // comentario que menciona `[visualizer]` no abre sección.
+    fn header_section(line: &str) -> Option<&str> {
+        let t = line.trim_start();
+        let rest = t.strip_prefix('[')?;
+        let end = rest.find(']')?;
+        let after = rest[end + 1..].trim();
+        if after.is_empty() || after.starts_with('#') {
+            Some(rest[..end].trim())
+        } else {
+            None
+        }
+    }
+
+    // Cola de comentario de una línea `clave = valor …` respetando comillas.
+    fn line_comment(after_equals: &str) -> &str {
+        let mut quote: Option<char> = None;
+        for (i, c) in after_equals.char_indices() {
+            match quote {
+                Some(q) if c == q => quote = None,
+                Some(_) => {}
+                None => match c {
+                    '"' | '\'' => quote = Some(c),
+                    '#' => return after_equals[i..].trim_end(),
+                    _ => {}
+                },
+            }
+        }
+        ""
+    }
+
+    let mut lines: Vec<String> =
+        text.split('\n').map(str::to_string).collect();
+
+    let Some(start) =
+        lines.iter().position(|l| header_section(l) == Some("visualizer"))
+    else {
+        // Sin sección: agregarla al final, sin tocar lo existente.
+        let mut out = text.to_string();
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push_str(eol);
+        }
+        out.push_str(&format!("[visualizer]{eol}style = \"{style}\"{eol}"));
+        return out;
+    };
+
+    // Fin de la sección: la próxima cabecera (de cualquier sección).
+    let end = lines
+        .iter()
+        .skip(start + 1)
+        .position(|l| header_section(l).is_some())
+        .map(|offset| start + 1 + offset)
+        .unwrap_or(lines.len());
+
+    // ¿Ya hay una clave `style` dentro de la sección?
+    for i in (start + 1)..end {
+        let line = &lines[i];
+        let t = line.trim_start();
+        if t.starts_with('#') {
+            continue;
+        }
+        let Some(rest) = t.strip_prefix("style") else {
+            continue;
+        };
+        let Some(after) = rest.trim_start().strip_prefix('=') else {
+            // «styles», «style2», etc.: no es la clave.
+            continue;
+        };
+        let indent = &line[..line.len() - t.len()];
+        let comment = line_comment(after);
+        let mut new_line = format!("{indent}style = \"{style}\"");
+        if !comment.is_empty() {
+            new_line.push(' ');
+            new_line.push_str(comment);
+        }
+        if line.ends_with('\r') {
+            new_line.push('\r');
+        }
+        lines[i] = new_line;
+        return lines.join("\n");
+    }
+
+    // Clave ausente: insertarla justo debajo del encabezado.
+    let mut inserted = format!("style = \"{style}\"");
+    if crlf {
+        inserted.push('\r');
+    }
+    lines.insert(start + 1, inserted);
+    lines.join("\n")
+}
+
+/// Escribe el `style` en `path` de forma atómica (archivo temporal +
+/// rename). Crea el archivo (y su directorio) si no existe. Nunca toca la
+/// config real: las pruebas usan rutas temporales vía esta función.
+pub(crate) fn persist_visualizer_style_at(
+    path: &Path,
+    style: &str,
+) -> Result<(), String> {
+    let existing = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            String::new()
+        }
+        Err(err) => {
+            return Err(format!("no se pudo leer '{}': {err}", path.display()));
+        }
+    };
+    let updated = update_visualizer_style(&existing, style);
+
+    // Igual que con el tema: ante formas válidas que el editor por líneas no
+    // reconoce (tabla inline, claves con punto o entre comillas) podría
+    // duplicar claves; se valida el resultado y, si no queda TOML válido con
+    // el estilo pedido, no se toca el archivo.
+    let persisted = updated
+        .parse::<toml::Table>()
+        .ok()
+        .and_then(|table| {
+            table
+                .get("visualizer")?
+                .get("style")?
+                .as_str()
+                .map(|saved| saved == style)
+        })
+        .unwrap_or(false);
+    if !persisted {
+        return Err(format!(
+            "no se pudo guardar el estilo sin romper '{}'; agregá `style = \"{style}\"` en [visualizer] a mano",
+            path.display()
+        ));
+    }
+
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && let Err(err) = fs::create_dir_all(parent)
+    {
+        return Err(format!("no se pudo guardar el estilo: {err}"));
+    }
+
+    let mut tmp_os = path.as_os_str().to_os_string();
+    tmp_os.push(".tmp");
+    let tmp = PathBuf::from(tmp_os);
+    if let Err(err) = fs::write(&tmp, updated.as_bytes()) {
+        return Err(format!("no se pudo guardar el estilo: {err}"));
+    }
+    match fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let _ = fs::remove_file(&tmp);
+            Err(format!("no se pudo guardar el estilo: {err}"))
+        }
+    }
+}
+
+/// Persiste el estilo en la config del usuario (ruta por defecto o
+/// `MP3TUI_CONFIG`).
+pub fn persist_visualizer_style(style: &str) -> Result<(), String> {
+    let Some((path, _)) = resolve_path() else {
+        return Err(
+            "no se pudo guardar el estilo: sin ruta de config".to_string(),
+        );
+    };
+    persist_visualizer_style_at(&path, style)
 }
 
 /// `[visualizer] style`: auto (default), ascii o unicode. Merge campo a campo
@@ -2264,6 +2494,165 @@ zoom = 2");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let err = persist_theme_name_at(&dir, "nord")
+            .expect_err("un directorio no es escribible");
+        assert!(!err.is_empty(), "mensaje de error no vacío");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // -------------------------------------------------------------------------
+    // T3: selector de Bandas — opciones, reescritura y persistencia de style
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn visualizer_style_options_list_three_values_in_stable_menu_order() {
+        assert_eq!(
+            VisualizerStyle::options(),
+            [
+                VisualizerStyle::Auto,
+                VisualizerStyle::Ascii,
+                VisualizerStyle::Unicode
+            ],
+            "orden estable del sub-modal: auto, ascii, unicode"
+        );
+        assert_eq!(VisualizerStyle::Auto.as_str(), "auto");
+        assert_eq!(VisualizerStyle::Ascii.as_str(), "ascii");
+        assert_eq!(VisualizerStyle::Unicode.as_str(), "unicode");
+    }
+
+    #[test]
+    fn update_visualizer_style_creates_section_when_missing() {
+        assert_eq!(
+            update_visualizer_style("", "ascii"),
+            "[visualizer]\nstyle = \"ascii\"\n",
+            "archivo vacío: crea la sección"
+        );
+
+        let existing = "[library]\nroots = []\n";
+        let out = update_visualizer_style(existing, "unicode");
+        assert!(
+            out.starts_with(existing),
+            "el contenido existente se preserva: {out:?}"
+        );
+        assert!(
+            out.ends_with("[visualizer]\nstyle = \"unicode\"\n"),
+            "se agrega [visualizer] al final: {out:?}"
+        );
+    }
+
+    #[test]
+    fn update_visualizer_style_replaces_and_inserts_preserving_comments() {
+        let out = update_visualizer_style(
+            "[visualizer]\nstyle = \"unicode\"  # viejo\n",
+            "ascii",
+        );
+        assert_eq!(
+            out,
+            "[visualizer]\nstyle = \"ascii\" # viejo\n",
+            "reemplaza solo el valor y conserva el comentario"
+        );
+
+        let out = update_visualizer_style(
+            "[visualizer]\nmode = 3\n",
+            "auto",
+        );
+        assert_eq!(
+            out,
+            "[visualizer]\nstyle = \"auto\"\nmode = 3\n",
+            "inserta style justo después del encabezado"
+        );
+
+        // Un comentario que menciona [visualizer] no abre una sección.
+        let out = update_visualizer_style(
+            "# [visualizer]\n[library]\nroots = []\n",
+            "ascii",
+        );
+        assert!(
+            out.starts_with("# [visualizer]\n")
+                && out.ends_with("[visualizer]\nstyle = \"ascii\"\n"),
+            "{out:?}"
+        );
+
+        let crlf = "[visualizer]\r\nstyle = \"auto\"\r\n";
+        assert_eq!(
+            update_visualizer_style(crlf, "unicode"),
+            "[visualizer]\r\nstyle = \"unicode\"\r\n",
+            "reemplazo con CRLF: solo cambia el valor"
+        );
+    }
+
+    #[test]
+    fn persist_visualizer_style_never_writes_invalid_toml() {
+        // Igual que el tema: formas válidas de TOML que el editor por líneas
+        // no reconoce → el archivo queda intacto, nunca roto.
+        let cases = [
+            ("inline", "visualizer = { style = \"auto\" }\n"),
+            ("dotted", "visualizer.style = \"auto\"\n"),
+            ("quoted", "[visualizer]\n\"style\" = \"auto\"\n"),
+        ];
+        for (label, original) in cases {
+            let path = std::env::temp_dir().join(format!(
+                "mp3tui_bands_invalid_{label}_{}.toml",
+                std::process::id()
+            ));
+            std::fs::write(&path, original).expect("escribe el original");
+
+            let result = persist_visualizer_style_at(&path, "ascii");
+            let text = std::fs::read_to_string(&path).expect("sigue existiendo");
+            let parsed = text.parse::<toml::Table>();
+            let _ = std::fs::remove_file(&path);
+
+            match result {
+                Ok(()) => {
+                    let table = parsed.unwrap_or_else(|e| {
+                        panic!("{label}: Ok pero dejó TOML inválido: {e}\n{text}")
+                    });
+                    let style = table
+                        .get("visualizer")
+                        .and_then(|t| t.get("style"))
+                        .and_then(|n| n.as_str());
+                    assert_eq!(style, Some("ascii"), "{label}: estilo guardado");
+                }
+                Err(_) => assert_eq!(text, original, "{label}: archivo intacto si falla"),
+            }
+        }
+    }
+
+    #[test]
+    fn persist_visualizer_style_at_updates_or_creates_and_reports_errors() {
+        let path = std::env::temp_dir()
+            .join(format!("mp3tui_bands_cfg_{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        // 1. No existe: lo crea con la sección mínima.
+        persist_visualizer_style_at(&path, "ascii").expect("crea el archivo");
+        let text = std::fs::read_to_string(&path).expect("recién creado");
+        assert_eq!(text, "[visualizer]\nstyle = \"ascii\"\n");
+
+        // 2. Existe: solo cambia style; comentarios y otras secciones intactos,
+        //    sin archivo temporal colgando.
+        let original = "# mío\n[visualizer]\nstyle = \"ascii\"\n[ui]\nmouse = false\n";
+        std::fs::write(&path, original).unwrap();
+        persist_visualizer_style_at(&path, "unicode").expect("actualiza");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            text,
+            "# mío\n[visualizer]\nstyle = \"unicode\"\n[ui]\nmouse = false\n"
+        );
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        assert!(
+            !std::path::PathBuf::from(&tmp).exists(),
+            "sin archivo temporal colgando"
+        );
+
+        // 3. Destino no escribible (directorio): error corto, sin pánico.
+        let dir = std::env::temp_dir()
+            .join(format!("mp3tui_bands_dir_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = persist_visualizer_style_at(&dir, "ascii")
             .expect_err("un directorio no es escribible");
         assert!(!err.is_empty(), "mensaje de error no vacío");
 

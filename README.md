@@ -172,6 +172,12 @@ previsualizan cada paleta en vivo, `Enter` aplica el tema y guarda su `name`
 en este archivo (creando la sección `[theme]` si no existe) y vuelve al panel,
 y `Esc` cancela, restaura el tema anterior y vuelve al panel.
 
+Desde el panel (`Ctrl+P` → `Bandas`) se abre el selector de bandas: `↑`/`↓`
+previsualizan cada estilo en vivo sobre el visualizador de fondo, `Enter`
+aplica el estilo y guarda su `style` en la sección `[visualizer]` de este
+archivo (creándola si no existe) y vuelve al panel, y `Esc` cancela, restaura
+el estilo anterior y vuelve al panel.
+
 ```toml
 [theme]
 name = "kanagawa-dragon" # paleta de partida; ver IDs abajo

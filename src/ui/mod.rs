@@ -278,6 +278,9 @@ struct App {
     pub history_path: Option<PathBuf>,
     /// Menú de temas abierto (T12): `Some` mientras el modal está activo.
     theme_menu: Option<ThemeMenuState>,
+    /// Selector de bandas abierto (T3): `Some` mientras el sub-modal está
+    /// activo (el panel sigue abierto debajo).
+    bands_menu: Option<BandsMenuState>,
     /// Panel de configuración abierto (T1): `Some` mientras el modal está activo.
     settings_panel: Option<SettingsPanelState>,
     /// Doble Esc para salir: el primer Esc arma, el segundo sale.
@@ -564,9 +567,14 @@ fn handle_mouse(event: MouseEvent, app: &mut App, engine: &mut AudioEngine) {
     if !config::config().mouse {
         return;
     }
-    // Con un modal abierto (prompt de URL, menú de temas, panel de
-    // configuración) el clic no atraviesa hacia lo que quedó tapado.
-    if app.url_input.is_some() || app.theme_menu.is_some() || app.settings_panel.is_some() {
+    // Con un modal abierto (prompt de URL, menú de temas, selector de
+    // bandas, panel de configuración) el clic no atraviesa hacia lo que
+    // quedó tapado.
+    if app.url_input.is_some()
+        || app.theme_menu.is_some()
+        || app.bands_menu.is_some()
+        || app.settings_panel.is_some()
+    {
         app.drag = None;
         return;
     }
@@ -674,8 +682,18 @@ struct ThemeMenuState {
     original_theme: Theme,
 }
 
-/// Filas fijas del panel de configuración: el contenido de cada una llega en
-/// T2 (Temas), T3 (Bandas) y T4 (Mouse).
+/// Estado del selector de bandas (T3): selección con previsualización en
+/// vivo y el estilo con el que se abrió (para el marcador y para restaurar
+/// con Esc). Espejo de `ThemeMenuState` sobre los 3 valores fijos.
+struct BandsMenuState {
+    /// Índice en `config::VisualizerStyle::options()`.
+    selected: usize,
+    /// Estilo configurado al abrir (fila «actual» marcada con ●).
+    original: config::VisualizerStyle,
+}
+
+/// Filas fijas del panel de configuración: Temas (T2) abre su sub-modal,
+/// Bandas (T3) el suyo y Mouse (T4) su toggle.
 const SETTINGS_ROWS: [&str; 3] = ["Temas", "Mouse", "Bandas"];
 
 /// Estado del panel de configuración (T1: shell sin contenido): selección por
@@ -795,6 +813,7 @@ pub fn run(engine: &mut AudioEngine, start: StartMode) -> io::Result<()> {
         pending_history: None,
         history_path: crate::history::history_path(),
         theme_menu: None,
+        bands_menu: None,
         settings_panel: None,
         quit_guard: QuitGuard::default(),
         hit: RefCell::new(HitMap::default()),
@@ -1018,6 +1037,13 @@ fn dispatch_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine) {
     // cerrar el sub-modal con Enter/Esc—.
     if app.theme_menu.is_some() {
         handle_theme_menu_key(key, app, config::persist_theme_name);
+        return;
+    }
+
+    // Selector de bandas (T3): sub-modal del panel con la misma prioridad
+    // que el de temas (nunca están abiertos los dos a la vez).
+    if app.bands_menu.is_some() {
+        handle_bands_menu_key(key, app, config::persist_visualizer_style);
         return;
     }
 
@@ -1389,6 +1415,61 @@ fn handle_theme_menu_key(
     }
 }
 
+// --- Selector de bandas (T3: sub-modal del panel) ---------------------------
+
+fn open_bands_menu(app: &mut App) {
+    let current = config::active_visualizer_style();
+    let selected = config::VisualizerStyle::options()
+        .iter()
+        .position(|style| *style == current)
+        .unwrap_or(0);
+    app.bands_menu = Some(BandsMenuState {
+        selected,
+        original: current,
+    });
+}
+
+fn handle_bands_menu_key(
+    key: KeyEvent,
+    app: &mut App,
+    persist: impl FnOnce(&str) -> Result<(), String>,
+) {
+    let len = config::VisualizerStyle::options().len();
+    match key.code {
+        KeyCode::Up | KeyCode::Down => {
+            let Some(menu) = app.bands_menu.as_mut() else {
+                return;
+            };
+            let delta = if matches!(key.code, KeyCode::Up) { -1 } else { 1 };
+            menu.selected = move_selection(menu.selected, delta, len);
+            let style = config::VisualizerStyle::options()[menu.selected];
+            // Previsualización en vivo: cambia el estilo sin persistir (el
+            // render lo resuelve por frame vía `effective_visualizer_style`).
+            config::preview_visualizer_style(style);
+        }
+        KeyCode::Enter => {
+            let Some(menu) = app.bands_menu.take() else {
+                return;
+            };
+            let style = config::VisualizerStyle::options()[menu.selected];
+            // Aplica primero (queda en la sesión aunque falle el guardado)
+            // y recién después persiste; un fallo solo deja el aviso.
+            config::activate_visualizer_style(style);
+            if let Err(err) = persist(style.as_str()) {
+                app.error = Some(err);
+            }
+        }
+        KeyCode::Esc => {
+            let Some(menu) = app.bands_menu.take() else {
+                return;
+            };
+            // Restaura el estilo con el que se abrió.
+            config::activate_visualizer_style(menu.original);
+        }
+        _ => {}
+    }
+}
+
 // --- Panel de configuración (T1: shell) -------------------------------------
 
 fn open_settings_panel(app: &mut App) {
@@ -1405,10 +1486,10 @@ fn handle_settings_panel_key(key: KeyEvent, app: &mut App) {
             let delta = if matches!(key.code, KeyCode::Up) { -1 } else { 1 };
             panel.selected = move_selection(panel.selected, delta, SETTINGS_ROWS.len());
         }
-        // T2: Enter en «Temas» abre el ThemeMenuState existente como
-        // sub-modal (el panel sigue abierto debajo; el dispatch prioriza al
-        // menú y su Enter/Esc vuelven al panel). Mouse (T4) y Bandas (T3)
-        // siguen NO-OP a propósito.
+        // T2/T3: Enter en «Temas» abre el ThemeMenuState existente como
+        // sub-modal y Enter en «Bandas» abre el selector de estilos (el
+        // panel sigue abierto debajo; el dispatch prioriza al sub-modal y
+        // su Enter/Esc vuelven al panel). «Mouse» (T4) sigue NO-OP.
         KeyCode::Enter => {
             let selected = match app.settings_panel.as_ref() {
                 Some(panel) => panel.selected,
@@ -1416,6 +1497,8 @@ fn handle_settings_panel_key(key: KeyEvent, app: &mut App) {
             };
             if selected == 0 {
                 open_theme_menu(app);
+            } else if selected == 2 {
+                open_bands_menu(app);
             }
         }
         // Un solo Esc cierra el panel; como no toca la guarda de salida, el
@@ -1425,6 +1508,56 @@ fn handle_settings_panel_key(key: KeyEvent, app: &mut App) {
         }
         _ => {}
     }
+}
+
+/// Filas del sub-modal: una por estilo; ● marca el estilo activo al abrir y
+/// la selección va resaltada como en el menú de temas.
+fn bands_menu_lines(menu: &BandsMenuState) -> Vec<Line<'static>> {
+    let colors = theme(); // snapshot coherente para todas las filas
+    config::VisualizerStyle::options()
+        .iter()
+        .enumerate()
+        .map(|(i, style)| {
+            let marker = if *style == menu.original { "● " } else { "  " };
+            let row_style = if i == menu.selected {
+                Style::default()
+                    .bg(colors.select_bg)
+                    .fg(colors.accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(colors.text)
+            };
+            Line::from(Span::styled(
+                format!(" {marker}{} ", style.as_str()),
+                row_style,
+            ))
+        })
+        .collect()
+}
+
+/// Modal centrado del selector de bandas (T3), mismo estilo que el de temas.
+fn render_bands_menu(frame: &mut Frame<'_>, menu: &BandsMenuState) {
+    let area = frame.area();
+    let width = 44.min(area.width.saturating_sub(4)).max(24);
+    let height = (config::VisualizerStyle::options().len() as u16 + 2)
+        .min(area.height.saturating_sub(2))
+        .max(3);
+
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let rect = Rect::new(x, y, width, height);
+
+    frame.render_widget(Clear, rect);
+
+    let block = Block::bordered()
+        .border_style(Style::default().fg(theme().accent))
+        .title(Span::styled(
+            " Bandas ",
+            Style::default().fg(theme().accent).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    frame.render_widget(Paragraph::new(bands_menu_lines(menu)), inner);
 }
 
 /// Filas del modal: una por tema builtin; ● marca el tema activo al abrir y
@@ -1881,6 +2014,11 @@ fn render(frame: &mut Frame<'_>, app: &App, engine: &AudioEngine) {
 
     if let Some(panel) = &app.settings_panel {
         render_settings_panel(frame, panel);
+    }
+
+    // El sub-modal de bandas (T3) va encima del panel.
+    if let Some(menu) = &app.bands_menu {
+        render_bands_menu(frame, menu);
     }
 
     // El sub-modal de temas (T2) va encima del panel: se dibuja último.
@@ -3177,8 +3315,15 @@ fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
         )];
     }
 
-    // Panel de configuración (T2): Enter abre el sub-modal de Temas en la
-    // primera fila (Mouse y Bandas siguen NO-OP hasta T4/T3).
+    // Selector de bandas (T3): mismo patrón que el menú de temas.
+    if app.bands_menu.is_some() {
+        return vec![Line::from(
+            " ↑/↓: previsualizar estilo   Enter: guardar   Esc: cancelar ",
+        )];
+    }
+
+    // Panel de configuración (T2/T3): Enter abre el sub-modal de Temas en la
+    // primera fila y el de Bandas en la tercera («Mouse» sigue NO-OP, T4).
     if app.settings_panel.is_some() {
         return vec![Line::from(" ↑/↓: mover   Enter: abrir   Esc: cerrar ")];
     }
@@ -3631,6 +3776,7 @@ mod tests {
             pending_history: None,
             history_path: Some(test_temp_history_path()),
             theme_menu: None,
+            bands_menu: None,
             settings_panel: None,
             quit_guard: QuitGuard::default(),
             hit: RefCell::new(HitMap::default()),
@@ -5249,28 +5395,26 @@ mod tests {
     }
 
     #[test]
-    fn settings_enter_on_mouse_and_bands_stays_noop() {
-        // Candados de alcance T2: el contenido de Mouse (T4) y Bandas (T3)
-        // todavía no existe; Enter no hace nada en esas filas.
-        for selected in [1usize, 2usize] {
-            let mut app = test_app();
-            open_settings_panel(&mut app);
-            app.settings_panel.as_mut().expect("abierto").selected = selected;
-            handle_settings_panel_key(theme_menu_key(KeyCode::Enter), &mut app);
-            assert!(
-                app.settings_panel.is_some(),
-                "fila {selected}: Enter no cierra el panel"
-            );
-            assert!(
-                app.theme_menu.is_none(),
-                "fila {selected}: Enter sigue NO-OP en T2"
-            );
-            assert_eq!(
-                app.settings_panel.as_ref().expect("abierto").selected,
-                selected,
-                "fila {selected}: Enter no mueve la selección"
-            );
-        }
+    fn settings_enter_on_mouse_stays_noop() {
+        // Candado de alcance T3: el toggle de Mouse es T4; Enter no hace nada
+        // en esa fila (Bandas ya abre su sub-modal: ver tests T3).
+        let mut app = test_app();
+        open_settings_panel(&mut app);
+        app.settings_panel.as_mut().expect("abierto").selected = 1;
+        handle_settings_panel_key(theme_menu_key(KeyCode::Enter), &mut app);
+        assert!(
+            app.settings_panel.is_some(),
+            "Enter en Mouse no cierra el panel"
+        );
+        assert!(
+            app.theme_menu.is_none() && app.bands_menu.is_none(),
+            "Enter en Mouse sigue NO-OP en T3"
+        );
+        assert_eq!(
+            app.settings_panel.as_ref().expect("abierto").selected,
+            1,
+            "Enter en Mouse no mueve la selección"
+        );
     }
 
     #[test]
@@ -5392,6 +5536,213 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // T3: selector de Bandas dentro del panel + persistencia del estilo
+    // -------------------------------------------------------------------------
+
+    static BANDS_MENU_TEST_LOCK: std::sync::Mutex<()> =
+        std::sync::Mutex::new(());
+
+    struct BandsMenuTestGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        style: config::VisualizerStyle,
+    }
+
+    impl Drop for BandsMenuTestGuard {
+        fn drop(&mut self) {
+            config::activate_visualizer_style(self.style);
+        }
+    }
+
+    /// Serializa los tests que mutan el estilo activo global y lo restaura al
+    /// salir (incluso si el test falla).
+    fn bands_menu_test_setup() -> BandsMenuTestGuard {
+        let lock = BANDS_MENU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        BandsMenuTestGuard {
+            _lock: lock,
+            style: config::active_visualizer_style(),
+        }
+    }
+
+    #[test]
+    fn settings_enter_on_bands_opens_bands_submodal_keeping_panel() {
+        let _setup = bands_menu_test_setup();
+        let mut app = test_app();
+        open_settings_panel(&mut app);
+        app.settings_panel.as_mut().expect("abierto").selected = 2;
+        handle_settings_panel_key(theme_menu_key(KeyCode::Enter), &mut app);
+        assert!(
+            app.settings_panel.is_some(),
+            "el panel sigue abierto debajo del sub-modal"
+        );
+        assert!(
+            app.bands_menu.is_some(),
+            "Enter en Bandas abre el selector de estilos"
+        );
+    }
+
+    #[test]
+    fn bands_submodal_navigation_clamps_and_previews_live() {
+        let _setup = bands_menu_test_setup();
+        config::activate_visualizer_style(config::VisualizerStyle::Ascii);
+        let mut app = test_app();
+        open_settings_panel(&mut app);
+        open_bands_menu(&mut app);
+        let selected = |app: &App| {
+            app.bands_menu.as_ref().expect("sub-modal abierto").selected
+        };
+        assert_eq!(selected(&app), 1, "arranca en el estilo activo (ascii)");
+
+        // Sin envoltura, como el menú de temas.
+        handle_bands_menu_key(theme_menu_key(KeyCode::Up), &mut app, |_| Ok(()));
+        assert_eq!(selected(&app), 0, "↑ va a auto");
+        handle_bands_menu_key(theme_menu_key(KeyCode::Up), &mut app, |_| Ok(()));
+        assert_eq!(selected(&app), 0, "↑ en la primera fila no se mueve");
+        handle_bands_menu_key(theme_menu_key(KeyCode::Down), &mut app, |_| Ok(()));
+        handle_bands_menu_key(theme_menu_key(KeyCode::Down), &mut app, |_| Ok(()));
+        handle_bands_menu_key(theme_menu_key(KeyCode::Down), &mut app, |_| Ok(()));
+        assert_eq!(selected(&app), 2, "↓ frena en unicode sin envolver");
+
+        // Navegar previsualiza en vivo: el estilo efectivo sigue al cursor
+        // (forzados ganan sin importar WT_SESSION, así no depende del env).
+        assert_eq!(
+            config::active_visualizer_style(),
+            config::VisualizerStyle::Unicode
+        );
+        assert_eq!(
+            config::effective_visualizer_style(),
+            config::VisualizerStyle::Unicode,
+            "el fondo previsualiza el estilo navegado"
+        );
+    }
+
+    #[test]
+    fn dispatch_routes_to_bands_submodal_when_open() {
+        let _setup = bands_menu_test_setup();
+        let Some(mut engine) = engine_or_skip() else { return };
+        config::activate_visualizer_style(config::VisualizerStyle::Auto);
+        let mut app = test_app();
+        app.mode = Mode::Player;
+        open_settings_panel(&mut app);
+        app.settings_panel.as_mut().expect("abierto").selected = 2;
+        handle_settings_panel_key(theme_menu_key(KeyCode::Enter), &mut app);
+
+        handle_key(theme_menu_key(KeyCode::Down), &mut app, &mut engine);
+
+        assert_eq!(
+            app.bands_menu.as_ref().expect("sigue abierto").selected,
+            1,
+            "con el sub-modal abierto las teclas van al sub-modal, no al panel"
+        );
+        assert_eq!(
+            app.settings_panel.as_ref().expect("panel debajo").selected,
+            2,
+            "el panel de abajo no se mueve"
+        );
+    }
+
+    #[test]
+    fn bands_submodal_enter_saves_and_returns_to_panel() {
+        let _setup = bands_menu_test_setup();
+        let path = std::env::temp_dir()
+            .join(format!("mp3tui_t3_bands_enter_{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        config::activate_visualizer_style(config::VisualizerStyle::Auto);
+        let mut app = test_app();
+        open_settings_panel(&mut app);
+        open_bands_menu(&mut app);
+        handle_bands_menu_key(theme_menu_key(KeyCode::Down), &mut app, |_| Ok(()));
+        handle_bands_menu_key(theme_menu_key(KeyCode::Enter), &mut app, |style| {
+            config::persist_visualizer_style_at(&path, style)
+        });
+        assert!(app.bands_menu.is_none(), "Enter cierra el sub-modal");
+        assert!(
+            app.settings_panel.is_some(),
+            "pero VUELVE al panel, no lo cierra"
+        );
+        assert_eq!(
+            config::active_visualizer_style(),
+            config::VisualizerStyle::Ascii,
+            "el estilo queda aplicado"
+        );
+        let text = std::fs::read_to_string(&path).expect("estilo persistido");
+        assert!(
+            text.contains("style = \"ascii\""),
+            "el estilo se persiste como hoy: {text:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn bands_submodal_esc_restores_and_returns_to_panel() {
+        let _setup = bands_menu_test_setup();
+        config::activate_visualizer_style(config::VisualizerStyle::Ascii);
+        let mut app = test_app();
+        open_settings_panel(&mut app);
+        open_bands_menu(&mut app);
+        // Previsualiza otro estilo moviéndose dentro del sub-modal.
+        handle_bands_menu_key(theme_menu_key(KeyCode::Down), &mut app, |_| Ok(()));
+        assert_eq!(
+            config::active_visualizer_style(),
+            config::VisualizerStyle::Unicode,
+            "navegar previsualiza"
+        );
+        handle_bands_menu_key(theme_menu_key(KeyCode::Esc), &mut app, |_| Ok(()));
+        assert!(app.bands_menu.is_none(), "Esc cierra el sub-modal");
+        assert!(
+            app.settings_panel.is_some(),
+            "y VUELVE al panel, no lo cierra"
+        );
+        assert_eq!(
+            config::active_visualizer_style(),
+            config::VisualizerStyle::Ascii,
+            "Esc restaura el estilo previo"
+        );
+    }
+
+    #[test]
+    fn mouse_is_inert_under_bands_submodal() {
+        // El guard inerte cubre el panel y el sub-modal: se verifica.
+        let _setup = bands_menu_test_setup();
+        let Some(mut engine) = engine_or_skip() else { return };
+        let mut app = test_app();
+        app.mode = Mode::Player;
+        app.has_player = true;
+        *app.hit.borrow_mut() = sample_hit();
+        open_settings_panel(&mut app);
+        open_bands_menu(&mut app);
+        handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 30, 5),
+            &mut app,
+            &mut engine,
+        );
+        assert_eq!(engine.volume(), 0.0, "el clic no atraviesa el sub-modal");
+        assert_eq!(app.drag, None);
+    }
+
+    #[test]
+    fn bands_footer_shows_preview_hints() {
+        let _setup = bands_menu_test_setup();
+        let mut app = test_app();
+        open_settings_panel(&mut app);
+        open_bands_menu(&mut app);
+        let joined: String = footer_lines(&app, false)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            joined.contains("previsualizar"),
+            "el pie del sub-modal explica el preview: {joined}"
+        );
+        assert!(
+            joined.contains("guardar"),
+            "el pie del sub-modal explica Enter: {joined}"
+        );
     }
 
     #[test]
