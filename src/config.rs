@@ -55,6 +55,8 @@ pub struct Config {
     /// `[ui] mouse`: captura del mouse (clic, arrastre, rueda). Activada por
     /// defecto; con `false` la terminal conserva su selección de texto nativa.
     pub mouse: bool,
+    /// `[visualizer] style`: ascii, unicode o auto (según `WT_SESSION`).
+    pub visualizer_style: VisualizerStyle,
     /// Avisos de la carga: campos inválidos, claves desconocidas o archivo
     /// ilegible. Vacío cuando todo (o el archivo mismo) está bien.
     pub warnings: Vec<String>,
@@ -69,6 +71,7 @@ impl Default for Config {
             keys: Keys::default(),
             library: LibraryConfig::default(),
             mouse: true,
+            visualizer_style: VisualizerStyle::default(),
             warnings: Vec::new(),
         }
     }
@@ -177,7 +180,7 @@ pub fn parse(text: &str) -> Config {
 
     for section in table.keys() {
         match section.as_str() {
-            "theme" | "keybindings" | "library" | "ui" => {}
+            "theme" | "keybindings" | "library" | "ui" | "visualizer" => {}
             other => warnings.push(format!(
                 "sección desconocida «[{other}]» (se ignora)"
             )),
@@ -216,6 +219,19 @@ pub fn parse(text: &str) -> Config {
             Some(section) => parse_ui(section, &mut config, &mut warnings),
             None => warnings.push(
                 "[ui] debe ser una tabla, por ejemplo: mouse = false".to_string(),
+            ),
+        },
+    }
+
+    match table.get("visualizer") {
+        None => {}
+        Some(value) => match value.as_table() {
+            Some(section) => {
+                parse_visualizer(section, &mut config, &mut warnings)
+            }
+            None => warnings.push(
+                "[visualizer] debe ser una tabla, por ejemplo: style = \"ascii\""
+                    .to_string(),
             ),
         },
     }
@@ -1231,6 +1247,75 @@ impl LibraryConfig {
     }
 }
 
+/// Estilo de bandas del visualizador (`[visualizer] style`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VisualizerStyle {
+    /// Según la terminal: con `WT_SESSION` = unicode, sin ella = ascii.
+    #[default]
+    Auto,
+    Ascii,
+    Unicode,
+}
+
+/// Resuelve el estilo efectivo de forma pura (testeable): `ascii`/`unicode`
+/// fuerzan; `auto` mira `WT_SESSION` (inyectada, NO leída acá).
+pub fn resolve_visualizer_style(
+    configured: VisualizerStyle,
+    wt_session: Option<&str>,
+) -> VisualizerStyle {
+    match configured {
+        VisualizerStyle::Auto => match wt_session {
+            Some(session) if !session.is_empty() => VisualizerStyle::Unicode,
+            _ => VisualizerStyle::Ascii,
+        },
+        forced => forced,
+    }
+}
+
+/// Estilo efectivo para renderizar: config + `WT_SESSION` real del entorno.
+pub fn effective_visualizer_style() -> VisualizerStyle {
+    resolve_visualizer_style(
+        config().visualizer_style,
+        env::var("WT_SESSION").ok().as_deref(),
+    )
+}
+
+/// `[visualizer] style`: auto (default), ascii o unicode. Merge campo a campo
+/// como el resto: lo inválido avisa y cae al default sin tocar lo demás.
+fn parse_visualizer(
+    section: &toml::Table,
+    config: &mut Config,
+    warnings: &mut Vec<String>,
+) {
+    for (key, value) in section {
+        match key.as_str() {
+            "style" => match value.as_str() {
+                Some(raw) => {
+                    match raw.trim().to_ascii_lowercase().as_str() {
+                        "auto" => config.visualizer_style = VisualizerStyle::Auto,
+                        "ascii" => config.visualizer_style = VisualizerStyle::Ascii,
+                        "unicode" => {
+                            config.visualizer_style = VisualizerStyle::Unicode
+                        }
+                        _ => warnings.push(format!(
+                            "[visualizer] style «{raw}» no reconocido \
+                             (válidos: auto, ascii, unicode); se usa «auto»"
+                        )),
+                    }
+                }
+                None => warnings.push(
+                    "[visualizer] style debe ser un texto entre comillas, \
+                     p. ej. style = \"ascii\"; se usa «auto»"
+                        .to_string(),
+                ),
+            },
+            other => warnings.push(format!(
+                "[visualizer] clave desconocida «{other}» (se ignora)"
+            )),
+        }
+    }
+}
+
 /// `[ui]`: opciones de la interfaz. Hoy solo `mouse` (bool).
 fn parse_ui(section: &toml::Table, config: &mut Config, warnings: &mut Vec<String>) {
     for (key, value) in section {
@@ -1369,6 +1454,58 @@ mouse = \"no\"");
 zoom = 2");
         assert_eq!(unknown.warnings.len(), 1, "{:?}", unknown.warnings);
         assert!(unknown.warnings[0].contains("zoom"), "{:?}", unknown.warnings);
+    }
+
+    #[test]
+    fn visualizer_style_defaults_to_auto_and_parses_all_values() {
+        assert_eq!(parse("").visualizer_style, VisualizerStyle::Auto);
+        for (raw, expected) in [
+            ("auto", VisualizerStyle::Auto),
+            ("ascii", VisualizerStyle::Ascii),
+            ("unicode", VisualizerStyle::Unicode),
+        ] {
+            let config = parse(&format!("[visualizer]\nstyle = \"{raw}\"\n"));
+            assert_eq!(config.visualizer_style, expected, "style={raw}");
+            assert!(config.warnings.is_empty(), "{:?}", config.warnings);
+        }
+    }
+
+    #[test]
+    fn visualizer_style_invalid_or_unknown_warns_and_keeps_default() {
+        let bad = parse("[visualizer]\nstyle = \"bloques\"");
+        assert_eq!(bad.visualizer_style, VisualizerStyle::Auto);
+        assert_eq!(bad.warnings.len(), 1, "{:?}", bad.warnings);
+        assert!(bad.warnings[0].contains("style"), "{:?}", bad.warnings);
+
+        let not_a_string = parse("[visualizer]\nstyle = 42");
+        assert_eq!(not_a_string.visualizer_style, VisualizerStyle::Auto);
+        assert_eq!(not_a_string.warnings.len(), 1, "{:?}", not_a_string.warnings);
+
+        let unknown = parse("[visualizer]\nzoom = 2");
+        assert_eq!(unknown.visualizer_style, VisualizerStyle::Auto);
+        assert_eq!(unknown.warnings.len(), 1, "{:?}", unknown.warnings);
+        assert!(unknown.warnings[0].contains("zoom"), "{:?}", unknown.warnings);
+    }
+
+    #[test]
+    fn visualizer_style_does_not_drag_other_fields() {
+        let config = parse("[visualizer]\nstyle = \"ascii\"\n[ui]\nmouse = false\n");
+        assert_eq!(config.visualizer_style, VisualizerStyle::Ascii);
+        assert!(!config.mouse);
+        assert!(config.warnings.is_empty(), "{:?}", config.warnings);
+    }
+
+    #[test]
+    fn visualizer_auto_resolves_by_wt_session_and_forced_modes_win() {
+        use VisualizerStyle::{Ascii, Auto, Unicode};
+        assert_eq!(resolve_visualizer_style(Auto, None), Ascii);
+        assert_eq!(resolve_visualizer_style(Auto, Some(""),), Ascii);
+        assert_eq!(
+            resolve_visualizer_style(Auto, Some("6e5b..."),),
+            Unicode
+        );
+        assert_eq!(resolve_visualizer_style(Ascii, Some("6e5b..."),), Ascii);
+        assert_eq!(resolve_visualizer_style(Unicode, None), Unicode);
     }
 
     #[test]

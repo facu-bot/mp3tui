@@ -208,6 +208,9 @@ seek_back = "left"
 # Con backslashes usá strings literales de TOML ('C:\Musica') o barras
 # normales ("C:/Musica").
 roots = ["C:/Musica"]
+
+[visualizer]
+style = "auto" # auto (según la terminal), ascii o unicode
 ```
 
 Notas del comportamiento de la config:
@@ -220,6 +223,11 @@ Notas del comportamiento de la config:
 - Se mergea campo a campo: un valor inválido vuelve a su default sin
   arrastrar al resto. Los avisos salen en stderr antes de la TUI y en la
   primera pantalla.
+- `[visualizer] style` elige las bandas del visualizador: `unicode` dibuja
+  bloques `▁▂▃▄▅▆▇█`, `ascii` usa la rampa ` .:-=;+*#@` con fondo de puntos
+  tenue (para terminales sin unicode, como conhost legacy) y `auto` (default)
+  elige solo: unicode con `WT_SESSION` (Windows Terminal), ascii sin ella. Un
+  valor inválido avisa y se usa `auto`. El gradiente de color no cambia.
 - Si dos acciones distintas quedan mapeadas a la misma tecla, gana la de
   mayor prioridad en el dispatch y se genera un warning que lo explicita
   (la perdedora vuelve a sus defaults libres).

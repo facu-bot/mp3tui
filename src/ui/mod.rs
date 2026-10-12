@@ -38,6 +38,9 @@ const PAGE_STEP: isize = 10;
 
 /// Bloques de octavo de celda para el visualizador sub-celda (mejora 1).
 const EIGHTH_BLOCKS: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+/// Rampa ASCII de 10 niveles para el modo ascii (índice 0 = vacío … 9 = lleno).
+const ASCII_RAMP: [&str; 10] =
+    [" ", ".", ":", "-", "=", ";", "+", "*", "#", "@"];
 
 // Paleta compartida por todo el programa (T9/T12): la celda runtime de
 // config, que cambia en caliente al previsualizar/aplicar temas desde el menú
@@ -2860,7 +2863,11 @@ fn render_visualizer(frame: &mut Frame<'_>, area: Rect, bands: &[f32; NUM_BANDS]
         .title(accent_title("Visualizador"));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-        paint_bands(frame.buffer_mut(), inner, bands, &theme());
+    let ascii = matches!(
+        config::effective_visualizer_style(),
+        config::VisualizerStyle::Ascii
+    );
+    paint_bands(frame.buffer_mut(), inner, bands, &theme(), ascii);
 }
 
 /// Pinta las 32 barras dentro del área interior del bloque, sin widgets.
@@ -2875,6 +2882,7 @@ fn paint_bands(
     inner: Rect,
     bands: &[f32; NUM_BANDS],
     theme: &Theme,
+    ascii: bool,
 ) {
     if inner.width == 0 || inner.height == 0 {
         return;
@@ -2910,7 +2918,7 @@ fn paint_bands(
         let full_cells = height_f.floor() as u16;
         let frac = height_f - height_f.floor();
 
-        // Pintar las celdas completas (█ con gradiente de color).
+        // Pintar las celdas completas (█ con gradiente de color; @ en ascii).
         for row in 0..full_cells {
             let y = bottom - 1 - row;
             let t = if inner.height > 1 {
@@ -2920,18 +2928,25 @@ fn paint_bands(
             };
             let (red, green, blue) = spectrum_color(t, theme);
             let color = Color::Rgb(red, green, blue);
+            let symbol = if ascii { "@" } else { "█" };
             for dx in 0..width {
                 if let Some(cell) = buffer.cell_mut((x0 + dx, y)) {
-                    cell.set_symbol("█").set_fg(color);
+                    cell.set_symbol(symbol).set_fg(color);
                 }
             }
         }
 
-        // Pintar la celda parcial con el bloque de octavo correspondiente.
+        // Pintar la celda parcial: bloque de octavo en unicode, rampa de 10
+        // niveles en ascii. El color es el mismo gradiente en ambos modos.
         if frac > 0.0 && full_cells < inner.height {
             let y = bottom - full_cells - 1;
-            let idx = ((frac * 8.0) as usize).min(7);
-            let symbol = EIGHTH_BLOCKS[idx];
+            let symbol = if ascii {
+                let idx = ((frac * 10.0) as usize).min(9);
+                ASCII_RAMP[idx]
+            } else {
+                let idx = ((frac * 8.0) as usize).min(7);
+                EIGHTH_BLOCKS[idx]
+            };
             // Color: el mismo gradiente que tendría si fuera una celda completa.
             let t = if inner.height > 1 {
                 full_cells as f32 / (inner.height - 1) as f32
@@ -2947,13 +2962,18 @@ fn paint_bands(
             }
         }
 
-        // Limpiar las celdas vacías por encima de la barra.
+        // Limpiar las celdas vacías por encima de la barra: espacio en
+        // unicode, fondo de puntos tenue en ascii.
         let painted_rows = full_cells + if frac > 0.0 { 1 } else { 0 };
         for row in painted_rows..inner.height {
             let y = bottom - 1 - row;
             for dx in 0..width {
                 if let Some(cell) = buffer.cell_mut((x0 + dx, y)) {
-                    cell.set_symbol(" ").set_fg(Color::Reset);
+                    if ascii {
+                        cell.set_symbol(".").set_fg(theme.dim);
+                    } else {
+                        cell.set_symbol(" ").set_fg(Color::Reset);
+                    }
                 }
             }
         }
@@ -3254,7 +3274,7 @@ mod tests {
         let mut buffer = Buffer::empty(area);
         let mut bands = [0.0f32; NUM_BANDS];
         bands[0] = 1.0;
-        paint_bands(&mut buffer, area, &bands, &theme);
+        paint_bands(&mut buffer, area, &bands, &theme, false);
 
         let bottom = &buffer[(0u16, 9u16)];
         assert_eq!(bottom.symbol(), "\u{2588}");
@@ -3279,7 +3299,7 @@ mod tests {
     fn paint_bands_zero_leaves_empty_reset_cells() {
         let area = Rect::new(0, 0, 8, 10);
         let mut buffer = Buffer::empty(area);
-        paint_bands(&mut buffer, area, &[0.0f32; NUM_BANDS], &Theme::default());
+        paint_bands(&mut buffer, area, &[0.0f32; NUM_BANDS], &Theme::default(), false);
 
         let cell = &buffer[(0u16, 9u16)];
         assert_eq!(cell.symbol(), " ");
@@ -3292,7 +3312,7 @@ mod tests {
         let mut buffer = Buffer::empty(area);
         let mut bands = [0.0f32; NUM_BANDS];
         bands[0] = 0.5;
-        paint_bands(&mut buffer, area, &bands, &Theme::default());
+        paint_bands(&mut buffer, area, &bands, &Theme::default(), false);
 
         // 0.5 * 10 = 5.0 → full_cells = 5, frac = 0.0 → no partial cell.
         // Rows y=9..5 (bottom 5) are full █, y=4 is empty.
@@ -3312,7 +3332,7 @@ mod tests {
         let mut buffer = Buffer::empty(area);
         let mut bands = [0.0f32; NUM_BANDS];
         bands[0] = 0.45;
-        paint_bands(&mut buffer, area, &bands, &Theme::default());
+        paint_bands(&mut buffer, area, &bands, &Theme::default(), false);
 
         let bottom = area.y + area.height; // = 10
         let partial_y = bottom - 4 - 1; // = 5
@@ -3333,7 +3353,7 @@ mod tests {
         let width = 113u16;
         let area = Rect::new(0, 0, width, 3);
         let mut buffer = Buffer::empty(area);
-        paint_bands(&mut buffer, area, &[1.0f32; NUM_BANDS], &Theme::default());
+        paint_bands(&mut buffer, area, &[1.0f32; NUM_BANDS], &Theme::default(), false);
 
         let rightmost = (0..width)
             .rev()
@@ -3344,6 +3364,81 @@ mod tests {
             rightmost >= width - 2,
             "las barras deben llegar al borde derecho, última columna pintada: {rightmost}"
         );
+    }
+
+    #[test]
+    fn ascii_ramp_has_ten_levels_from_empty_to_full() {
+        assert_eq!(ASCII_RAMP.len(), 10, "la rampa ascii tiene 10 niveles");
+        assert_eq!(ASCII_RAMP[0], " ", "índice 0 = vacío");
+        assert_eq!(ASCII_RAMP[9], "@", "índice 9 = lleno");
+        assert_eq!(
+            ASCII_RAMP,
+            [" ", ".", ":", "-", "=", ";", "+", "*", "#", "@"]
+        );
+    }
+
+    #[test]
+    fn paint_bands_ascii_full_bar_uses_at_with_same_gradient() {
+        let theme = Theme::default();
+        let area = Rect::new(0, 0, 8, 10);
+        let mut buffer = Buffer::empty(area);
+        let mut bands = [0.0f32; NUM_BANDS];
+        bands[0] = 1.0;
+        paint_bands(&mut buffer, area, &bands, &theme, true);
+
+        let bottom = &buffer[(0u16, 9u16)];
+        assert_eq!(bottom.symbol(), "@", "celda llena en ascii");
+        assert_eq!(
+            bottom.fg,
+            Color::Rgb(0x89, 0x92, 0xA7),
+            "el gradiente no cambia en ascii"
+        );
+
+        let top = &buffer[(0u16, 0u16)];
+        assert_eq!(top.symbol(), "@");
+        assert_eq!(top.fg, Color::Rgb(0xC4, 0x74, 0x6E), "rojo del pico");
+    }
+
+    #[test]
+    fn paint_bands_ascii_empty_cells_are_dim_dots() {
+        let theme = Theme::default();
+        let area = Rect::new(0, 0, 8, 10);
+        let mut buffer = Buffer::empty(area);
+        paint_bands(&mut buffer, area, &[0.0f32; NUM_BANDS], &theme, true);
+
+        let cell = &buffer[(0u16, 9u16)];
+        assert_eq!(cell.symbol(), ".", "fondo de puntos en ascii");
+        assert_eq!(cell.fg, theme.dim);
+    }
+
+    #[test]
+    fn paint_bands_ascii_partial_cell_uses_ramp() {
+        // magnitude = 0.45, alto 10 → height_f = 4.5, full = 4, frac = 0.5
+        // idx = (0.5 * 10.0) as usize = 5 → ASCII_RAMP[5] = ";"
+        let theme = Theme::default();
+        let area = Rect::new(0, 0, 8, 10);
+        let mut buffer = Buffer::empty(area);
+        let mut bands = [0.0f32; NUM_BANDS];
+        bands[0] = 0.45;
+        paint_bands(&mut buffer, area, &bands, &theme, true);
+
+        let bottom = area.y + area.height; // = 10
+        let partial_y = bottom - 4 - 1; // = 5
+        assert_eq!(
+            buffer[(0u16, partial_y)].symbol(),
+            ";",
+            "frac=0.5 → ASCII_RAMP[5] = ;"
+        );
+        // Mismo gradiente que tendría esa celda en unicode.
+        let expected = spectrum_color(4.0 / 9.0, &theme);
+        assert_eq!(
+            buffer[(0u16, partial_y)].fg,
+            Color::Rgb(expected.0, expected.1, expected.2)
+        );
+        assert_eq!(buffer[(0u16, bottom - 1)].symbol(), "@", "llenas = @");
+        let above = &buffer[(0u16, partial_y - 1)];
+        assert_eq!(above.symbol(), ".", "sobre la barra = punto tenue");
+        assert_eq!(above.fg, theme.dim);
     }
 
     fn test_app() -> App {
