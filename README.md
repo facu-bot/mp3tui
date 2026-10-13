@@ -120,7 +120,9 @@ dragon, tokyonight, catppuccin-mocha, dracula, gruvbox-dark, nord, rose-pine y
 **miku**).
 
 El modo **`miku`** (`[visualizer] mode = "miku"`) convierte el visualizador en
-una bailarina ASCII que cambia de pose al ritmo de los graves (detector de
-pulso sobre el bajo; con silencio o pausa sigue bailando por timer). Elegir el
-tema **miku** activa ese modo por default (salvo que `[visualizer] mode` esté
-seteado a mano).
+la **animación de Miku bailando**: reproduce los frames de la danza (~3 s de
+bucle) con el fondo negro del lienzo original, acelerando el paso al ritmo del
+bajo (detector de pulso sobre las bandas graves); con silencio o pausa sigue
+bailando por timer. Los dibujos son ASCII puro, así que se ve **igual con
+estilo ascii o unicode**. Elegir el tema **miku** activa ese modo por default
+(salvo que `[visualizer] mode` esté seteado a mano).

@@ -4049,81 +4049,15 @@ fn render_visualizer(frame: &mut Frame<'_>, area: Rect, analyzer: &SpectrumAnaly
             &theme(),
             ascii,
         ),
-        VisualizerPaint::Miku => {
-            paint_miku(frame.buffer_mut(), inner, analyzer, &theme(), ascii)
-        }
+        VisualizerPaint::Miku => paint_miku(frame.buffer_mut(), inner, analyzer),
     }
 }
 
-/// Frames de la bailarina ASCII (modo `miku`): 4 poses, solo caracteres
-/// ASCII, silueta de coletas y falda; la pose la avanza `SpectrumAnalyzer::
-/// tick_dance` según la energía de graves (con timer de respiración).
-const MIKU_FRAMES: [&str; crate::visualizer::MIKU_POSES] = [
-    // Quieta, coletas al costado.
-    r"\            /
- \  /''''\  /
-  \| MIKU |/
-   (_ O O _)
-    >  ^  <
-   /|_| |_|\
-  | |_| |_| |
-  |   \ /   |
-  |    \/   |
-   \  | |  /
-    \_| |_/
-     /\ /\
-",
-    // Brisco arriba.
-    r"      |      
- \    |    /
-  \  /'\  /
-   \|MIKU|/
-    (_ O O _)
-     >  ^  <
-   _/| | |\_
-  |  | | |  |
-  |  |   |  |
- _/   \ /   \_
-| \   \/    / |
- \_\  | |  /_/
-    \_|_|_/
-",
-    // Giro, coletas al frente.
-    r"\ _        _ /
-  Y   /\   Y
-  |  /  \  |
-  | |  |  | |
- \ | |  | | /
-  \| |  | |/
-   ( O  O )
-    >  __ <
-   /|_|  |_|\
-  / |    | \
- |  | /\ |  |
- |  |/  \|  |
-  \_||  ||_/
-    |_|  |_|
-",
-    // Pateo.
-    r"      _/\
-  \  /    \  /
-   \|      |/
-   (_  ^  _)
-    >      <
-   /|  /\  |\
-  | | /  \ | |
-  | |/    \| |
-  |  \    /  |
-   \  \  /  /
-    \_ \/ _/
-      |  |
-     /\  /\
-",
-];
 
 /// Color de paleta del arte animado (`miku_art`): letras a..g generadas del
-/// `.asciimtn` original. `a` = negro (fondo del arte: se omite, el fondo de la
-/// app ya es oscuro); `c`/`d` son los acentos turquesa/cian de Miku.
+/// `.asciimtn` original. `a` = negro, el fondo del lienzo del arte: coincide
+/// con el fondo que `paint_miku` pinta en el área, así que se omite; `c`/`d`
+/// son los acentos turquesa/cian de Miku.
 fn miku_palette_color(letter: char) -> Option<Color> {
     match letter {
         'b' => Some(Color::Rgb(0x00, 0xcd, 0x00)),
@@ -4136,24 +4070,22 @@ fn miku_palette_color(letter: char) -> Option<Color> {
     }
 }
 
-/// Pintor de la bailarina (modo `miku`). Con estilo unicode reproduce la
-/// ANIMACIÓN real de la pieza «hatsumemiku.asciimtn» (26 frames de la danza,
-/// con colores de paleta, recortada al bbox de la figura), avanzando un frame
-/// cada `ANIM_TICKS` de reloj para que el bucle dure ~3 s; sobre eso, el arco
-/// de salto (`dance_pose`, disparado por el beat de graves) y el vaivén
-/// horizontal (`dance_clock`) mueven la figura dentro del área. Con estilo
-/// ascii (sin unicode) usa las 4 poses simples de `MIKU_FRAMES`.
+/// Pintor de la bailarina (modo `miku`): reproduce la ANIMACIÓN real de
+/// «hatsumemiku.asciimtn» (26 frames de la danza, con colores de paleta,
+/// recortada al bbox de la figura), avanzando un frame cada `ANIM_TICKS` de
+/// reloj para que el bucle dure ~3 s; sobre eso, el arco de salto
+/// (`dance_pose`, disparado por el beat de graves) y el vaivén horizontal
+/// (`dance_clock`) la mueven centrada dentro del área. El fondo del área se
+/// rellena con el negro del lienzo del arte, y los DIBUJOS de la pieza son
+/// ASCII puro, así la bailarina es idéntica con estilo ascii o unicode.
 fn paint_miku(
     buf: &mut ratatui::buffer::Buffer,
     inner: Rect,
     analyzer: &SpectrumAnalyzer,
-    theme: &Theme,
-    ascii: bool,
 ) {
-    if ascii {
-        paint_miku_poses(buf, inner, analyzer, theme);
-        return;
-    }
+    // Fondo del lienzo del arte (#000000): todo el área queda igual al fondo
+    // del ascii original, sin huecos contra la paleta de la app.
+    buf.set_style(inner, Style::default().bg(Color::Rgb(0x00, 0x00, 0x00)));
 
     use crate::visualizer::miku_art as art;
     let frame = (analyzer.dance_clock() / art::ANIM_TICKS as u64) as usize
@@ -4203,9 +4135,6 @@ fn paint_miku(
         0
     };
 
-    for y in inner.y..inner.y + inner.height {
-        buf.set_string(inner.x, y, " ".repeat(inner.width as usize), Style::default());
-    }
     for r in 0..rows {
         let y = inner.y + (pos_r + r) as u16;
         let art_row = art::CROP_TOP + win_r + r;
@@ -4226,49 +4155,6 @@ fn paint_miku(
                 ch.to_string(),
                 Style::default().fg(color),
             );
-        }
-    }
-}
-
-/// Variante en estilo ascii del pintor de la bailarina: las 4 poses simples
-/// centradas y colorizadas por clase de glifo (coletas con `spectrum_mid`, la
-/// cara con `text`, el resto con `dim`).
-fn paint_miku_poses(
-    buf: &mut ratatui::buffer::Buffer,
-    inner: Rect,
-    analyzer: &SpectrumAnalyzer,
-    theme: &Theme,
-) {
-    let pose = analyzer.dance_pose().min(MIKU_FRAMES.len() - 1);
-    let frame_lines: Vec<&str> = MIKU_FRAMES[pose].lines().collect();
-    let cols = inner.width as usize;
-    for (row, line) in frame_lines.iter().take(inner.height as usize).enumerate() {
-        let y = inner.y + row as u16;
-        buf.set_string(inner.x, y, " ".repeat(cols), Style::default());
-        let glyphs: Vec<char> = line.chars().collect();
-        if glyphs.is_empty() {
-            continue;
-        }
-        let pad = cols.saturating_sub(glyphs.len());
-        let x0 = inner.x + (pad / 2) as u16;
-        for (col, ch) in glyphs.iter().enumerate() {
-            if *ch == ' ' || *ch == '\n' {
-                continue;
-            }
-            let style = match ch {
-                '/' | '\\' | '\'' | 'Y' | '^' => {
-                    Style::default().fg(theme.spectrum_mid)
-                }
-                'O' | 'o' | '_' | '>' | '<' | '(' | ')' => {
-                    Style::default().fg(theme.text)
-                }
-                _ => Style::default().fg(theme.dim),
-            };
-            let x = x0 + col as u16;
-            if x >= inner.x.saturating_add(inner.width) {
-                break;
-            }
-            buf.set_string(x, y, ch.to_string(), style);
         }
     }
 }
@@ -8848,10 +8734,9 @@ mod tests {
             VisualizerPaint::Miku,
             "miku va a su bailarina, no a las barras"
         );
-        assert_eq!(
-            MIKU_FRAMES.len(),
-            crate::visualizer::MIKU_POSES,
-            "las poses del analyzer y las frames de ui coinciden"
+        assert!(
+            crate::visualizer::MIKU_POSES >= 4,
+            "el arco de salto del analyzer tiene poses suficientes"
         );
     }
 
@@ -8863,15 +8748,14 @@ mod tests {
         let Some(engine) = engine_or_skip() else { return };
         runtime::preview_visualizer_mode(config::VisualizerMode::Miku);
         let mut analyzer = SpectrumAnalyzer::new();
-        // Silencio: el timer de respiración mueve la pose sola; paramos en la
-        // pose 1 (brazos arriba), que lleva la palabra MIKU en el pecho.
+        // Silencio: el timer de respiración mueve la pose sola (arco de salto).
         for _ in 0..200 {
             analyzer.tick_dance(true);
-            if analyzer.dance_pose() == 1 {
+            if analyzer.dance_pose() != 0 {
                 break;
             }
         }
-        assert_eq!(analyzer.dance_pose(), 1, "el timer avanzó a la pose 1");
+        assert_ne!(analyzer.dance_pose(), 0, "el timer movió la pose");
 
         let mut app = test_app();
         app.mode = Mode::Player;
@@ -8884,8 +8768,8 @@ mod tests {
             .expect("draw");
         let text = player_screen_text(&terminal.backend().buffer().clone());
         assert!(
-            text.contains('M') && text.contains('I'),
-            "la pose actual renderiza la bailarina: {text}"
+            text.contains('@'),
+            "la animación real de Miku está en pantalla en el estilo por defecto"
         );
 
         // Panel abierto a 64x24: la bailarina se recorta sin paniquear y
