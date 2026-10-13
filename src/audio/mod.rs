@@ -1690,7 +1690,7 @@ mod tests {
     #[ignore = "requiere device de audio y un wav de prueba"]
     fn seek_position_matches_target_after_delay() {
         let path = Path::new(
-            r"C:\Users\facu\AppData\Local\Temp\opencode\test_music\sub\Cancion Delta.wav",
+            r"C:\Users\alguien\Musica\prueba\Cancion Delta.wav",
         );
         if !path.exists() {
             eprintln!("skip: no existe {}", path.display());
@@ -1806,7 +1806,7 @@ mod tests {
     #[ignore = "requiere device de audio y un wav de prueba"]
     fn speed_two_x_halves_wall_clock_duration() {
         let path = Path::new(
-            r"C:\Users\facu\AppData\Local\Temp\opencode\test_music\sub\Cancion Delta.wav",
+            r"C:\Users\alguien\Musica\prueba\Cancion Delta.wav",
         );
         if !path.exists() {
             eprintln!("skip: no existe {}", path.display());
