@@ -111,3 +111,16 @@ local encolada no abre), el ítem se **saltea con un aviso** en la línea de
 estado: el cursor avanza al próximo ítem de la cola y lo intenta. Si la cola se
 agota, se vuelve al recorrido normal de la biblioteca/historial. El ítem
 fallido queda en la cola, atenuado, y el cursor lo pasa.
+
+## Temas y visualizador
+
+Con `Ctrl+P` se abre la configuración (temas, modo y estilo del visualizador).
+Los temas se eligen por nombre en `[theme] name` del config.toml (kanagawa-
+dragon, tokyonight, catppuccin-mocha, dracula, gruvbox-dark, nord, rose-pine y
+**miku**).
+
+El modo **`miku`** (`[visualizer] mode = "miku"`) convierte el visualizador en
+una bailarina ASCII que cambia de pose al ritmo de los graves (detector de
+pulso sobre el bajo; con silencio o pausa sigue bailando por timer). Elegir el
+tema **miku** activa ese modo por default (salvo que `[visualizer] mode` esté
+seteado a mano).

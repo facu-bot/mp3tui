@@ -59,9 +59,13 @@ pub struct Config {
     pub mouse: bool,
     /// `[visualizer] style`: ascii, unicode o auto (según `WT_SESSION`).
     pub visualizer_style: VisualizerStyle,
-    /// `[visualizer] mode`: barras (default), onda, espejo, vu o circular.
-    /// El valor eliminado `caida` avisa específicamente y cae a `barras`.
+    /// `[visualizer] mode`: barras (default), onda, espejo, vu, circular o
+    /// miku. El valor eliminado `caida` avisa específicamente y cae a `barras`.
     pub visualizer_mode: VisualizerMode,
+    /// `true` cuando `[visualizer] mode` viene explicitado en config.toml: un
+    /// modo escrito a mano gana sobre el default que el tema declara (D1: el
+    /// tema miku arranca en modo bailarina solo si no hay modo explícito).
+    pub(crate) visualizer_mode_explicit: bool,
     /// `true` cuando `parse()` encontró el valor eliminado `caida` en
     /// `[visualizer] mode`: señal para que `load()` reescriba la config real
     /// a `barras` una sola vez (`parse()` puro, el que usan los tests, nunca
@@ -83,6 +87,7 @@ impl Default for Config {
             mouse: true,
             visualizer_style: VisualizerStyle::default(),
             visualizer_mode: VisualizerMode::default(),
+            visualizer_mode_explicit: false,
             removed_visualizer_mode: false,
             warnings: Vec::new(),
         }
@@ -284,6 +289,13 @@ pub fn parse(text: &str) -> Config {
                     .to_string(),
             ),
         },
+    }
+
+    // D1: el tema Miku arranca en modo bailarina salvo que `[visualizer]
+    // mode` venga explicitado (un modo a mano gana, y se cambia desde el
+    // sub-modal de modo).
+    if !config.visualizer_mode_explicit && config.theme_name == "miku" {
+        config.visualizer_mode = VisualizerMode::Miku;
     }
 
     // Tras aplicar defaults por campo: si dos acciones distintas terminaron
@@ -563,6 +575,22 @@ pub fn builtin_themes() -> &'static [(&'static str, Theme)] {
                     spectrum_mid: Color::Rgb(0xC4, 0xA7, 0xE7), // iris
                     spectrum_high: Color::Rgb(0xEB, 0xBC, 0xBA), // rose
                     buffered: Color::Rgb(0x90, 0x8C, 0xAA), // subtle
+                }),
+                // Hatsune Miku: turquesa/cian de su paleta oficial, con el
+                // rosa como acento cálido. El modo visualizador default de
+                // este tema es la bailarina (ver parse: D1).
+                ("miku", Theme {
+                    accent: Color::Rgb(0x39, 0xC5, 0xBB),   // miku turquesa
+                    text: Color::Rgb(0xE8, 0xF1, 0xF3),     // hielo
+                    dim: Color::Rgb(0x7F, 0xA8, 0xAC),      // teal grisáceo
+                    select_bg: Color::Rgb(0x1F, 0x2E, 0x33), // teal noche
+                    error: Color::Rgb(0xFF, 0x6E, 0x9B),    // miku rosa
+                    ok: Color::Rgb(0x7B, 0xE0, 0xC0),       // menta
+                    warn: Color::Rgb(0xFF, 0xD1, 0x66),     // amarillo cálido
+                    spectrum_low: Color::Rgb(0x39, 0xC5, 0xBB), // turquesa
+                    spectrum_mid: Color::Rgb(0x6B, 0xE5, 0xF5), // cian
+                    spectrum_high: Color::Rgb(0xFF, 0x9F, 0xD0), // rosa
+                    buffered: Color::Rgb(0x4A, 0x8B, 0x90), // teal oscuro
                 }),
             ]
         })
@@ -1477,6 +1505,8 @@ pub enum VisualizerMode {
     Vu,
     /// Plot polar grueso de las 32 bandas.
     Circular,
+    /// Bailarina ASCII (tema miku): poses guiadas por la energía de graves.
+    Miku,
 }
 
 impl VisualizerMode {
@@ -1488,17 +1518,19 @@ impl VisualizerMode {
             Self::Espejo => "espejo",
             Self::Vu => "vu",
             Self::Circular => "circular",
+            Self::Miku => "miku",
         }
     }
 
-    /// Los 5 valores en orden estable de menú (sub-selector de Modo).
-    pub fn options() -> [Self; 5] {
+    /// Los 6 valores en orden estable de menú (sub-selector de Modo).
+    pub fn options() -> [Self; 6] {
         [
             Self::Barras,
             Self::Onda,
             Self::Espejo,
             Self::Vu,
             Self::Circular,
+            Self::Miku,
         ]
     }
 }
@@ -1630,6 +1662,9 @@ fn parse_visualizer(
             "mode" => match value.as_str() {
                 Some(raw) => {
                     let normalized = raw.trim().to_ascii_lowercase();
+                    // La clave existe (aunque el valor sea inválido): un modo
+                    // explícito gana sobre el default del tema (D1).
+                    config.visualizer_mode_explicit = true;
                     match VisualizerMode::options()
                         .into_iter()
                         .find(|mode| mode.as_str() == normalized)
@@ -1656,11 +1691,15 @@ fn parse_visualizer(
                         }
                     }
                 }
-                None => warnings.push(
-                    "[visualizer] mode debe ser un texto entre comillas, \
-                     p. ej. mode = \"barras\"; se usa «barras»"
-                        .to_string(),
-                ),
+                None => {
+                    // La clave existe: cuenta como modo explícito (D1).
+                    config.visualizer_mode_explicit = true;
+                    warnings.push(
+                        "[visualizer] mode debe ser un texto entre comillas, \
+                         p. ej. mode = \"barras\"; se usa «barras»"
+                            .to_string(),
+                    );
+                }
             },
             other => warnings.push(format!(
                 "[visualizer] clave desconocida «{other}» (se ignora)"
@@ -2359,7 +2398,7 @@ zoom = 2");
     // -------------------------------------------------------------------------
 
     #[test]
-    fn theme_palette_table_lists_seven_ids_and_kanagawa_matches_default() {
+    fn theme_palette_table_lists_eight_ids_and_kanagawa_matches_default() {
         let ids: Vec<&str> =
             builtin_themes().iter().map(|(id, _)| *id).collect();
         assert_eq!(
@@ -2372,8 +2411,9 @@ zoom = 2");
                 "gruvbox-dark",
                 "nord",
                 "rose-pine",
+                "miku",
             ],
-            "los 7 ids oficiales, en orden estable de menú"
+            "los 8 ids oficiales, en orden estable de menú"
         );
         // kanagawa-dragon es exactamente el tema actual: la look & feel de hoy.
         assert_eq!(
@@ -2993,6 +3033,7 @@ zoom = 2");
             ("espejo", VisualizerMode::Espejo),
             ("vu", VisualizerMode::Vu),
             ("circular", VisualizerMode::Circular),
+            ("miku", VisualizerMode::Miku),
         ] {
             let config = parse(&format!("[visualizer]\nmode = \"{raw}\"\n"));
             assert_eq!(config.visualizer_mode, expected, "mode={raw}");
@@ -3009,7 +3050,7 @@ zoom = 2");
         // La lista de válidos sale de `VisualizerMode::options()`, no de un
         // string duplicado a mano.
         assert!(
-            bad.warnings[0].contains("barras, onda, espejo, vu, circular"),
+            bad.warnings[0].contains("barras, onda, espejo, vu, circular, miku"),
             "lista de válidos derivada de options(): {:?}",
             bad.warnings
         );
@@ -3050,6 +3091,50 @@ zoom = 2");
         assert!(unknown.warnings[0].contains("tempo"), "{:?}", unknown.warnings);
     }
 
+    /// D1: el modo «miku» parsea como los demás, y el tema Miku arranca en
+    /// modo Miku cuando `[visualizer] mode` NO está explicitado; un modo
+    /// explícito gana sobre el default del tema.
+    #[test]
+    fn visualizer_mode_miku_parses_and_miku_theme_defaults_the_mode() {
+        let explicit = parse("[visualizer]\nmode = \"miku\"\n");
+        assert_eq!(explicit.visualizer_mode, VisualizerMode::Miku);
+        assert!(explicit.warnings.is_empty(), "{:?}", explicit.warnings);
+
+        let from_theme = parse("[theme]\nname = \"miku\"\n");
+        assert_eq!(from_theme.theme_name, "miku");
+        assert_eq!(
+            from_theme.visualizer_mode,
+            VisualizerMode::Miku,
+            "sin modo explícito el tema Miku activa la bailarina"
+        );
+
+        let explicit_wins =
+            parse("[theme]\nname = \"miku\"\n[visualizer]\nmode = \"barras\"\n");
+        assert_eq!(
+            explicit_wins.visualizer_mode,
+            VisualizerMode::Barras,
+            "un modo explícito gana sobre el default del tema"
+        );
+    }
+
+    /// El tema Miku existe con paleta completa (los 11 slots coloreados) y en
+    /// el orden estable del menú.
+    #[test]
+    fn builtin_themes_include_miku_with_a_full_palette() {
+        let themes = builtin_themes();
+        let (id, theme) = themes
+            .iter()
+            .find(|(id, _)| *id == "miku")
+            .expect("el tema miku existe");
+        assert_eq!(*id, "miku");
+        assert_ne!(theme.accent, Color::Reset);
+        assert_ne!(theme.text, Color::Reset);
+        assert_ne!(theme.spectrum_high, Color::Reset);
+        assert_ne!(theme.buffered, Color::Reset);
+        // Último del menú estable, detrás de los 7 previos.
+        assert_eq!(themes.last().map(|(id, _)| *id), Some("miku"));
+    }
+
     #[test]
     fn visualizer_mode_does_not_drag_other_fields() {
         let config =
@@ -3061,7 +3146,7 @@ zoom = 2");
     }
 
     #[test]
-    fn visualizer_mode_options_list_five_values_in_stable_menu_order() {
+    fn visualizer_mode_options_list_six_values_in_stable_menu_order() {
         assert_eq!(
             VisualizerMode::options(),
             [
@@ -3070,14 +3155,16 @@ zoom = 2");
                 VisualizerMode::Espejo,
                 VisualizerMode::Vu,
                 VisualizerMode::Circular,
+                VisualizerMode::Miku,
             ],
-            "orden estable del sub-modal: barras, onda, espejo, vu, circular"
+            "orden estable del sub-modal: barras, onda, espejo, vu, circular, miku"
         );
         assert_eq!(VisualizerMode::Barras.as_str(), "barras");
         assert_eq!(VisualizerMode::Onda.as_str(), "onda");
         assert_eq!(VisualizerMode::Espejo.as_str(), "espejo");
         assert_eq!(VisualizerMode::Vu.as_str(), "vu");
         assert_eq!(VisualizerMode::Circular.as_str(), "circular");
+        assert_eq!(VisualizerMode::Miku.as_str(), "miku");
     }
 
     #[test]

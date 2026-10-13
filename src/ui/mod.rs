@@ -1100,6 +1100,9 @@ fn event_loop(tui: &mut Tui, app: &mut App, engine: &mut AudioEngine) -> io::Res
             app.analyzer.ingest(&mut tap);
         }
         app.analyzer.analyze();
+        // Bailarina (modo `miku`): la pose avanza por frame según la energía
+        // de graves (o por timer en pausa).
+        app.analyzer.tick_dance(app.status == Status::Playing);
 
         tui.terminal.draw(|frame| render(frame, app, engine))?;
 
@@ -1687,6 +1690,11 @@ fn handle_theme_menu_key(
         |id| runtime::preview_theme(config::resolve_theme(id)),
         |id| {
             runtime::activate_theme(id, config::resolve_theme(id));
+            // D1: aplicar el tema Miku también activa la bailarina (el default
+            // de arranque lo cubre parse(); acá el cambio es en vivo).
+            if *id == "miku" {
+                runtime::activate_visualizer_mode(config::VisualizerMode::Miku);
+            }
             (*id).to_string()
         },
         |menu| runtime::activate_theme(&menu.original_name, menu.original_theme.clone()),
@@ -4013,8 +4021,8 @@ fn render_visualizer(frame: &mut Frame<'_>, area: Rect, analyzer: &SpectrumAnaly
     // Cada modo va a su propio pintor con los datos que necesita: `onda` al
     // osciloscopio con la ventana triggered y con ganancia automática del
     // analizador (`scope_window`), `espejo` y `vu` con las bandas/RMS del
-    // analizador, `circular` a su plot polar; `barras` sigue el path actual
-    // byte-a-byte idéntico vía `paint_bands`.
+    // analizador, `circular` a su plot polar, `miku` a la bailarina ASCII;
+    // `barras` sigue el path actual byte-a-byte idéntico vía `paint_bands`.
     match resolve_visualizer_paint(runtime::active_visualizer_mode()) {
         VisualizerPaint::Bars => {
             paint_bands(frame.buffer_mut(), inner, analyzer.bands(), &theme(), ascii)
@@ -4041,11 +4049,122 @@ fn render_visualizer(frame: &mut Frame<'_>, area: Rect, analyzer: &SpectrumAnaly
             &theme(),
             ascii,
         ),
+        VisualizerPaint::Miku => paint_miku(frame.buffer_mut(), inner, analyzer, &theme()),
     }
 }
 
-/// Destino del dispatch de render por modo: barras, osciloscopio, espejo, VU
-/// o plot polar. Sin fallback: los 5 modos tienen pintor propio.
+/// Frames de la bailarina ASCII (modo `miku`): 4 poses, solo caracteres
+/// ASCII, silueta de coletas y falda; la pose la avanza `SpectrumAnalyzer::
+/// tick_dance` según la energía de graves (con timer de respiración).
+const MIKU_FRAMES: [&str; crate::visualizer::MIKU_POSES] = [
+    // Quieta, coletas al costado.
+    r"\            /
+ \  /''''\  /
+  \| MIKU |/
+   (_ O O _)
+    >  ^  <
+   /|_| |_|\
+  | |_| |_| |
+  |   \ /   |
+  |    \/   |
+   \  | |  /
+    \_| |_/
+     /\ /\
+",
+    // Brisco arriba.
+    r"      |      
+ \    |    /
+  \  /'\  /
+   \|MIKU|/
+    (_ O O _)
+     >  ^  <
+   _/| | |\_
+  |  | | |  |
+  |  |   |  |
+ _/   \ /   \_
+| \   \/    / |
+ \_\  | |  /_/
+    \_|_|_/
+",
+    // Giro, coletas al frente.
+    r"\ _        _ /
+  Y   /\   Y
+  |  /  \  |
+  | |  |  | |
+ \ | |  | | /
+  \| |  | |/
+   ( O  O )
+    >  __ <
+   /|_|  |_|\
+  / |    | \
+ |  | /\ |  |
+ |  |/  \|  |
+  \_||  ||_/
+    |_|  |_|
+",
+    // Pateo.
+    r"      _/\
+  \  /    \  /
+   \|      |/
+   (_  ^  _)
+    >      <
+   /|  /\  |\
+  | | /  \ | |
+  | |/    \| |
+  |  \    /  |
+   \  \  /  /
+    \_ \/ _/
+      |  |
+     /\  /\
+",
+];
+
+/// Pintor de la bailarina (modo `miku`): escribe la pose actual centrada al
+/// ancho del área (se recorta si el área es más angosta), limpia el fondo de
+/// cada fila y coloriza por clase de glifo: coletas/acentos con `spectrum_mid`
+/// (turquesa en el tema miku), la cara con `text` y el resto con `dim`.
+fn paint_miku(
+    buf: &mut ratatui::buffer::Buffer,
+    inner: Rect,
+    analyzer: &SpectrumAnalyzer,
+    theme: &Theme,
+) {
+    let pose = analyzer.dance_pose().min(MIKU_FRAMES.len() - 1);
+    let frame_lines: Vec<&str> = MIKU_FRAMES[pose].lines().collect();
+    let cols = inner.width as usize;
+    for (row, line) in frame_lines.iter().take(inner.height as usize).enumerate() {
+        let y = inner.y + row as u16;
+        buf.set_string(inner.x, y, " ".repeat(cols), Style::default());
+        let glyphs: Vec<char> = line.chars().collect();
+        if glyphs.is_empty() {
+            continue;
+        }
+        let pad = cols.saturating_sub(glyphs.len());
+        let x0 = inner.x + (pad / 2) as u16;
+        for (col, ch) in glyphs.iter().enumerate() {
+            if *ch == ' ' || *ch == '\n' {
+                continue;
+            }
+            let style = match ch {
+                '/' | '\\' | '\'' | 'Y' | '^' => {
+                    Style::default().fg(theme.spectrum_mid)
+                }
+                'O' | 'o' | '_' | '>' | '<' | '(' | ')' => {
+                    Style::default().fg(theme.text)
+                }
+                _ => Style::default().fg(theme.dim),
+            };
+            let x = x0 + col as u16;
+            if x >= inner.x.saturating_add(inner.width) {
+                break;
+            }
+            buf.set_string(x, y, ch.to_string(), style);
+        }
+    }
+}
+
+/// Destino del dispatch de render por modo: barras, osciloscopio, espejo, VU,
+/// plot polar o bailarina Miku. Sin fallback: los 6 modos tienen pintor propio.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VisualizerPaint {
     Bars,
@@ -4053,6 +4172,7 @@ enum VisualizerPaint {
     Mirror,
     Vu,
     Circular,
+    Miku,
 }
 
 /// Dispatch puro del modo al pintor: cada modo va al suyo, sin fallback.
@@ -4063,6 +4183,7 @@ fn resolve_visualizer_paint(mode: config::VisualizerMode) -> VisualizerPaint {
         config::VisualizerMode::Espejo => VisualizerPaint::Mirror,
         config::VisualizerMode::Vu => VisualizerPaint::Vu,
         config::VisualizerMode::Circular => VisualizerPaint::Circular,
+        config::VisualizerMode::Miku => VisualizerPaint::Miku,
     }
 }
 
@@ -7505,6 +7626,37 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// D1: aplicar el tema Miku desde el menú activa en vivo la bailarina
+    /// (además del default de arranque que cubre `parse()`).
+    #[test]
+    fn applying_the_miku_theme_activates_the_dancer_mode_live() {
+        let _setup = theme_menu_test_setup();
+        let mut app = test_app();
+        runtime::activate_visualizer_mode(config::VisualizerMode::Barras);
+        let miku_index = config::builtin_themes()
+            .iter()
+            .position(|(id, _)| *id == "miku")
+            .expect("el tema miku existe");
+        app.theme_menu = Some(ThemeMenuState {
+            selected: miku_index,
+            original_name: runtime::active_theme_name(),
+            original_theme: runtime::active_theme(),
+        });
+
+        handle_theme_menu_key(theme_menu_key(KeyCode::Enter), &mut app, |_| Ok(()));
+
+        assert_eq!(
+            runtime::active_theme_name(),
+            "miku",
+            "el tema miku queda activo"
+        );
+        assert_eq!(
+            runtime::active_visualizer_mode(),
+            config::VisualizerMode::Miku,
+            "aplicar miku activa la bailarina en vivo"
+        );
+    }
+
     #[test]
     fn theme_menu_enter_persist_failure_keeps_applied_theme() {
         let _setup = theme_menu_test_setup();
@@ -7601,7 +7753,7 @@ mod tests {
         let lines = theme_menu_lines(&menu);
         let texts: Vec<String> =
             lines.iter().map(line_text).collect::<Vec<_>>();
-        assert_eq!(texts.len(), 7, "una fila por tema: {texts:?}");
+        assert_eq!(texts.len(), 8, "una fila por tema: {texts:?}");
         for (id, _) in config::builtin_themes() {
             assert!(
                 texts.iter().any(|t| t.contains(id)),
@@ -8416,15 +8568,15 @@ mod tests {
         // Sin envoltura, como los otros selectores.
         handle_mode_menu_key(theme_menu_key(KeyCode::Up), &mut app, |_| Ok(()));
         assert_eq!(selected(&app), 0, "↑ en la primera fila no se mueve");
-        for _ in 0..6 {
+        for _ in 0..7 {
             handle_mode_menu_key(theme_menu_key(KeyCode::Down), &mut app, |_| Ok(()));
         }
-        assert_eq!(selected(&app), 4, "↓ frena en circular sin envolver (5 modos)");
+        assert_eq!(selected(&app), 5, "↓ frena en miku sin envolver (6 modos)");
 
         // Navegar previsualiza en vivo: el modo activo sigue al cursor.
         assert_eq!(
             runtime::active_visualizer_mode(),
-            config::VisualizerMode::Circular
+            config::VisualizerMode::Miku
         );
     }
 
@@ -8581,6 +8733,59 @@ mod tests {
             VisualizerPaint::Circular,
             "circular va a su plot polar, no a las barras"
         );
+        assert_eq!(
+            resolve_visualizer_paint(config::VisualizerMode::Miku),
+            VisualizerPaint::Miku,
+            "miku va a su bailarina, no a las barras"
+        );
+        assert_eq!(
+            MIKU_FRAMES.len(),
+            crate::visualizer::MIKU_POSES,
+            "las poses del analyzer y las frames de ui coinciden"
+        );
+    }
+
+    /// El modo miku pinta la bailarina: avanza de pose por timer aunque haya
+    /// silencio y el frame renderiza los glifos de la pose actual, también con
+    /// el panel abierto a ancho chico.
+    #[test]
+    fn visualizer_miku_mode_paints_the_dancer_in_all_poses() {
+        let Some(engine) = engine_or_skip() else { return };
+        runtime::preview_visualizer_mode(config::VisualizerMode::Miku);
+        let mut analyzer = SpectrumAnalyzer::new();
+        // Silencio: el timer de respiración mueve la pose sola; paramos en la
+        // pose 1 (brazos arriba), que lleva la palabra MIKU en el pecho.
+        for _ in 0..200 {
+            analyzer.tick_dance(true);
+            if analyzer.dance_pose() == 1 {
+                break;
+            }
+        }
+        assert_eq!(analyzer.dance_pose(), 1, "el timer avanzó a la pose 1");
+
+        let mut app = test_app();
+        app.mode = Mode::Player;
+        app.has_player = true;
+        app.analyzer = analyzer;
+        let backend = ratatui::backend::TestBackend::new(100, 40);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &app, &engine))
+            .expect("draw");
+        let text = player_screen_text(&terminal.backend().buffer().clone());
+        assert!(
+            text.contains('M') && text.contains('I'),
+            "la pose actual renderiza la bailarina: {text}"
+        );
+
+        // Panel abierto a 64x24: la bailarina se recorta sin paniquear y
+        // dejando el resto del frame intacto.
+        app.explorer_open = true;
+        let small = ratatui::backend::TestBackend::new(64, 24);
+        let mut terminal = ratatui::Terminal::new(small).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &app, &engine))
+            .expect("draw sin panico con el panel abierto");
     }
 
     #[test]
