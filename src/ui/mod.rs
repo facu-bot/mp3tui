@@ -567,12 +567,6 @@ fn settings_key_display() -> String {
     }
 }
 
-/// Desplazamiento a la izquierda para centrar una línea de ancho `line` en un
-/// área de `area` celdas. Puro: `0` cuando la línea llena (o sobrepasa) el
-/// área.
-fn centered_pad(line: u16, area: u16) -> u16 {
-    area.saturating_sub(line) / 2
-}
 
 /// Fila de controles clickeables: la línea a dibujar y, por botón, la columna
 /// inicial (relativa a la fila) y su ancho. Los chips se ajustan al ancho
@@ -3067,9 +3061,7 @@ fn render_explorer_panel(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn render_player_info(frame: &mut Frame<'_>, area: Rect, app: &App, engine: &AudioEngine, focused: bool) {
-    // Borde acentuado cuando el player tiene el foco. (El ancho reducido con
-    // la columna del arte ASCII quedó revertido: el usuario decidió no usar
-    // ese espacio por ahora — ver log L14.)
+    // Borde acentuado cuando el player tiene el foco.
     let border_color = if focused { theme().accent } else { theme().dim };
     let block = Block::bordered()
         .border_style(Style::default().fg(border_color))
@@ -3096,17 +3088,16 @@ fn render_player_info(frame: &mut Frame<'_>, area: Rect, app: &App, engine: &Aud
     // Bloque inicial: archivo + (meta opcional) + estado + (cola opcional) + error.
     let first_block_lines = if show_meta { 4 } else { 3 } + if show_queue { 1 } else { 0 };
 
-    // Archivo/estado, velocidad (opcional), volumen, progreso, una fila en
-    // blanco de separación y la fila de controles clickeables (T5). La
-    // velocidad va antes de las barras, en el orden real del render.
-    let mut constraints = vec![Constraint::Length(first_block_lines)];
+    // Archivo/estado, volumen, progreso y la fila de controles clickeables.
+    let mut constraints = vec![
+        Constraint::Length(first_block_lines),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ];
     if show_speed {
         constraints.push(Constraint::Length(1));
     }
-    constraints.push(Constraint::Length(1)); // volumen
-    constraints.push(Constraint::Length(1)); // progreso
-    constraints.push(Constraint::Length(1)); // separación en blanco
-    constraints.push(Constraint::Length(1)); // controles clickeables
     constraints.push(Constraint::Min(0));
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -3188,20 +3179,14 @@ fn render_player_info(frame: &mut Frame<'_>, area: Rect, app: &App, engine: &Aud
         });
     }
 
-    // La fila en blanco (rows[row + 2]) no se dibuja: separa las barras de
-    // los controles, que van centrados en el eje X (T5).
-    let controls_area = rows[row + 3];
+    let controls_area = rows[row + 2];
     let (controls, buttons) =
         transport_row(engine.is_playing(), app.shuffle, app.repeat, controls_area.width);
-    let pad = centered_pad(controls.width() as u16, controls_area.width);
-    frame.render_widget(
-        Paragraph::new(controls).alignment(Alignment::Center),
-        controls_area,
-    );
+    frame.render_widget(Paragraph::new(controls), controls_area);
     {
         let mut hit = app.hit.borrow_mut();
         for (button, start, width) in buttons {
-            let x = controls_area.x.saturating_add(pad + start);
+            let x = controls_area.x.saturating_add(start);
             let right = controls_area.x.saturating_add(controls_area.width);
             if x >= right {
                 continue;
@@ -11383,41 +11368,6 @@ mod tests {
             "sin player la franja no aparece (solo en el panel de Tab)"
         );
     }
-
-    /// T5: la fila de botones va centrada en el eje X y separada de las
-    /// barras por una fila en blanco.
-    #[test]
-    fn player_info_separates_and_centers_the_controls_row() {
-        let Some(engine) = engine_or_skip() else { return };
-        let mut app = test_app();
-        app.mode = Mode::Player;
-        app.has_player = true;
-        let buffer = render_player_frame(&app, &engine);
-        let text = player_screen_text(&buffer);
-        let lines: Vec<&str> = text.lines().collect();
-        let controls_y = lines
-            .iter()
-            .position(|l| l.contains('◀'))
-            .expect("la fila de controles existe");
-        let progreso_y = lines
-            .iter()
-            .position(|l| l.contains("Progreso"))
-            .expect("la barra de progreso existe");
-        assert_eq!(
-            controls_y,
-            progreso_y + 2,
-            "hay una fila en blanco entre progreso y los botones (T5)"
-        );
-        // Columna del primer chip dentro de la línea (el borde del bloque es
-        // la columna 0): antes iba pegada a la izquierda (~2); con el
-        // centrado se corre al medio del bloque de info (≥ 8).
-        let first_chip = lines[controls_y].find('◀').expect("chip ◀◀");
-        assert!(
-            first_chip >= 8,
-            "los botones quedan centrados en el eje X (en vez de pegados a la izquierda): {first_chip:?}"
-        );
-    }
-
 
     /// S13: una URL encolada que falla al resolver se saltea — el cursor
     /// avanza al próximo ítem de la cola y lo intenta (erst la URL siguiente).
