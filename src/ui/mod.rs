@@ -3446,31 +3446,6 @@ fn render_library(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
     } else {
         theme().dim
     };
-    // La franja «Próxima canción» (T1) va FUERA del bloque, ocupando todo el
-    // ancho del panel en sus últimas filas: el bloque (con su borde) queda
-    // arriba y la franja se apoya abajo, a lo ancho. Sin próximo no agrega
-    // ruido, igual que la línea del reproductor.
-    let has_next = matches!(
-        &app.next_up,
-        Some(title) if !title.is_empty()
-    );
-    let panel_area = if has_next {
-        let split = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(1), Constraint::Length(2)])
-            .split(area);
-        let (block_area, strip_area) = (split[0], split[1]);
-        render_next_up_strip(
-            frame,
-            strip_area,
-            app.next_up.as_deref().unwrap_or_default(),
-            app.ui_frame,
-        );
-        block_area
-    } else {
-        area
-    };
-
     let block = Block::bordered()
         .border_style(Style::default().fg(border_color))
         .title(if queue_view {
@@ -3478,9 +3453,32 @@ fn render_library(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
         } else {
             library_title_line(app, &folder, highlight)
         });
-    let inner = block.inner(panel_area);
-    frame.render_widget(block, panel_area);
-    let list_area = inner;
+    let inner = block.inner(area);
+    // La sección «Próxima canción» (T1) va DENTRO del rectángulo del panel,
+    // en su último tramo: lista → separador → etiqueta → título (marquee), y
+    // el borde de abajo del panel cierra todo el bloque. Sin próximo no
+    // agrega ruido, igual que la línea del reproductor.
+    let has_next = matches!(
+        &app.next_up,
+        Some(title) if !title.is_empty()
+    );
+    let list_area = if has_next {
+        let split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(3)])
+            .split(inner);
+        let (list_area, section_area) = (split[0], split[1]);
+        render_next_up_section(
+            frame,
+            section_area,
+            app.next_up.as_deref().unwrap_or_default(),
+            app.ui_frame,
+        );
+        list_area
+    } else {
+        inner
+    };
+    frame.render_widget(block, area);
 
     if queue_view {
         let lines = queue_rows(app, list_area.width, list_area.height);
@@ -3521,16 +3519,20 @@ fn render_library(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
     frame.render_widget(Paragraph::new(lines), list_area);
 }
 
-/// Franja del pie del panel lateral (T1): la etiqueta «Próxima canción» (tenue,
-/// como la línea `Siguiente:` del reproductor) y el título en marquee, a todo
-/// el ancho del panel, debajo del borde del bloque.
-fn render_next_up_strip(
+/// Tramo final del panel lateral (T1): separador fino, etiqueta «Próxima
+/// canción» (tenue, como `Siguiente:` del reproductor) y el título en marquee,
+/// ocupando TODO el ancho del panel; el borde de abajo del bloque lo cierra.
+fn render_next_up_section(
     frame: &mut Frame<'_>,
     area: Rect,
     title: &str,
     frame_clock: u64,
 ) {
     let width = area.width as usize;
+    let divider = Line::from(Span::styled(
+        "─".repeat(width),
+        Style::default().fg(theme().dim),
+    ));
     let label = Line::from(Span::styled(
         "Próxima canción",
         Style::default().fg(theme().dim),
@@ -3539,7 +3541,7 @@ fn render_next_up_strip(
         marquee_window(title, width, frame_clock as usize),
         Style::default().fg(theme().text),
     ));
-    frame.render_widget(Paragraph::new(vec![label, song]), area);
+    frame.render_widget(Paragraph::new(vec![divider, label, song]), area);
 }
 
 fn item_group<'a>(app: &'a App, item: &ViewItem) -> Option<&'a str> {
@@ -11280,6 +11282,10 @@ mod tests {
         assert!(
             text.contains("próxima canción"),
             "el título próximo aparece en el panel: {text}"
+        );
+        assert!(
+            text.contains("Próxima canción"),
+            "la etiqueta de la sección aparece en el panel"
         );
 
         // Con la cola vacía y biblioteca cargada: el próximo del pool.
