@@ -64,7 +64,7 @@ mp3tui "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 | `espacio` | Reproducir / pausar |
 | `↑` / `↓` | Volumen |
 | `←` / `→` | Seek ±5 s |
-| `n` / `p` | Pista siguiente / anterior |
+| `n` / `p` | Pista siguiente / anterior (con la Cola cargada, la recorre) |
 | `s` / `r` | Aleatorio / repetir |
 | `Tab` | Biblioteca (panel lateral) |
 | `b` | Buscar |
@@ -78,7 +78,14 @@ mp3tui "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 ## Cola de reproducción
 
 Encolá pistas con `a` (Biblioteca) o desde la URL e historial. Los ítems
-encolados se ven en el panel lateral con `c`. Mientras hay cola, el panel del
-reproductor muestra la próxima pista (una línea `Siguiente: …` y, si queda más
-de una, un `(+N)` con cuántas faltan detrás). Con la cola vacía esa línea no
-aparece.
+encolados se ven en el panel lateral con `c`. La cola es una lista con un
+**cursor** sobre el ítem que está sonando desde ella: `n` y el fin de pista
+avanzan el cursor, `p` retrocede uno y reproduce el anterior. Los ítems no se
+consumen al sonar: los ya sonados quedan atenuados en el panel y el ítem parado
+en el cursor se marca con `▶`, así siempre se ve a dónde se puede volver. Cuando
+no queda nada después del cursor, `n` y el fin de pista vuelven al recorrido
+normal de la biblioteca (con `repeat` y shuffle como siempre).
+
+Mientras hay algo después del cursor, el panel del reproductor muestra la
+próxima pista (una línea `Siguiente: …` y, si queda más de una, un `(+N)` con
+cuántas faltan detrás). Sin nada por delante esa línea no aparece.

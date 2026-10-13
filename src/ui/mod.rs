@@ -4,7 +4,6 @@
 //! explorador se superpone como panel lateral con Ctrl+Tab/b/Tab; a
 //! pantalla completa solo cuando no hay player (arranque por directorio).
 
-use std::collections::VecDeque;
 use std::io;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -256,9 +255,15 @@ struct App {
     /// Permutación de `0..view.len()`; válida mientras `shuffle` esté activo
     /// y `shuffle_order.len() == view.len()`.
     shuffle_order: Vec<usize>,
-    /// Cola de reproducción en orden FIFO: lo próximo a sonar. Mientras tenga
-    /// ítems manda sobre `repeat` y `shuffle`.
-    queue: VecDeque<QueueItem>,
+    /// Cola de reproducción: lo que aparece en la solapa Cola del panel.
+    /// Mientras queden ítems después de `queue_cursor` manda sobre `repeat`
+    /// y `shuffle`.
+    queue: Vec<QueueItem>,
+    /// Posición de la cola donde está parado el cursor: el ítem que suena (o
+    /// el último que sonó desde la cola). `None` mientras no haya sonado
+    /// ningún ítem de la cola. Las posiciones por debajo se muestran
+    /// atenuadas (ya sonaron) y las de arriba, como próximas.
+    queue_cursor: Option<usize>,
     /// Solapa activa del panel lateral: `false` = Biblioteca, `true` = Cola.
     /// Solo tiene efecto con el panel abierto.
     queue_panel: bool,
@@ -857,7 +862,8 @@ pub fn run(engine: &mut AudioEngine, start: StartMode) -> io::Result<()> {
         shuffle: false,
         repeat: RepeatMode::Off,
         shuffle_order: Vec::new(),
-        queue: VecDeque::new(),
+        queue: Vec::new(),
+        queue_cursor: None,
         queue_panel: false,
         queue_selected: 0,
         current_path,
@@ -1996,7 +2002,7 @@ fn enqueue_selected(app: &mut App) {
     match item {
         ViewItem::Track(library_index) => {
             if let Some(track) = library_get(app, library_index) {
-                app.queue.push_back(QueueItem::Local(track.clone()));
+                app.queue.push(QueueItem::Local(track.clone()));
             }
         }
         ViewItem::History(hist_idx) => {
@@ -2006,7 +2012,7 @@ fn enqueue_selected(app: &mut App) {
                 } else {
                     entry.title.clone()
                 };
-                app.queue.push_back(QueueItem::Url {
+                app.queue.push(QueueItem::Url {
                     url: entry.url.clone(),
                     title,
                 });
@@ -2015,38 +2021,83 @@ fn enqueue_selected(app: &mut App) {
     }
 }
 
-/// Enter en la Cola: saca el ítem seleccionado y lo reproduce ya (resuelve la
-/// URL por el camino normal si es una URL pendiente).
+/// Enter en la Cola: mueve el cursor de reproducción al ítem seleccionado y
+/// lo reproduce ya (resuelve la URL por el camino normal si es una URL
+/// pendiente). El ítem no sale de la cola: queda marcado como actual, para
+/// poder volver con `p` (S9).
 fn play_selected_queue_item(app: &mut App, engine: &mut AudioEngine) {
     if app.queue.is_empty() {
         return;
     }
     let index = app.queue_selected.min(app.queue.len() - 1);
-    let Some(item) = app.queue.remove(index) else {
-        return;
-    };
-    if index >= app.queue.len() && !app.queue.is_empty() {
-        app.queue_selected = app.queue.len() - 1;
-    }
-    match item {
-        QueueItem::Local(track) => {
-            if start_local_playback(app, engine, track.path) {
-                app.mode = Mode::Player;
-            }
-        }
-        QueueItem::Url { url, .. } => {
-            submit_url_prompt(url, app, engine);
-        }
+    let local = matches!(app.queue.get(index), Some(QueueItem::Local(_)));
+    if play_queue_position(app, engine, index, &mut dispatch_url_replay) && local {
+        app.mode = Mode::Player;
     }
 }
 
+/// Posición de la cola que sigue al cursor de reproducción: la de abajo
+/// mientras nada de la cola haya sonado todavía. `None` cuando no queda nada
+/// por delante (o la cola está vacía): ahí vale el fallback al pool de la
+/// biblioteca/historial (S5/S6).
+fn queue_next_position(app: &App) -> Option<usize> {
+    let next = match app.queue_cursor {
+        Some(cursor) => cursor.checked_add(1)?,
+        None => 0,
+    };
+    (next < app.queue.len()).then_some(next)
+}
+
+/// Posición anterior a la del cursor de reproducción. `None` en la primera
+/// posición y mientras nada de la cola haya sonado: la cola no tiene
+/// «anterior» desde donde está parado.
+fn queue_prev_position(app: &App) -> Option<usize> {
+    app.queue_cursor?.checked_sub(1)
+}
+
+/// Reproduce la posición `index` de la cola por el camino que ya existe (pista
+/// local o URL pendiente con el replay inyectable) y mueve ahí el cursor de la
+/// cola. Devuelve false sin mover el cursor si el ítem no pudo arrancar.
+fn play_queue_position(
+    app: &mut App,
+    engine: &mut AudioEngine,
+    index: usize,
+    replay: &mut impl FnMut(&mut App, &mut AudioEngine, UrlReplayRequest),
+) -> bool {
+    let Some(item) = app.queue.get(index).cloned() else {
+        return false;
+    };
+    match item {
+        QueueItem::Local(track) => {
+            if !start_local_playback(app, engine, track.path) {
+                return false;
+            }
+        }
+        QueueItem::Url { url, .. } => {
+            // Se resuelve recién ahora: las URLs resueltas vencen.
+            replay(app, engine, UrlReplayRequest { original_url: url });
+        }
+    }
+    app.queue_cursor = Some(index);
+    true
+}
+
 /// Borra el ítem seleccionado de la Cola y acota la selección al nuevo alto.
+/// El cursor de reproducción se acomoda para seguir apuntando al mismo ítem:
+/// si se borra el que estaba sonando desde la cola, el cursor vuelve a `None`
+/// (nada de la cola está sonando).
 fn delete_selected_queue_item(app: &mut App) {
     if app.queue.is_empty() {
         return;
     }
     let index = app.queue_selected.min(app.queue.len() - 1);
+    let cursor_was = app.queue_cursor.filter(|&c| c < app.queue.len());
     app.queue.remove(index);
+    app.queue_cursor = match cursor_was {
+        Some(c) if index < c => Some(c - 1),
+        Some(c) if index == c => None,
+        _ => app.queue_cursor,
+    };
     app.queue_selected = app.queue_selected.min(app.queue.len().saturating_sub(1));
 }
 
@@ -2162,6 +2213,18 @@ fn play_step_with(
     step: isize,
     mut replay: impl FnMut(&mut App, &mut AudioEngine, UrlReplayRequest),
 ) {
+    // La cola manda (D1/S5/S9): `n` y `p` recorren el cursor de la cola en
+    // ambos sentidos antes de caer al pool de la biblioteca/historial.
+    let queue_target = if step > 0 {
+        queue_next_position(app)
+    } else {
+        queue_prev_position(app)
+    };
+    if let Some(index) = queue_target {
+        if play_queue_position(app, engine, index, &mut replay) {
+            return;
+        }
+    }
     let pool = pool_positions_in_view(app);
     if pool.is_empty() {
         return;
@@ -2259,24 +2322,19 @@ fn handle_natural_end_with(
     engine: &mut AudioEngine,
     mut replay: impl FnMut(&mut App, &mut AudioEngine, UrlReplayRequest),
 ) {
-    // La cola manda: mientras tenga ítems, el fin de pista saca el primero
-    // (FIFO) y lo reproduce, sin aplicar `repeat` ni `shuffle`.
-    if let Some(item) = app.queue.pop_front() {
-        match item {
-            QueueItem::Local(track) => {
-                if start_local_playback(app, engine, track.path) {
-                    // La selección sigue a la pista que arrancó, igual que
-                    // cuando el "siguiente" sale de la biblioteca.
-                    resync_selection(app);
-                }
+    // La cola manda: mientras quede algo después del cursor, el fin de pista
+    // avanza el cursor a esa posición y la reproduce, sin aplicar `repeat` ni
+    // `shuffle` (S5/S9). Agotada la cola, valen las reglas de siempre.
+    if let Some(index) = queue_next_position(app) {
+        let local = matches!(app.queue.get(index), Some(QueueItem::Local(_)));
+        if play_queue_position(app, engine, index, &mut replay) {
+            if local {
+                // La selección sigue a la pista que arrancó, igual que
+                // cuando el "siguiente" sale de la biblioteca.
+                resync_selection(app);
             }
-            QueueItem::Url { url, .. } => {
-                // Se resuelve recién ahora, por el mismo camino que el replay
-                // de URL: las URLs resueltas vencen.
-                replay(app, engine, UrlReplayRequest { original_url: url });
-            }
+            return;
         }
-        return;
     }
 
     let pool = pool_positions_in_view(app);
@@ -2656,8 +2714,9 @@ fn render_player_info(frame: &mut Frame<'_>, area: Rect, app: &App, engine: &Aud
     // normal el panel conserva su forma y el espacio no muestra ruido.
     let show_speed = (engine.speed() - 1.0).abs() > f32::EPSILON;
     let show_meta = track_meta.is_some();
-    // La cola solo se anuncia cuando tiene ítems; vacía no agrega ruido.
-    let show_queue = !app.queue.is_empty();
+    // La cola solo se anuncia cuando queda algo por delante del cursor; si no,
+    // no agrega ruido (S9/S10).
+    let show_queue = queue_next_position(app).is_some();
 
     // Bloque inicial: archivo + (meta opcional) + estado + (cola opcional) + error.
     let first_block_lines = if show_meta { 4 } else { 3 } + if show_queue { 1 } else { 0 };
@@ -2700,11 +2759,13 @@ fn render_player_info(frame: &mut Frame<'_>, area: Rect, app: &App, engine: &Aud
 
     info_lines.push(status_line(app.status, app.repeat, app.shuffle));
 
-    // Lo próximo que suena: solo cuando hay cola. El título usa `QueueItem::label`
+    // Lo próximo que suena: el ítem que sigue al cursor de la cola, solo
+    // cuando queda algo por delante (S9/S10). El título usa `QueueItem::label`
     // (igual que la lista de la Cola) y el (+N) cuenta cuánto falta detrás.
-    if show_queue {
-        let next = app.queue.front().map(QueueItem::label).unwrap_or_default();
-        let count = app.queue.len() - 1;
+    let next_queued = queue_next_position(app);
+    if let Some(index) = next_queued {
+        let next = app.queue[index].label();
+        let count = app.queue.len() - 1 - index;
         let value = if count > 0 {
             format!("{next} (+{count})")
         } else {
@@ -3272,10 +3333,31 @@ fn library_rows(app: &App, width: u16, height: u16) -> Vec<Line<'static>> {
     lines
 }
 
-/// Filas visibles de la cola (FIFO): una por ítem con el mismo cursor y
-/// resaltado de selección que la biblioteca. Mantiene su propio scroll
-/// (`queue_selected`), independiente del de la Biblioteca. La cola vacía
-/// muestra un estado explícito.
+/// Estado de una fila de la cola respecto del cursor de reproducción (S9): lo
+/// ya sonado se atenúa, la posición donde está parado se marca y lo que falta
+/// queda normal.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum QueueRowState {
+    Played,
+    Current,
+    Pending,
+}
+
+/// Estado de `position` en la cola: el ítem del cursor es el que suena (o el
+/// último que sonó desde la cola), los de abajo ya sonaron y los de arriba
+/// faltan.
+fn queue_row_state(app: &App, position: usize) -> QueueRowState {
+    match app.queue_cursor {
+        Some(cursor) if position < cursor => QueueRowState::Played,
+        Some(cursor) if position == cursor => QueueRowState::Current,
+        _ => QueueRowState::Pending,
+    }
+}
+
+/// Lista de la Cola del panel: el mismo resaltado de selección que la
+/// Biblioteca (`queue_selected`), más el marcador `▶` del ítem parado en el
+/// cursor de reproducción y los ya sonados atenuados. La cola vacía muestra un
+/// estado explícito.
 fn queue_rows(app: &App, width: u16, height: u16) -> Vec<Line<'static>> {
     let height = height as usize;
     if height == 0 {
@@ -3294,34 +3376,60 @@ fn queue_rows(app: &App, width: u16, height: u16) -> Vec<Line<'static>> {
             break;
         }
         let selected = position == app.queue_selected;
-        lines.push(queue_row_line(item.label(), position + 1, selected, width));
+        lines.push(queue_row_line(
+            item.label(),
+            position + 1,
+            selected,
+            queue_row_state(app, position),
+            width,
+        ));
     }
     lines
 }
 
-/// Una fila de la cola: cursor, número y etiqueta del ítem, con la misma
-/// paleta que la fila de la biblioteca (`select_bg` para la seleccionada).
-fn queue_row_line(label: &str, number: usize, selected: bool, width: u16) -> Line<'static> {
+/// Una fila de la cola: cursor de selección, marcador de reproducción, número
+/// y etiqueta del ítem, con la misma paleta que la fila de la biblioteca
+/// (`select_bg` para la seleccionada).
+fn queue_row_line(
+    label: &str,
+    number: usize,
+    selected: bool,
+    state: QueueRowState,
+    width: u16,
+) -> Line<'static> {
     let cursor = if selected { CURSOR } else { " " };
+    let marker = if state == QueueRowState::Current {
+        PLAYING
+    } else {
+        " "
+    };
     let prefix = format!("{number:>2}. ");
-    let budget = (width as usize).saturating_sub(1 + prefix.chars().count());
+    let budget = (width as usize).saturating_sub(2 + prefix.chars().count());
     let label = truncate_chars(label, budget);
     let pad = budget.saturating_sub(label.chars().count());
-    let (cursor_style, text_style) = if selected {
+    let body = format!("{prefix}{label}{}", " ".repeat(pad));
+    let (cursor_style, marker_style, text_style) = if selected {
         let bg = theme().select_bg;
         (
             Style::default().bg(bg).fg(theme().accent).add_modifier(Modifier::BOLD),
-            Style::default().bg(bg).fg(theme().text).add_modifier(Modifier::BOLD),
+            Style::default().bg(bg).fg(theme().ok),
+            Style::default().bg(bg).fg(theme().text),
         )
     } else {
+        let text = match state {
+            QueueRowState::Played => theme().dim,
+            QueueRowState::Current | QueueRowState::Pending => theme().text,
+        };
         (
             Style::default().fg(theme().accent).add_modifier(Modifier::BOLD),
-            Style::default().fg(theme().text),
+            Style::default().fg(theme().ok),
+            Style::default().fg(text),
         )
     };
     Line::from(vec![
         Span::styled(cursor, cursor_style),
-        Span::styled(format!("{prefix}{label}{}", " ".repeat(pad)), text_style),
+        Span::styled(marker, marker_style),
+        Span::styled(body, text_style),
     ])
 }
 
@@ -3334,7 +3442,7 @@ fn queue_title_line(app: &App, highlight: Color) -> Line<'static> {
     ))
 }
 
-/// Título del bloque Cola: cantidad de ítems pendientes.
+/// Título del bloque Cola: cantidad de ítems que tiene la cola.
 fn queue_title(app: &App) -> String {
     let count = app.queue.len();
     let noun = if count == 1 { "ítem" } else { "ítems" };
@@ -5657,7 +5765,8 @@ mod tests {
             shuffle: false,
             repeat: RepeatMode::Off,
             shuffle_order: Vec::new(),
-            queue: VecDeque::new(),
+            queue: Vec::new(),
+            queue_cursor: None,
             queue_panel: false,
             queue_selected: 0,
             current_path: None,
@@ -6462,8 +6571,8 @@ mod tests {
         app.current_path = Some(PathBuf::from(r"C:\x\alpha.mp3"));
         app.track_label = "alpha.mp3".to_string();
         // Dos ítems encolados: el próximo es «beta» y queda 1 pendiente.
-        app.queue.push_back(QueueItem::Local(track_named("beta")));
-        app.queue.push_back(QueueItem::Local(track_named("gamma")));
+        app.queue.push(QueueItem::Local(track_named("beta")));
+        app.queue.push(QueueItem::Local(track_named("gamma")));
 
         let buffer = render_player_frame(&app, &engine);
         let text = player_screen_text(&buffer);
@@ -6489,6 +6598,54 @@ mod tests {
         assert!(
             !text.contains("Siguiente"),
             "sin cola no hay fila de próxima: {text}"
+        );
+    }
+
+    /// S9: con el cursor parado en el primer ítem, lo «siguiente» es el segundo
+    /// de la cola (y no queda nada detrás, así que no hay «(+N)»).
+    #[test]
+    fn player_info_shows_the_item_after_the_queue_cursor() {
+        let Some(engine) = engine_or_skip() else { return };
+        let mut app = library_with_three();
+        app.mode = Mode::Player;
+        app.has_player = true;
+        app.current_path = Some(PathBuf::from(r"C:\x\alpha.mp3"));
+        app.track_label = "alpha.mp3".to_string();
+        app.queue.push(QueueItem::Local(track_named("beta")));
+        app.queue.push(QueueItem::Local(track_named("gamma")));
+        app.queue_cursor = Some(0);
+
+        let buffer = render_player_frame(&app, &engine);
+        let text = player_screen_text(&buffer);
+        assert!(
+            text.contains("Siguiente: gamma"),
+            "lo siguiente sale de la posición después del cursor: {text}"
+        );
+        assert!(
+            !text.contains("(+1)"),
+            "no queda nada detrás de gamma: {text}"
+        );
+    }
+
+    /// S9: con el cursor en el último ítem no hay nada siguiente, así que la
+    /// fila desaparece igual que con la cola vacía.
+    #[test]
+    fn player_info_hides_the_queue_line_when_the_cursor_is_at_the_last_item() {
+        let Some(engine) = engine_or_skip() else { return };
+        let mut app = library_with_three();
+        app.mode = Mode::Player;
+        app.has_player = true;
+        app.current_path = Some(PathBuf::from(r"C:\x\alpha.mp3"));
+        app.track_label = "alpha.mp3".to_string();
+        app.queue.push(QueueItem::Local(track_named("beta")));
+        app.queue.push(QueueItem::Local(track_named("gamma")));
+        app.queue_cursor = Some(1);
+
+        let buffer = render_player_frame(&app, &engine);
+        let text = player_screen_text(&buffer);
+        assert!(
+            !text.contains("Siguiente"),
+            "sin nada después del cursor no hay fila de próxima: {text}"
         );
     }
 
@@ -8333,6 +8490,32 @@ mod tests {
         }
     }
 
+    /// Ítem de cola con URL pendiente: se resuelve recién cuando le toca sonar.
+    fn queue_url(title: &str) -> QueueItem {
+        QueueItem::Url {
+            url: format!("https://x/{title}"),
+            title: title.to_string(),
+        }
+    }
+
+    /// App con dos pistas locales REALES (WAV temporales) para los casos de
+    /// fallback al pool; devuelve sus caminos para poder borrarlos al final.
+    fn queue_fallback_app() -> (App, PathBuf, PathBuf) {
+        let dir = std::env::temp_dir();
+        let t1 = dir.join(format!("mp3tui_t8pool1_{}.wav", std::process::id()));
+        let t2 = dir.join(format!("mp3tui_t8pool2_{}.wav", std::process::id()));
+        let wav = make_test_wav(4410);
+        let _ = std::fs::write(&t1, &wav);
+        let _ = std::fs::write(&t2, &wav);
+        let mut app = test_app();
+        app.library = Some(crate::playlist::from_tracks_for_test(vec![
+            track_with_path(t1.clone(), "track_1"),
+            track_with_path(t2.clone(), "track_2"),
+        ]));
+        refresh_view(&mut app);
+        (app, t1, t2)
+    }
+
     #[test]
     fn test_local_playback_clears_is_url_and_allows_natural_end_advance() {
         let mut app = test_app();
@@ -8556,7 +8739,7 @@ mod tests {
         app.current_path = Some(actual.clone());
         let mut encolada = Track::from_path(siguiente.clone());
         encolada.title = "La que sigue".to_string();
-        app.queue.push_back(QueueItem::Local(encolada));
+        app.queue.push(QueueItem::Local(encolada));
 
         let mut dispatched: Option<UrlReplayRequest> = None;
         handle_natural_end_with(&mut app, &mut engine, |_app, _engine, request| {
@@ -8569,16 +8752,25 @@ mod tests {
             "con la cola cargada el fin de pista reproduce el ítem encolado"
         );
         assert_eq!(dispatched, None, "no se re-lanza la pista que terminó");
-        assert!(app.queue.is_empty(), "el ítem encolado sale de la cola");
+        assert_eq!(
+            app.queue_cursor,
+            Some(0),
+            "el cursor de la cola queda en el ítem que sonó (S9)"
+        );
+        assert_eq!(
+            app.queue.len(),
+            1,
+            "el ítem no sale de la cola: sigue visible para poder volver con p"
+        );
 
         let _ = std::fs::remove_file(&actual);
         let _ = std::fs::remove_file(&siguiente);
     }
 
-    /// La cola es FIFO también con shuffle activo: sale el primero encolado,
-    /// no uno al azar de la biblioteca.
+    /// La cola conserva el orden de encolado también con shuffle activo, y el
+    /// cursor avanza en vez de consumir la lista (S9).
     #[test]
-    fn test_natural_end_with_queue_is_fifo_even_with_shuffle() {
+    fn test_natural_end_with_queue_respects_enqueue_order_even_with_shuffle() {
         let mut app = test_app();
         let mut engine = match AudioEngine::new() {
             Ok(e) => e,
@@ -8596,8 +8788,8 @@ mod tests {
         a.title = "Primera".to_string();
         let mut b = Track::from_path(segunda.clone());
         b.title = "Segunda".to_string();
-        app.queue.push_back(QueueItem::Local(a));
-        app.queue.push_back(QueueItem::Local(b));
+        app.queue.push(QueueItem::Local(a));
+        app.queue.push(QueueItem::Local(b));
 
         handle_natural_end_with(&mut app, &mut engine, |_app, _engine, _request| {});
 
@@ -8607,17 +8799,23 @@ mod tests {
             "con shuffle la cola igual respeta el orden de encolado"
         );
         assert_eq!(
-            app.queue.front().map(QueueItem::label),
+            app.queue_cursor,
+            Some(0),
+            "el cursor queda en el primero: la cola no se consume"
+        );
+        assert_eq!(app.queue.len(), 2, "los dos ítems siguen en la cola");
+        assert_eq!(
+            app.queue.get(1).map(QueueItem::label),
             Some("Segunda"),
-            "el segundo ítem queda esperando su turno"
+            "el segundo ítem espera su turno detrás del cursor"
         );
 
         let _ = std::fs::remove_file(&primera);
         let _ = std::fs::remove_file(&segunda);
     }
 
-    /// Una URL encolada se resuelve recién al terminar la actual: el ítem sale
-    /// de la cola y pasa por el mismo camino que el replay de URL.
+    /// Una URL encolada se resuelve recién al terminar la actual, sin salir de
+    /// la cola: el cursor la marca como el ítem sonando.
     #[test]
     fn test_natural_end_with_queued_url_resolves_only_when_its_turn_comes() {
         let mut app = test_app();
@@ -8627,7 +8825,7 @@ mod tests {
         };
         app.status = Status::Playing;
         app.is_url = true;
-        app.queue.push_back(QueueItem::Url {
+        app.queue.push(QueueItem::Url {
             url: "https://www.youtube.com/watch?v=encolada".to_string(),
             title: "Encolada".to_string(),
         });
@@ -8642,7 +8840,8 @@ mod tests {
             Some("https://www.youtube.com/watch?v=encolada".to_string()),
             "la URL encolada se resuelve cuando se termina la actual"
         );
-        assert!(app.queue.is_empty(), "el ítem encolado sale de la cola");
+        assert_eq!(app.queue_cursor, Some(0), "el cursor queda en la URL encolada");
+        assert_eq!(app.queue.len(), 1, "la URL sigue en la cola");
     }
 
     /// D2/S6 con el shuffle activo: una pista local que termina encadena con
@@ -8902,7 +9101,7 @@ mod tests {
         handle_list_key(theme_menu_key(KeyCode::Char('a')), &mut app, &mut engine);
 
         assert_eq!(app.queue.len(), 1, "una pista encolada");
-        assert_eq!(app.queue.front().map(QueueItem::label), Some("beta"));
+        assert_eq!(app.queue.first().map(QueueItem::label), Some("beta"));
         assert_eq!(app.selected, 1, "la selección de la biblioteca no se mueve");
         assert_eq!(app.view.len(), 3, "la lista no cambia");
     }
@@ -8923,7 +9122,7 @@ mod tests {
         handle_list_key(theme_menu_key(KeyCode::Char('a')), &mut app, &mut engine);
 
         assert_eq!(
-            app.queue.front(),
+            app.queue.first(),
             Some(&QueueItem::Url {
                 url: "https://www.youtube.com/watch?v=x".to_string(),
                 title: "Video de YouTube".to_string(),
@@ -8941,8 +9140,8 @@ mod tests {
         app.has_player = true;
         app.explorer_open = true;
         app.selected = 2;
-        app.queue.push_back(QueueItem::Local(track_named("uno")));
-        app.queue.push_back(QueueItem::Local(track_named("dos")));
+        app.queue.push(QueueItem::Local(track_named("uno")));
+        app.queue.push(QueueItem::Local(track_named("dos")));
 
         handle_list_key(theme_menu_key(KeyCode::Char('c')), &mut app, &mut engine);
         assert!(app.queue_panel, "c muestra la Cola en el panel");
@@ -8957,54 +9156,255 @@ mod tests {
         assert_eq!(app.queue_selected, 1, "la Cola conserva su selección");
     }
 
-    /// Lista de la Cola: FIFO con el mismo cursor/resaltado que la Biblioteca
-    /// y estado vacío explícito.
+    /// Lista de la Cola: el resaltado (selección) es el mismo que el de la
+    /// Biblioteca, el ítem parado en el cursor de reproducción se marca con
+    /// `▶`, lo ya sonado queda atenuado y el estado vacío es explícito (S9).
     #[test]
-    fn queue_rows_show_labels_in_fifo_order_with_the_cursor() {
+    fn queue_rows_mark_the_cursor_position_and_dim_the_played_items() {
         let mut app = test_app();
-        app.queue.push_back(QueueItem::Local(track_named("primera")));
-        app.queue.push_back(QueueItem::Url {
+        app.queue.push(QueueItem::Local(track_named("primera")));
+        app.queue.push(QueueItem::Url {
             url: "https://x/y".to_string(),
             title: "segunda".to_string(),
         });
+        app.queue.push(QueueItem::Local(track_named("tercera")));
         app.queue_selected = 1;
+        app.queue_cursor = Some(1);
 
         let lines = queue_rows(&app, 40, 10);
         let texts: Vec<String> = lines.iter().map(|line| line_text(line)).collect();
-        assert_eq!(texts.len(), 2, "una fila por ítem: {texts:?}");
+        assert_eq!(texts.len(), 3, "una fila por ítem: {texts:?}");
+        assert!(texts[1].starts_with('\u{258c}'), "cursor de selección en el seleccionado");
         assert!(texts[0].contains("primera"), "{:?}", texts[0]);
-        assert!(texts[1].starts_with('\u{258c}'), "cursor en el seleccionado");
-        assert!(texts[1].contains("segunda"), "{:?}", texts[1]);
+        assert!(texts[2].contains("tercera"), "{:?}", texts[2]);
+
+        assert_eq!(
+            texts[0].chars().nth(1),
+            Some(' '),
+            "lo ya sonado no lleva el marcador de reproducción: {:?}",
+            texts[0]
+        );
+        assert_eq!(
+            lines[0].spans[2].style.fg,
+            Some(theme().dim),
+            "lo ya sonado se muestra atenuado: {:?}",
+            texts[0]
+        );
+        assert_eq!(
+            texts[1].chars().nth(1),
+            Some('\u{25b6}'),
+            "el ítem parado en el cursor de la cola se marca: {:?}",
+            texts[1]
+        );
+        assert_eq!(
+            lines[2].spans[2].style.fg,
+            Some(theme().text),
+            "lo que falta suena normal: {:?}",
+            texts[2]
+        );
 
         let empty = queue_rows(&test_app(), 40, 10);
         let empty_text = line_text(&empty[0]);
         assert!(empty_text.contains("vacía"), "estado vacío: {empty_text}");
     }
 
-    /// `d` borra el ítem seleccionado de la Cola y la selección cae en el
-    /// siguiente.
+    /// S9: borrar un ítem que está antes del cursor lo corre para que siga
+    /// apuntando al mismo ítem.
     #[test]
-    fn queue_delete_key_removes_the_selected_item() {
+    fn queue_delete_before_the_cursor_keeps_it_on_the_same_item() {
         let Some(mut engine) = engine_or_skip() else { return };
         let mut app = test_app();
         app.explorer_open = true;
         app.queue_panel = true;
-        app.queue.push_back(QueueItem::Local(track_named("uno")));
-        app.queue.push_back(QueueItem::Local(track_named("dos")));
-        app.queue.push_back(QueueItem::Local(track_named("tres")));
+        app.queue.push(QueueItem::Local(track_named("uno")));
+        app.queue.push(QueueItem::Local(track_named("dos")));
+        app.queue.push(QueueItem::Local(track_named("tres")));
+        app.queue_cursor = Some(2);
+        app.queue_selected = 0;
+
+        handle_list_key(theme_menu_key(KeyCode::Char('d')), &mut app, &mut engine);
+
+        let labels: Vec<&str> = app.queue.iter().map(QueueItem::label).collect();
+        assert_eq!(labels, vec!["dos", "tres"], "borra el seleccionado");
+        assert_eq!(
+            app.queue_cursor,
+            Some(1),
+            "el cursor sigue apuntando al mismo ítem (tres)"
+        );
+    }
+
+    /// S9: borrar el ítem que está sonando desde la cola apaga el cursor,
+    /// porque ya no hay nada de la cola en reproducción.
+    #[test]
+    fn queue_delete_of_the_playing_item_clears_the_cursor() {
+        let Some(mut engine) = engine_or_skip() else { return };
+        let mut app = test_app();
+        app.explorer_open = true;
+        app.queue_panel = true;
+        app.queue.push(QueueItem::Local(track_named("uno")));
+        app.queue.push(QueueItem::Local(track_named("dos")));
+        app.queue_cursor = Some(1);
         app.queue_selected = 1;
 
         handle_list_key(theme_menu_key(KeyCode::Char('d')), &mut app, &mut engine);
 
         let labels: Vec<&str> = app.queue.iter().map(QueueItem::label).collect();
-        assert_eq!(labels, vec!["uno", "tres"], "borra el seleccionado");
-        assert_eq!(app.queue_selected, 1, "la selección cae en el siguiente");
+        assert_eq!(labels, vec!["uno"], "borra el que estaba sonando");
+        assert_eq!(app.queue_cursor, None, "nada de la cola está sonando");
     }
 
-    /// Enter en la Cola salta y reproduce ya el ítem seleccionado, sacándolo
-    /// de la cola.
+    /// S9: `n` recorre la cola —avanza el cursor una posición y reproduce ese
+    /// ítem— antes de caer al pool de la biblioteca.
     #[test]
-    fn queue_enter_plays_the_selected_item_and_removes_it() {
+    fn queue_step_next_advances_the_cursor_and_plays_that_item() {
+        let Some(mut engine) = engine_or_skip() else { return };
+        let mut app = library_with_three();
+        app.mode = Mode::Player;
+        app.queue.push(queue_url("uno"));
+        app.queue.push(queue_url("dos"));
+
+        let mut captured: Vec<String> = Vec::new();
+        play_step_with(&mut app, &mut engine, 1, |_app, _engine, request| {
+            captured.push(request.original_url);
+        });
+
+        assert_eq!(
+            captured,
+            vec!["https://x/uno".to_string()],
+            "n arranca por el primero de la cola"
+        );
+        assert_eq!(app.queue_cursor, Some(0), "el cursor queda en el ítem que sonó");
+        assert_eq!(app.queue.len(), 2, "la cola conserva los ítems");
+
+        play_step_with(&mut app, &mut engine, 1, |_app, _engine, request| {
+            captured.push(request.original_url);
+        });
+        assert_eq!(
+            captured,
+            vec!["https://x/uno".to_string(), "https://x/dos".to_string()],
+            "n vuelve a avanzar el cursor"
+        );
+        assert_eq!(app.queue_cursor, Some(1));
+        assert_eq!(app.queue.len(), 2, "y la cola sigue entera");
+    }
+
+    /// S9: `p` retrocede una posición del cursor y reproduce la anterior.
+    #[test]
+    fn queue_step_prev_goes_back_to_the_previous_queue_item() {
+        let Some(mut engine) = engine_or_skip() else { return };
+        let mut app = library_with_three();
+        app.mode = Mode::Player;
+        app.queue.push(queue_url("uno"));
+        app.queue.push(queue_url("dos"));
+        app.queue.push(queue_url("tres"));
+        app.queue_cursor = Some(2);
+
+        let mut captured: Option<UrlReplayRequest> = None;
+        play_step_with(&mut app, &mut engine, -1, |_app, _engine, request| {
+            captured = Some(request);
+        });
+
+        assert_eq!(
+            captured.map(|request| request.original_url),
+            Some("https://x/dos".to_string()),
+            "p reproduce la anterior al cursor"
+        );
+        assert_eq!(app.queue_cursor, Some(1), "el cursor retrocede");
+        assert_eq!(app.queue.len(), 3, "la cola no se consume");
+    }
+
+    /// S9: sin nada por delante del cursor, `n` cae al pool de la biblioteca
+    /// como hoy (repeat Off avanza a la siguiente) y no mueve el cursor.
+    #[test]
+    fn queue_step_next_at_the_end_of_the_cursor_falls_back_to_the_pool() {
+        let Some(mut engine) = engine_or_skip() else { return };
+        let (mut app, t1, t2) = queue_fallback_app();
+        app.current_path = Some(t1);
+        app.queue.push(queue_url("uno"));
+        app.queue_cursor = Some(0);
+
+        let mut captured: Option<UrlReplayRequest> = None;
+        play_step_with(&mut app, &mut engine, 1, |_app, _engine, request| {
+            captured = Some(request);
+        });
+
+        assert_eq!(captured, None, "no hay nada después del cursor en la cola");
+        assert_eq!(
+            app.current_path.as_ref(),
+            Some(&t2),
+            "sin nada en la cola, n sigue avanzando la biblioteca como hoy"
+        );
+        assert_eq!(
+            app.queue_cursor,
+            Some(0),
+            "el cursor de la cola no se mueve al caer al pool"
+        );
+        assert_eq!(app.queue.len(), 1, "la cola queda intacta");
+
+        let _ = std::fs::remove_file(&t2);
+    }
+
+    /// S9: el fin natural con el cursor ya en el final de la cola vuelve al
+    /// fallback de S5/S6 (la biblioteca avanza como hoy).
+    #[test]
+    fn queue_natural_end_with_the_cursor_at_the_end_falls_back_to_the_pool() {
+        let (mut app, t1, t2) = queue_fallback_app();
+        let mut engine = match AudioEngine::new() {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        app.current_path = Some(t1);
+        app.status = Status::Playing;
+        app.queue.push(queue_url("uno"));
+        app.queue_cursor = Some(0);
+
+        let mut captured: Option<UrlReplayRequest> = None;
+        handle_natural_end_with(&mut app, &mut engine, |_app, _engine, request| {
+            captured = Some(request);
+        });
+
+        assert_eq!(captured, None, "la cola ya no tiene nada por delante");
+        assert_eq!(
+            app.current_path.as_ref(),
+            Some(&t2),
+            "el fin natural sigue avanzando la biblioteca"
+        );
+        assert_eq!(app.queue_cursor, Some(0), "el cursor de la cola no se mueve");
+        assert_eq!(app.queue.len(), 1, "la cola queda intacta");
+
+        let _ = std::fs::remove_file(&t2);
+    }
+
+    /// S9: sin cursor de cola todavía, `p` sigue retrocediendo el pool como
+    /// hoy (la cola no tiene «anterior» desde donde está parado).
+    #[test]
+    fn queue_step_prev_without_a_cursor_falls_back_to_the_pool() {
+        let Some(mut engine) = engine_or_skip() else { return };
+        let (mut app, t1, t2) = queue_fallback_app();
+        app.current_path = Some(t2.clone());
+        app.queue.push(queue_url("uno"));
+
+        let mut captured: Option<UrlReplayRequest> = None;
+        play_step_with(&mut app, &mut engine, -1, |_app, _engine, request| {
+            captured = Some(request);
+        });
+
+        assert_eq!(captured, None, "sin cursor no hay ítem de cola anterior");
+        assert_eq!(app.queue_cursor, None, "el cursor sigue apagado");
+        assert_eq!(
+            app.current_path.as_ref(),
+            Some(&t1),
+            "p sigue retrocediendo la biblioteca como hoy"
+        );
+        assert_eq!(app.queue.len(), 1, "la cola queda intacta");
+
+        let _ = std::fs::remove_file(&t2);
+    }
+
+    /// Enter en la Cola salta y reproduce ya el ítem seleccionado, sin sacarlo
+    /// de la cola: queda marcado como el actual para poder volver con `p` (S9).
+    #[test]
+    fn queue_enter_plays_the_selected_item_and_moves_the_cursor() {
         let mut app = test_app();
         let mut engine = match AudioEngine::new() {
             Ok(e) => e,
@@ -9016,16 +9416,41 @@ mod tests {
 
         app.explorer_open = true;
         app.queue_panel = true;
-        app.queue.push_back(QueueItem::Local(track_with_path(path.clone(), "elegida")));
-        app.queue.push_back(QueueItem::Local(track_named("queda")));
+        app.queue.push(QueueItem::Local(track_with_path(path.clone(), "elegida")));
+        app.queue.push(QueueItem::Local(track_named("queda")));
 
         handle_list_key(theme_menu_key(KeyCode::Enter), &mut app, &mut engine);
 
         assert_eq!(app.current_path.as_ref(), Some(&path), "Enter reproduce ya");
+        assert_eq!(app.queue_cursor, Some(0), "el cursor queda en el elegido");
         let labels: Vec<&str> = app.queue.iter().map(QueueItem::label).collect();
-        assert_eq!(labels, vec!["queda"], "el ítem reproducido sale de la cola");
+        assert_eq!(
+            labels,
+            vec!["elegida", "queda"],
+            "el ítem reproducido sigue en la cola"
+        );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// `d` borra el ítem seleccionado de la Cola y la selección cae en el
+    /// siguiente.
+    #[test]
+    fn queue_delete_key_removes_the_selected_item() {
+        let Some(mut engine) = engine_or_skip() else { return };
+        let mut app = test_app();
+        app.explorer_open = true;
+        app.queue_panel = true;
+        app.queue.push(QueueItem::Local(track_named("uno")));
+        app.queue.push(QueueItem::Local(track_named("dos")));
+        app.queue.push(QueueItem::Local(track_named("tres")));
+        app.queue_selected = 1;
+
+        handle_list_key(theme_menu_key(KeyCode::Char('d')), &mut app, &mut engine);
+
+        let labels: Vec<&str> = app.queue.iter().map(QueueItem::label).collect();
+        assert_eq!(labels, vec!["uno", "tres"], "borra el seleccionado");
+        assert_eq!(app.queue_selected, 1, "la selección cae en el siguiente");
     }
 
     /// PRESERVE: con la lista Biblioteca activa, las flechas siguen moviendo
