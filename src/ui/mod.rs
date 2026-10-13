@@ -4055,11 +4055,12 @@ fn render_visualizer(frame: &mut Frame<'_>, area: Rect, analyzer: &SpectrumAnaly
 
 
 /// Color de paleta del arte animado (`miku_art`): letras a..g generadas del
-/// `.asciimtn` original. `a` = negro, el fondo del lienzo del arte: coincide
-/// con el fondo que `paint_miku` pinta en el área, así que se omite; `c`/`d`
-/// son los acentos turquesa/cian de Miku.
+/// `.asciimtn` original. `a` = negro: la silueta de Miku se dibuja en oscuro
+/// sobre el fondo de `@` blancos (igual que en el archivo); `c`/`d` son los
+/// acentos turquesa/cian.
 fn miku_palette_color(letter: char) -> Option<Color> {
     match letter {
+        'a' => Some(Color::Rgb(0x00, 0x00, 0x00)),
         'b' => Some(Color::Rgb(0x00, 0xcd, 0x00)),
         'c' => Some(Color::Rgb(0x00, 0xcd, 0xcd)),
         'd' => Some(Color::Rgb(0x00, 0xff, 0xff)),
@@ -4073,19 +4074,22 @@ fn miku_palette_color(letter: char) -> Option<Color> {
 /// Pintor de la bailarina (modo `miku`): reproduce la ANIMACIÓN real de
 /// «hatsumemiku.asciimtn» (26 frames de la danza, con colores de paleta,
 /// recortada al bbox de la figura), avanzando un frame cada `ANIM_TICKS` de
-/// reloj para que el bucle dure ~3 s; sobre eso, el arco de salto
-/// (`dance_pose`, disparado por el beat de graves) y el vaivén horizontal
-/// (`dance_clock`) la mueven centrada dentro del área. El fondo del área se
-/// rellena con el negro del lienzo del arte, y los DIBUJOS de la pieza son
-/// ASCII puro, así la bailarina es idéntica con estilo ascii o unicode.
+/// reloj para que el bucle dure ~3 s. El fondo del área es un campo de `@`
+/// blancos, igual que el lienzo del archivo, y la figura (silueta oscura +
+/// acentos) se dibuja encima **centrada en el eje X**: el arco de salto por el
+/// beat mueve Miku verticalmente alrededor del centro, sin vaivén lateral
+/// fuera de eje. Los dibujos son ASCII puro, idénticos con estilo ascii o
+/// unicode.
 fn paint_miku(
     buf: &mut ratatui::buffer::Buffer,
     inner: Rect,
     analyzer: &SpectrumAnalyzer,
 ) {
-    // Fondo del lienzo del arte (#000000): todo el área queda igual al fondo
-    // del ascii original, sin huecos contra la paleta de la app.
-    buf.set_style(inner, Style::default().bg(Color::Rgb(0x00, 0x00, 0x00)));
+    // Fondo del lienzo del arte: campo de `@` blancos en todo el área.
+    let white = Style::default().fg(Color::Rgb(0xff, 0xff, 0xff));
+    for y in inner.y..inner.y + inner.height {
+        buf.set_string(inner.x, y, "@".repeat(inner.width as usize), white);
+    }
 
     use crate::visualizer::miku_art as art;
     let frame = (analyzer.dance_clock() / art::ANIM_TICKS as u64) as usize
@@ -4101,15 +4105,16 @@ fn paint_miku(
         return;
     }
 
-    // Animación: arco de salto (0 reposo / 1..=3 arriba-bajando) por el beat,
-    // y vaivén horizontal lento por el reloj.
+    // Animación: arco de salto (0 reposo / 1..=3 arriba-bajando) por el beat.
+    // El movimiento es solo vertical alrededor del centro: la figura queda
+    // siempre centrada en el eje X del visualizador.
     let dy: i16 = match analyzer.dance_pose() {
         1 => -2,
         2 => -3,
         3 => -1,
         _ => 0,
     };
-    let dx: i16 = if (analyzer.dance_clock() / 8) % 2 == 0 { 0 } else { 1 };
+    let dx: i16 = 0;
 
     // Ventana dentro del arte (cuando el área es más chica que la figura) y
     // desplazamiento de la figura dentro del área (centrado + animación). Uno
@@ -8817,20 +8822,29 @@ mod tests {
         let text = player_screen_text(&buffer);
         assert!(
             text.contains('@'),
-            "la animación real de Miku (frames con @) está en pantalla"
+            "el fondo del lienzo (@ blancos) está en pantalla"
         );
         assert!(
             !text.contains("MIKU"),
-            "estilo unicode usa la animación real, no las poses ascii"
+            "la animación real, no las poses viejas"
         );
-        // Los frames llevan color de paleta: debe haber celdas blancas (#fff).
-        let white = (0..buffer.area.height).any(|y| {
+        // El fondo es @ blanco y la silueta de Miku se dibuja negra encima.
+        let has_white = (0..buffer.area.height).any(|y| {
             (0..buffer.area.width).any(|x| {
-                buffer[(x, y)].style().fg
-                    == Some(ratatui::style::Color::Rgb(0xff, 0xff, 0xff))
+                buffer[(x, y)].symbol() == "@"
+                    && buffer[(x, y)].style().fg
+                        == Some(ratatui::style::Color::Rgb(0xff, 0xff, 0xff))
             })
         });
-        assert!(white, "la paleta blanca del arte está en pantalla");
+        let has_black = (0..buffer.area.height).any(|y| {
+            (0..buffer.area.width).any(|x| {
+                buffer[(x, y)].symbol() != "@"
+                    && buffer[(x, y)].style().fg
+                        == Some(ratatui::style::Color::Rgb(0x00, 0x00, 0x00))
+            })
+        });
+        assert!(has_white, "el cuerpo de Miku se dibuja sobre @ blancos");
+        assert!(has_black, "la silueta oscura de Miku está sobre el fondo");
 
         app.explorer_open = true;
         let small = ratatui::backend::TestBackend::new(64, 24);
