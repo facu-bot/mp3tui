@@ -562,11 +562,15 @@ fn settings_key_display() -> String {
 }
 
 /// Fila de controles clickeables: la línea a dibujar y, por botón, la columna
-/// inicial (relativa a la fila) y su ancho.
+/// inicial (relativa a la fila) y su ancho. Los chips se ajustan al ancho
+/// disponible (`max_width`): los que no entran completos se omiten enteros,
+/// así nunca queda un botón recortado a la mitad ni una hit-zone fuera de la
+/// fila (con el panel abierto el reproductor se queda con el 64% del ancho).
 fn transport_row(
     playing: bool,
     shuffle: bool,
     repeat: RepeatMode,
+    max_width: u16,
 ) -> (Line<'static>, Vec<(Button, u16, u16)>) {
     let transport = Style::default()
         .fg(theme().text)
@@ -600,13 +604,19 @@ fn transport_row(
     let mut buttons = Vec::new();
     let mut column: u16 = 0;
     for (button, label, style, gap) in chips {
-        spans.push(Span::raw(gap));
-        column += gap.chars().count() as u16;
+        let gap_w = gap.chars().count() as u16;
         let chip = format!(" {label} ");
-        let width = chip.chars().count() as u16;
-        buttons.push((button, column, width));
+        let chip_w = chip.chars().count() as u16;
+        let next_column = column.saturating_add(gap_w).saturating_add(chip_w);
+        if next_column > max_width {
+            // El chip no entra completo: se omite entero (y lo que sigue).
+            break;
+        }
+        spans.push(Span::raw(gap));
+        column += gap_w;
+        buttons.push((button, column, chip_w));
         spans.push(Span::styled(chip, style));
-        column += width;
+        column += chip_w;
     }
     (Line::from(spans), buttons)
 }
@@ -3097,7 +3107,8 @@ fn render_player_info(frame: &mut Frame<'_>, area: Rect, app: &App, engine: &Aud
     }
 
     let controls_area = rows[row + 2];
-    let (controls, buttons) = transport_row(engine.is_playing(), app.shuffle, app.repeat);
+    let (controls, buttons) =
+        transport_row(engine.is_playing(), app.shuffle, app.repeat, controls_area.width);
     frame.render_widget(Paragraph::new(controls), controls_area);
     {
         let mut hit = app.hit.borrow_mut();
@@ -7011,20 +7022,20 @@ mod tests {
 
     #[test]
     fn transport_row_lists_buttons_in_order_with_play_state() {
-        let (paused, buttons) = transport_row(false, false, RepeatMode::Off);
+        let (paused, buttons) = transport_row(false, false, RepeatMode::Off, 200);
         let kinds: Vec<Button> = buttons.iter().map(|(b, _, _)| *b).collect();
         assert_eq!(
             kinds,
             vec![Button::Prev, Button::PlayPause, Button::Next, Button::Shuffle, Button::Repeat]
         );
         assert!(row_text(&paused).contains('▶'), "pausado muestra play");
-        let (playing, _) = transport_row(true, false, RepeatMode::Off);
+        let (playing, _) = transport_row(true, false, RepeatMode::Off, 200);
         assert!(row_text(&playing).contains("▮▮"), "sonando muestra pausa");
     }
 
     #[test]
     fn transport_row_positions_match_the_drawn_text() {
-        let (line, buttons) = transport_row(true, true, RepeatMode::All);
+        let (line, buttons) = transport_row(true, true, RepeatMode::All, 200);
         let text: Vec<char> = row_text(&line).chars().collect();
         let mut previous_end = 0;
         for (button, start, width) in &buttons {
@@ -7046,8 +7057,8 @@ mod tests {
                 .find(|span| span.content.contains(needle))
                 .and_then(|span| span.style.fg)
         };
-        let (off, _) = transport_row(false, false, RepeatMode::Off);
-        let (on, _) = transport_row(false, true, RepeatMode::One);
+        let (off, _) = transport_row(false, false, RepeatMode::Off, 200);
+        let (on, _) = transport_row(false, true, RepeatMode::One, 200);
         assert_eq!(style_of(&on, "aleatorio"), Some(theme().accent));
         assert_ne!(style_of(&off, "aleatorio"), Some(theme().accent));
         assert_eq!(style_of(&on, "repetir"), Some(theme().accent));
@@ -10733,6 +10744,94 @@ mod tests {
             "la cola no cambia"
         );
         assert_eq!(resolve_calls.borrow().as_slice(), &[page_url.as_str()]);
+    }
+
+    /// DIAGNÓSTICO TEMPORAL: dump del frame con el panel abierto, meta + cola
+    /// Regresión del reporte del usuario: con el panel lateral abierto (lista
+    /// Biblioteca), `n`/`N` saltan a la siguiente pista y `p` a la anterior,
+    /// igual que sin panel (los atajos de reproducción quedan activos sobre la
+    /// lista).
+    #[test]
+    fn list_mode_step_keys_change_tracks_with_the_panel_open() {
+        let Some(mut engine) = engine_or_skip() else { return };
+        let (mut app, t1, t2) = queue_fallback_app();
+        app.mode = Mode::Player;
+        app.has_player = true;
+        app.explorer_open = true;
+        app.selected = 0;
+        play_selected(&mut app, &mut engine);
+        assert_eq!(app.current_path.as_ref(), Some(&t1));
+
+        handle_list_key(theme_menu_key(KeyCode::Char('n')), &mut app, &mut engine);
+        assert_eq!(
+            app.current_path.as_ref(),
+            Some(&t2),
+            "n cambia a la siguiente con el panel abierto"
+        );
+
+        // Mayúsculas valen igual (el matcher ignora mayúsculas); con repeat
+        // Off en la última pista n no envuelve.
+        handle_list_key(theme_menu_key(KeyCode::Char('N')), &mut app, &mut engine);
+        assert_eq!(
+            app.current_path.as_ref(),
+            Some(&t2),
+            "N no envuelve con repeat Off en la última"
+        );
+
+        handle_list_key(theme_menu_key(KeyCode::Char('p')), &mut app, &mut engine);
+        assert_eq!(
+            app.current_path.as_ref(),
+            Some(&t1),
+            "p retrocede con el panel abierto"
+        );
+
+        let _ = std::fs::remove_file(&t2);
+    }
+
+    /// Con la solapa Cola abierta, `n` avanza la cola (el cursor) desde donde
+    /// está parado, igual que sin panel.
+    #[test]
+    fn queue_panel_step_key_advances_the_queue_cursor() {
+        let Some(mut engine) = engine_or_skip() else { return };
+        let (mut app, t1, t2) = queue_fallback_app();
+        app.mode = Mode::Player;
+        app.has_player = true;
+        app.explorer_open = true;
+        app.queue_panel = true;
+        app.current_path = Some(t1);
+        app.queue.push(QueueItem::Local(track_with_path(t2.clone(), "encolada")));
+
+        handle_list_key(theme_menu_key(KeyCode::Char('n')), &mut app, &mut engine);
+
+        assert_eq!(
+            app.current_path.as_ref(),
+            Some(&t2),
+            "n avanza al ítem encolado con la solapa Cola abierta"
+        );
+        assert_eq!(app.queue_cursor, Some(0), "el cursor avanza");
+
+        let _ = std::fs::remove_file(&t2);
+    }
+
+    /// La fila de controles ajusta sus chips al ancho disponible: un chip que
+    /// no entra completo se omite entero (nada de «rep» cortado a la mitad),
+    /// y cada hit-zone queda dentro del ancho dado.
+    #[test]
+    fn transport_row_never_truncates_a_chip_or_overflows_the_width() {
+        let (line, buttons) = transport_row(true, true, RepeatMode::All, 20);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            !text.contains("repito") && !text.contains("aleat"),
+            "chip recortado a la mitad: {text:?}"
+        );
+        if let Some((_, start, width)) = buttons.last() {
+            assert!(start + width <= 20, "hit-zone fuera del ancho: {buttons:?}");
+        }
+
+        let (wide, buttons_wide) = transport_row(true, true, RepeatMode::All, 60);
+        let wide_text: String = wide.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(buttons_wide.len(), 5, "con ancho 60 entran los cinco botones");
+        assert!(wide_text.contains("repetir: todo"), "{wide_text:?}");
     }
 
     /// S13: una URL encolada que falla al resolver se saltea — el cursor
