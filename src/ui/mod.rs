@@ -7207,11 +7207,21 @@ mod tests {
         let width = 8;
         let zero = marquee_window(title, width, 0);
         assert_eq!(zero.chars().count(), width, "ventana de ancho exacto");
-        let one = marquee_window(title, width, 1);
-        assert_ne!(one, zero, "el frame avanza la ventana un carácter");
+        // Un carácter cada MARQUEE_FRAMES_PER_CHAR frames: la velocidad de
+        // lectura es constante (~150 ms por carácter), no 60 chars/s.
+        assert_eq!(
+            marquee_window(title, width, 1),
+            zero,
+            "antes del paso el frame no mueve la ventana"
+        );
+        let one = marquee_window(title, width, super::render::MARQUEE_FRAMES_PER_CHAR);
+        assert_ne!(
+            one, zero,
+            "al cumplirse el paso, la ventana avanza un carácter"
+        );
         let cycle = title.chars().count() + 3; // título + separador
         assert_eq!(
-            marquee_window(title, width, cycle),
+            marquee_window(title, width, cycle * MARQUEE_FRAMES_PER_CHAR),
             zero,
             "el bucle envuelve a la posición inicial"
         );
@@ -7222,7 +7232,7 @@ mod tests {
         );
     }
 
-    ///: con un próximo (cola o pool), el panel muestra la franja
+    /// Con un próximo (cola o pool), el panel muestra la franja
     /// «próxima canción» con el título; sin próximo, no aparece.
     #[test]
     fn next_up_panel_section_shows_the_marquee_and_hides_without_a_next() {

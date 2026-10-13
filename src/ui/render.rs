@@ -1211,6 +1211,11 @@ pub(super) fn library_rows(app: &App, width: u16, height: u16) -> Vec<Line<'stat
 /// pegado a la izquierda (con padding a `width`); si no, recorre una ventana
 /// de `width` celdas sobre `título + separador + título` en bucle continuo,
 /// avanzando un carácter por frame.
+/// Paso del marquee: un carácter cada estos frames (~150 ms a ~60 draws/s),
+/// para que el título se alcance a leer y el desplazamiento sea constante sin
+/// importar el tamaño del terminal.
+pub(super) const MARQUEE_FRAMES_PER_CHAR: usize = 8;
+
 pub(super) fn marquee_window(text: &str, width: usize, frame: usize) -> String {
     let width = width.max(1);
     let chars = text.chars().count();
@@ -1219,7 +1224,7 @@ pub(super) fn marquee_window(text: &str, width: usize, frame: usize) -> String {
     }
     let sep = "   ";
     let cycle: Vec<char> = format!("{text}{sep}{text}{sep}").chars().collect();
-    let step = frame % (chars + sep.chars().count());
+    let step = (frame / MARQUEE_FRAMES_PER_CHAR) % (chars + sep.chars().count());
     cycle.iter().skip(step).take(width).collect()
 }
 
