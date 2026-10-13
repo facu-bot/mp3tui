@@ -4121,13 +4121,28 @@ const MIKU_FRAMES: [&str; crate::visualizer::MIKU_POSES] = [
 ",
 ];
 
-/// Pintor de la bailarina (modo `miku`). Con estilo unicode dibuja la textura
-/// real de Miku (`miku_art`, 49×38) animada: salto de 0..3 filas según el
-/// arco de `dance_pose` (el beat de graves lo dispara) y vaivén horizontal
-/// por el reloj; cuando el área no alcanza, la textura se reduce a medios
-/// bloques (▀/▄/█ por cada 2×2 texels braile) y se muestra una ventana
-/// centrada de la imagen reducida. Con estilo ascii (sin unicode) usa las 4
-/// poses simples de `MIKU_FRAMES`, que no dependen de glifos especiales.
+/// Color de paleta del arte animado (`miku_art`): letras a..g generadas del
+/// `.asciimtn` original. `a` = negro (fondo del arte: se omite, el fondo de la
+/// app ya es oscuro); `c`/`d` son los acentos turquesa/cian de Miku.
+fn miku_palette_color(letter: char) -> Option<Color> {
+    match letter {
+        'b' => Some(Color::Rgb(0x00, 0xcd, 0x00)),
+        'c' => Some(Color::Rgb(0x00, 0xcd, 0xcd)),
+        'd' => Some(Color::Rgb(0x00, 0xff, 0xff)),
+        'e' => Some(Color::Rgb(0x7f, 0x7f, 0x7f)),
+        'f' => Some(Color::Rgb(0xe5, 0xe5, 0xe5)),
+        'g' => Some(Color::Rgb(0xff, 0xff, 0xff)),
+        _ => None,
+    }
+}
+
+/// Pintor de la bailarina (modo `miku`). Con estilo unicode reproduce la
+/// ANIMACIÓN real de la pieza «hatsumemiku.asciimtn» (26 frames de la danza,
+/// con colores de paleta, recortada al bbox de la figura), avanzando un frame
+/// cada `ANIM_TICKS` de reloj para que el bucle dure ~3 s; sobre eso, el arco
+/// de salto (`dance_pose`, disparado por el beat de graves) y el vaivén
+/// horizontal (`dance_clock`) mueven la figura dentro del área. Con estilo
+/// ascii (sin unicode) usa las 4 poses simples de `MIKU_FRAMES`.
 fn paint_miku(
     buf: &mut ratatui::buffer::Buffer,
     inner: Rect,
@@ -4140,63 +4155,16 @@ fn paint_miku(
         return;
     }
 
-    // La constante abre con un salto de línea: se descarta esa entrada vacía.
-    let art_original: Vec<&str> = crate::visualizer::miku_art::MIKU_ART
-        .lines()
-        .filter(|l| !l.is_empty())
-        .collect();
-    let bright_texel = |ch: char| ch != '\u{2800}' && ch != ' ';
-    // Recorte automático de los márgenes vacíos de la pieza (trae aire
-    // arriba, abajo y a los costados): la figura queda centrada y grande.
-    let min_r = art_original
-        .iter()
-        .position(|l| l.chars().any(bright_texel))
-        .unwrap_or(0);
-    let max_r = art_original
-        .iter()
-        .rposition(|l| l.chars().any(bright_texel))
-        .unwrap_or(0);
-    let full_width = art_original
-        .iter()
-        .map(|l| l.chars().count())
-        .max()
-        .unwrap_or(0);
-    let min_c = (0..full_width)
-        .find(|&c| {
-            art_original
-                .iter()
-                .any(|l| l.chars().nth(c).is_some_and(bright_texel))
-        })
-        .unwrap_or(0);
-    let max_c = (0..full_width)
-        .rfind(|&c| {
-            art_original
-                .iter()
-                .any(|l| l.chars().nth(c).is_some_and(bright_texel))
-        })
-        .unwrap_or(full_width - 1);
-    let art: Vec<&str> = art_original[min_r..=max_r].to_vec();
-    let art_w = max_c - min_c + 1;
-    let art_h = art.len();
-    if art_h == 0 || art_w == 0 {
-        return;
-    }
-    // Acceso a un texel ya recortado: columna de la textura = min_c + c.
-    let texel = |row: usize, col: usize| -> char {
-        art[row].chars().nth(col).unwrap_or(' ')
-    };
-    let texel_min_c = min_c;
+    use crate::visualizer::miku_art as art;
+    let frame = (analyzer.dance_clock() / art::ANIM_TICKS as u64) as usize
+        % art::SAMPLED_FRAMES;
+    let lines = art::FRAME_CHARS[frame].lines().collect::<Vec<_>>();
+    let color_lines = art::FRAME_COLORS[frame].lines().collect::<Vec<_>>();
+    let art_w = art::CROP_RIGHT - art::CROP_LEFT + 1;
+    let art_h = art::CROP_BOTTOM - art::CROP_TOP + 1;
     let (rows_avail, cols_avail) = (inner.height as usize, inner.width as usize);
-    // En áreas chicas la textura se reduce a medios bloques (2×2 → 1 celda).
-    let scale = if rows_avail >= art_h && cols_avail >= art_w {
-        1
-    } else {
-        2
-    };
-    let out_rows = art_h.div_ceil(scale);
-    let out_cols = art_w.div_ceil(scale);
-    let rows = out_rows.min(rows_avail);
-    let cols = out_cols.min(cols_avail);
+    let rows = art_h.min(rows_avail);
+    let cols = art_w.min(cols_avail);
     if rows == 0 || cols == 0 {
         return;
     }
@@ -4211,31 +4179,26 @@ fn paint_miku(
     };
     let dx: i16 = if (analyzer.dance_clock() / 8) % 2 == 0 { 0 } else { 1 };
 
-    // Ventana dentro de la imagen (cuando el área es más chica que la imagen
-    // reducida) y desplazamiento de la imagen dentro del área (centrado + la
-    // animación). Se separan a propósito: uno recorta la fuente, el otro
-    // posiciona el resultado.
-    let win_r = if out_rows > rows {
-        (((out_rows - rows) / 2) as i16 + dy)
-            .clamp(0, (out_rows - rows) as i16) as usize
+    // Ventana dentro del arte (cuando el área es más chica que la figura) y
+    // desplazamiento de la figura dentro del área (centrado + animación). Uno
+    // recorta la fuente, el otro posiciona el resultado.
+    let win_r = if art_h > rows {
+        (((art_h - rows) / 2) as i16 + dy).clamp(0, (art_h - rows) as i16) as usize
     } else {
         0
     };
-    let win_c = if out_cols > cols {
-        (((out_cols - cols) / 2) as i16 + dx)
-            .clamp(0, (out_cols - cols) as i16) as usize
+    let win_c = if art_w > cols {
+        (((art_w - cols) / 2) as i16 + dx).clamp(0, (art_w - cols) as i16) as usize
     } else {
         0
     };
     let pos_r = if rows_avail > rows {
-        (((rows_avail - rows) / 2) as i16 + dy)
-            .clamp(0, (rows_avail - rows) as i16) as usize
+        (((rows_avail - rows) / 2) as i16 + dy).clamp(0, (rows_avail - rows) as i16) as usize
     } else {
         0
     };
     let pos_c = if cols_avail > cols {
-        (((cols_avail - cols) / 2) as i16 + dx)
-            .clamp(0, (cols_avail - cols) as i16) as usize
+        (((cols_avail - cols) / 2) as i16 + dx).clamp(0, (cols_avail - cols) as i16) as usize
     } else {
         0
     };
@@ -4243,44 +4206,26 @@ fn paint_miku(
     for y in inner.y..inner.y + inner.height {
         buf.set_string(inner.x, y, " ".repeat(inner.width as usize), Style::default());
     }
-    let style = Style::default().fg(theme.spectrum_mid);
     for r in 0..rows {
         let y = inner.y + (pos_r + r) as u16;
+        let art_row = art::CROP_TOP + win_r + r;
+        let line = lines[art_row].as_bytes();
+        let color_line = color_lines[art_row].as_bytes();
         for c in 0..cols {
-            let (ch, on) = if scale == 1 {
-                let ch = texel(win_r + r, texel_min_c + win_c + c);
-                (ch, bright_texel(ch))
-            } else {
-                let top = bright_texel(texel(
-                    (win_r + r) * 2,
-                    texel_min_c + (win_c + c) * 2,
-                )) || bright_texel(texel(
-                    (win_r + r) * 2,
-                    texel_min_c + (win_c + c) * 2 + 1,
-                ));
-                let bottom = bright_texel(texel(
-                    (win_r + r) * 2 + 1,
-                    texel_min_c + (win_c + c) * 2,
-                )) || bright_texel(texel(
-                    (win_r + r) * 2 + 1,
-                    texel_min_c + (win_c + c) * 2 + 1,
-                ));
-                (
-                    if top && bottom {
-                        '\u{2588}'
-                    } else if top {
-                        '\u{2580}'
-                    } else if bottom {
-                        '\u{2584}'
-                    } else {
-                        ' '
-                    },
-                    top || bottom,
-                )
-            };
-            if on {
-                buf.set_string(inner.x + (pos_c + c) as u16, y, ch.to_string(), style);
+            let art_col = art::CROP_LEFT + win_c + c;
+            let ch = line[art_col] as char;
+            if ch == ' ' {
+                continue;
             }
+            let Some(color) = miku_palette_color(color_line[art_col] as char) else {
+                continue;
+            };
+            buf.set_string(
+                inner.x + (pos_c + c) as u16,
+                y,
+                ch.to_string(),
+                Style::default().fg(color),
+            );
         }
     }
 }
@@ -8984,19 +8929,24 @@ mod tests {
         terminal
             .draw(|frame| render(frame, &app, &engine))
             .expect("draw");
-        let text = player_screen_text(&terminal.backend().buffer().clone());
+        let buffer = terminal.backend().buffer().clone();
+        let text = player_screen_text(&buffer);
         assert!(
-            text.contains('\u{25a0}')
-                || text.contains('\u{2580}')
-                || text.contains('\u{2584}')
-                || text.contains('\u{28ff}')
-                || text.contains('\u{28bf}'),
-            "la textura de Miku (braile o reducida a bloques) está en pantalla"
+            text.contains('@'),
+            "la animación real de Miku (frames con @) está en pantalla"
         );
         assert!(
             !text.contains("MIKU"),
-            "estilo unicode usa la textura real, no las poses ascii"
+            "estilo unicode usa la animación real, no las poses ascii"
         );
+        // Los frames llevan color de paleta: debe haber celdas blancas (#fff).
+        let white = (0..buffer.area.height).any(|y| {
+            (0..buffer.area.width).any(|x| {
+                buffer[(x, y)].style().fg
+                    == Some(ratatui::style::Color::Rgb(0xff, 0xff, 0xff))
+            })
+        });
+        assert!(white, "la paleta blanca del arte está en pantalla");
 
         app.explorer_open = true;
         let small = ratatui::backend::TestBackend::new(64, 24);
