@@ -9290,6 +9290,76 @@ mod tests {
         assert_eq!(app.queue_cursor, None, "nada de la cola está sonando");
     }
 
+    /// S9: el cursor de la cola nunca queda fuera de rango ni apuntando a un
+    /// ítem inexistente, ni siquiera mezclando encolado, borrado, Enter, `n`,
+    /// `p` y fin de pista en cualquier orden.
+    #[test]
+    fn queue_cursor_stays_in_range_through_mixed_operations() {
+        let Some(mut engine) = engine_or_skip() else { return };
+        let dir = std::env::temp_dir();
+        let wav = make_test_wav(4410);
+        let mut paths = Vec::new();
+        for i in 0..5 {
+            let path = dir.join(format!("mp3tui_cursor_{}_{}.wav", std::process::id(), i));
+            std::fs::write(&path, &wav).unwrap();
+            paths.push(path);
+        }
+        let mut app = test_app();
+        app.library = Some(crate::playlist::from_tracks_for_test(
+            paths
+                .iter()
+                .cloned()
+                .map(|path| track_with_path(path, "t"))
+                .collect(),
+        ));
+        refresh_view(&mut app);
+        app.mode = Mode::Player;
+        app.has_player = true;
+        app.explorer_open = true;
+        app.queue_panel = true;
+        app.status = Status::Playing;
+
+        for i in 0..200usize {
+            match i % 7 {
+                0 => {
+                    app.selected = i % app.view.len().max(1);
+                    enqueue_selected(&mut app);
+                }
+                1 => play_step_with(&mut app, &mut engine, 1, |_app, _engine, _req| {}),
+                2 => play_step_with(&mut app, &mut engine, -1, |_app, _engine, _req| {}),
+                3 => handle_natural_end_with(&mut app, &mut engine, |_app, _engine, _req| {}),
+                4 => {
+                    app.queue_selected = (i * 3) % app.queue.len().max(1);
+                    delete_selected_queue_item(&mut app);
+                }
+                5 => {
+                    app.queue_selected = (i * 5) % app.queue.len().max(1);
+                    play_selected_queue_item(&mut app, &mut engine);
+                }
+                _ => {
+                    app.queue_cursor = match app.queue.len() {
+                        0 => None,
+                        len => Some((i * 7) % len),
+                    };
+                }
+            }
+            if let Some(cursor) = app.queue_cursor {
+                assert!(
+                    cursor < app.queue.len(),
+                    "op {i}: cursor {cursor} fuera de rango (len {})",
+                    app.queue.len()
+                );
+            }
+            if app.queue.is_empty() {
+                assert_eq!(app.queue_cursor, None, "cola vacía con cursor encendido");
+            }
+        }
+
+        for path in &paths {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
     /// S9: `n` recorre la cola —avanza el cursor una posición y reproduce ese
     /// ítem— antes de caer al pool de la biblioteca.
     #[test]
