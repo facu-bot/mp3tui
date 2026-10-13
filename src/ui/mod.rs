@@ -1417,12 +1417,18 @@ fn refresh_view_with_hint(app: &mut App, preserved_history_url: Option<&str>) {
     app.selected = new_selected;
 
     if app.shuffle {
-        let track_count = app
+        // El orden vive sobre el pool MIXTO (pistas + historial), igual que en
+        // `toggle_shuffle` y en `pool_positions_in_view`: si el refresco lo
+        // dejara con solo las pistas, quedaría a medio armar hasta el próximo
+        // salto (D2/S6).
+        let pool_count = app
             .view
             .iter()
-            .filter(|item| matches!(item, ViewItem::Track(_)))
+            .filter(|item| {
+                matches!(item, ViewItem::Track(_)) || matches!(item, ViewItem::History(_))
+            })
             .count();
-        app.shuffle_order = shuffle_order(track_count);
+        app.shuffle_order = shuffle_order(pool_count);
     }
 }
 
@@ -6079,6 +6085,37 @@ mod tests {
         let mut sorted = app.shuffle_order.clone();
         sorted.sort_unstable();
         assert_eq!(sorted, vec![0, 1], "sigue siendo una permutación");
+    }
+
+    /// D2/S6: con shuffle activo el orden mezclado cubre el **pool mixto** que
+    /// recorren `n`/`p` y el fin de pista (biblioteca + historial de URLs), no
+    /// solo las pistas locales: si un refresco de la vista lo dejara corto, el
+    /// orden quedaría a medio armar hasta el próximo salto.
+    #[test]
+    fn refresh_view_shuffle_order_covers_the_mixed_pool() {
+        let mut app = test_app();
+        app.library = Some(crate::playlist::from_tracks_for_test(vec![
+            track_named("alpha"),
+            track_named("beta"),
+        ]));
+        app.history.add(
+            "Video de YouTube".to_string(),
+            "https://www.youtube.com/watch?v=x".to_string(),
+        );
+        app.shuffle = true;
+        refresh_view(&mut app);
+        let after_refresh = app.shuffle_order.len();
+
+        let pool = pool_positions_in_view(&mut app);
+        assert_eq!(pool.len(), 3, "el pool mixto suma la URL del historial");
+        assert_eq!(
+            after_refresh,
+            pool.len(),
+            "el orden mezclado ya cubre el pool mixto al refrescar la vista"
+        );
+        let mut sorted = app.shuffle_order.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, vec![0, 1, 2], "sigue siendo una permutación");
     }
 
     #[test]
