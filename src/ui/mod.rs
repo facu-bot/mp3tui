@@ -574,16 +574,6 @@ fn centered_pad(line: u16, area: u16) -> u16 {
     area.saturating_sub(line) / 2
 }
 
-/// Placeholder de la caja donde va el arte ASCII de la canción (T4): un borde
-/// tenue con el título del bloque, para que la columna reservada a la derecha
-/// de la info no parezca un hueco.
-fn render_art_placeholder(frame: &mut Frame<'_>, area: Rect) {
-    let block = Block::bordered()
-        .border_style(Style::default().fg(theme().dim))
-        .title(Span::styled("arte", Style::default().fg(theme().dim)));
-    frame.render_widget(block, area);
-}
-
 /// Fila de controles clickeables: la línea a dibujar y, por botón, la columna
 /// inicial (relativa a la fila) y su ancho. Los chips se ajustan al ancho
 /// disponible (`max_width`): los que no entran completos se omiten enteros,
@@ -3077,34 +3067,15 @@ fn render_explorer_panel(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn render_player_info(frame: &mut Frame<'_>, area: Rect, app: &App, engine: &AudioEngine, focused: bool) {
-    // T5: con ancho disponible, la info se encoge un poco y la columna que
-    // sobra a la derecha queda reservada para el arte ASCII de la canción
-    // (placeholder tenue; T4 la va a usar). En pantallas angostas (panel
-    // lateral abierto) la info conserva todo el ancho.
-    let (info_area, art_area) = if area.width >= 70 {
-        let split = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(62),
-                Constraint::Percentage(38),
-            ])
-            .split(area);
-        (split[0], split[1])
-    } else {
-        (area, Rect::default())
-    };
-
-    // Borde acentuado cuando el player tiene el foco.
+    // Borde acentuado cuando el player tiene el foco. (El ancho reducido con
+    // la columna del arte ASCII quedó revertido: el usuario decidió no usar
+    // ese espacio por ahora — ver log L14.)
     let border_color = if focused { theme().accent } else { theme().dim };
     let block = Block::bordered()
         .border_style(Style::default().fg(border_color))
         .title(accent_title("mp3tui"));
-    let inner = block.inner(info_area);
-    frame.render_widget(block, info_area);
-
-    if art_area.width > 0 && art_area.height > 0 {
-        render_art_placeholder(frame, art_area);
-    }
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
 
     // Buscar metadatos del track actual en la biblioteca.
     let track_meta: Option<(String, Option<String>)> = app.current_path.as_ref()
@@ -11447,44 +11418,6 @@ mod tests {
         );
     }
 
-    /// T5: con ancho disponible la info se encoge y la columna de la derecha
-    /// queda reservada con el placeholder tenue del arte; con el panel abierto
-    /// (ancho chico) no se reserva.
-    #[test]
-    fn player_info_reserves_the_art_column_with_a_faint_box() {
-        let Some(engine) = engine_or_skip() else { return };
-        let mut app = library_with_three();
-        app.mode = Mode::Player;
-        app.has_player = true;
-        app.current_path = Some(PathBuf::from(r"C:\x\alpha.mp3"));
-        app.track_label = "alpha.mp3".to_string();
-
-        let buffer = render_player_frame(&app, &engine);
-        let text = player_screen_text(&buffer);
-        assert!(text.contains("arte"), "el placeholder de la caja del arte está");
-        let archivo_col = text
-            .lines()
-            .find(|l| l.contains("Archivo:"))
-            .map(|l| l.find("Archivo:").unwrap_or(99))
-            .unwrap_or(99);
-        assert!(
-            archivo_col < 62,
-            "la info quedó a la izquierda de la columna del arte: {archivo_col}"
-        );
-
-        // Con el panel abierto no hay ancho: sin placeholder y sin crashear.
-        app.explorer_open = true;
-        let small = ratatui::backend::TestBackend::new(64, 24);
-        let mut terminal = ratatui::Terminal::new(small).expect("terminal");
-        terminal
-            .draw(|frame| render(frame, &app, &engine))
-            .expect("draw con panel abierto");
-        let text = player_screen_text(&terminal.backend().buffer().clone());
-        assert!(
-            !text.contains("arte"),
-            "con poco ancho no se reserva la columna del arte"
-        );
-    }
 
     /// S13: una URL encolada que falla al resolver se saltea — el cursor
     /// avanza al próximo ítem de la cola y lo intenta (erst la URL siguiente).
