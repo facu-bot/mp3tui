@@ -22,6 +22,10 @@ pub enum UrlKind {
     DirectAudio,
     /// Página web de servicio conocido (YouTube, SoundCloud, Bandcamp, Vimeo).
     Page,
+    /// Playlist de YouTube: tiene `list=` en la query o su path es `/playlist`.
+    /// Se lista con yt-dlp `--flat-playlist` (títulos + URLs de página, sin
+    /// resolver audio), no como una página única.
+    Playlist,
     /// URL sin extensión ni host reconocido; requiere inspeccionar Content-Type.
     Unknown,
 }
@@ -67,6 +71,14 @@ fn is_page_host(host: &str) -> bool {
         || stripped.ends_with(".bandcamp.com")
 }
 
+/// `true` si la query trae un parámetro `list` (playlist de YouTube u otro
+/// servicio que use `?list=`). El nombre del parámetro no distingue mayúsculas.
+fn has_list_query_param(query: &str) -> bool {
+    query.split('&').any(|pair| {
+        matches!(pair.split_once('='), Some((key, _)) if key.eq_ignore_ascii_case("list"))
+    })
+}
+
 /// Clasifica una entrada de usuario como ruta local o URL remota.
 pub fn classify(input: &str) -> Input {
     let trimmed = input.trim();
@@ -89,6 +101,18 @@ pub fn classify(input: &str) -> Input {
         None => path_and_rest,
     };
 
+    // Query (sin el `#fragment`), para detectar `?list=` de playlist.
+    let query = match path_and_rest.find('?') {
+        Some(idx) => {
+            let after = &path_and_rest[idx + 1..];
+            match after.find('#') {
+                Some(hash) => &after[..hash],
+                None => after,
+            }
+        }
+        None => "",
+    };
+
     let last_segment = path.rsplit('/').next().unwrap_or("");
     let ext_opt = last_segment.rsplit_once('.').and_then(|(stem, ext)| {
         if !stem.is_empty() && !ext.is_empty() {
@@ -108,6 +132,20 @@ pub fn classify(input: &str) -> Input {
             }
             _ => {}
         }
+    }
+
+    // Playlist: `list=` en la query o path `/playlist` (gana sobre el host
+    // de página para que un watch con lista no se trate como video suelto).
+    // `/playlists` (la página de playlists del usuario) NO es una lista.
+    let path_lower = path.to_ascii_lowercase();
+    if has_list_query_param(query)
+        || path_lower == "/playlist"
+        || path_lower.starts_with("/playlist/")
+    {
+        return Input::Url {
+            url: trimmed.to_string(),
+            kind: UrlKind::Playlist,
+        };
     }
 
     let host_and_port = authority.rsplit('@').next().unwrap_or(authority);
@@ -308,6 +346,68 @@ mod tests {
                 url: "https://soundcloud.com:443/track".to_string(),
                 kind: UrlKind::Page,
             }
+        );
+    }
+
+    #[test]
+    fn test_classify_playlist_urls() {
+        // Playlist por query `list=` (watch con lista o /playlist con lista).
+        let by_query = [
+            "https://www.youtube.com/watch?v=abc123&list=PLxyz",
+            "https://www.youtube.com/playlist?list=PLxyz",
+            "https://music.youtube.com/playlist?list=PLxyz&feature=share",
+            "https://www.youtube.com/embed/videoseries?list=PLxyz",
+            "https://example.com/watch?foo=bar&list=PLxyz",
+        ];
+        for url in by_query {
+            assert_eq!(
+                classify(url),
+                Input::Url {
+                    url: url.to_string(),
+                    kind: UrlKind::Playlist,
+                },
+                "Fallo clasificando playlist por query: {url}"
+            );
+        }
+
+        // Playlist por path `/playlist`.
+        let by_path = [
+            "https://www.youtube.com/playlist",
+            "https://www.youtube.com/playlist/",
+            "https://music.youtube.com/playlist?foo=bar",
+        ];
+        for url in by_path {
+            assert_eq!(
+                classify(url),
+                Input::Url {
+                    url: url.to_string(),
+                    kind: UrlKind::Playlist,
+                },
+                "Fallo clasificando playlist por path: {url}"
+            );
+        }
+
+        // Un watch normal sin `list=` sigue siendo Page.
+        assert_eq!(
+            classify("https://www.youtube.com/watch?v=abc123"),
+            Input::Url {
+                url: "https://www.youtube.com/watch?v=abc123".to_string(),
+                kind: UrlKind::Page,
+            }
+        );
+    }
+
+    /// El path `/playlists` (la página de playlists del usuario) no es una
+    /// URL de playlist: solo `/playlist` o `/playlist/`.
+    #[test]
+    fn test_classify_playlists_page_is_not_a_playlist() {
+        assert_eq!(
+            classify("https://www.youtube.com/playlists"),
+            Input::Url {
+                url: "https://www.youtube.com/playlists".to_string(),
+                kind: UrlKind::Page,
+            },
+            "la página de playlists del usuario no se lista como playlist"
         );
     }
 

@@ -56,6 +56,10 @@ const SEARCH_CARET: &str = "\u{258f}"; // ▏ cursor de texto en modo búsqueda
 const SEARCH_BOX_WIDTH: usize = 24;
 /// Texto guía de la caja vacía.
 const SEARCH_PLACEHOLDER: &str = "escribí para buscar";
+/// Aviso cuando una lista de playlist sale vacía (S12).
+const PLAYLIST_EMPTY_MSG: &str = "La playlist no tiene canciones";
+/// Aviso cuando un ítem de la cola no arranca y se saltea (S13).
+const QUEUE_ITEM_FAILED_MSG: &str = "No se pudo reproducir el ítem de la cola; se saltea";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Status {
@@ -91,6 +95,8 @@ pub enum SubmitAction {
     Local(PathBuf),
     DirectAudio(String),
     Page(String),
+    /// URL de playlist: se lista con `--flat-playlist` y se encola el resto (S12).
+    Playlist(String),
     Unknown(String),
     Empty,
 }
@@ -105,6 +111,7 @@ pub fn classify_submit_input(input: &str) -> SubmitAction {
         crate::source::Input::Url { url, kind } => match kind {
             crate::source::UrlKind::DirectAudio => SubmitAction::DirectAudio(url),
             crate::source::UrlKind::Page => SubmitAction::Page(url),
+            crate::source::UrlKind::Playlist => SubmitAction::Playlist(url),
             crate::source::UrlKind::Unknown => SubmitAction::Unknown(url),
         },
     }
@@ -185,6 +192,60 @@ fn handle_ytdlp_result(
     }
 }
 
+/// Resultado del listado `--flat-playlist` de una playlist (S12). La primera
+/// entrada se resuelve enseguida (su URL de audio vence) y el resto entra a
+/// la cola **al final** de la existente, sin tocar el cursor. Una lista vacía
+/// o un listado fallido → aviso visible y la cola queda intacta.
+fn handle_playlist_result(
+    app: &mut App,
+    request_id: u64,
+    result: Result<Vec<crate::source::ytdlp::PlaylistEntry>, crate::source::ytdlp::YtDlpError>,
+    resolve_page: &mut impl FnMut(String, u64) -> Receiver<YtDlpMessage>,
+) {
+    if request_id != app.ytdlp_request_id {
+        // Resultado tarde de un listado ya cancelado: se descarta (S12).
+        return;
+    }
+    match result {
+        Ok(entries) if entries.is_empty() => {
+            app.status = Status::Stopped;
+            app.error = Some(PLAYLIST_EMPTY_MSG.to_string());
+            app.ytdlp_failed = true;
+            app.pending_history = None;
+        }
+        Ok(entries) => {
+            // Las siguientes van al final de la cola existente (D7), sin
+            // tocar el cursor de la cola (S12). Cada una se resuelve recién
+            // cuando le toque sonar (S3).
+            for entry in entries.iter().skip(1) {
+                // Un título vacío (video privado/eliminado en flat mode) se
+                // muestra como su URL de página, igual que en el historial.
+                let title = if entry.title.is_empty() {
+                    entry.page_url.clone()
+                } else {
+                    entry.title.clone()
+                };
+                app.queue.push(QueueItem::Url {
+                    url: entry.page_url.clone(),
+                    title,
+                });
+            }
+            // La primera suena directo: se resuelve ahora.
+            let first = &entries[0];
+            app.status = Status::Resolving;
+            app.error = None;
+            let req_id = app.ytdlp_request_id;
+            app.ytdlp_rx = Some(resolve_page(first.page_url.clone(), req_id));
+        }
+        Err(err) => {
+            app.status = Status::Stopped;
+            app.error = Some(err.to_string());
+            app.ytdlp_failed = true;
+            app.pending_history = None;
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Pantalla de fondo. Con sesión de audio siempre es `Player`; el explorador
 /// se superpone como panel lateral (`App::explorer_open`) sin
@@ -228,6 +289,25 @@ type YtDlpMessage = (
     Result<crate::source::ytdlp::Resolved, crate::source::ytdlp::YtDlpError>,
 );
 
+/// Mensaje del listado `--flat-playlist`: id de pedido, URL original de la
+/// playlist y la lista de entradas (título + URL de página).
+type YtDlpListMessage = (
+    u64,
+    String,
+    Result<Vec<crate::source::ytdlp::PlaylistEntry>, crate::source::ytdlp::YtDlpError>,
+);
+
+/// Disparador que inició el avance por la cola. Al agotarse la cola tras
+/// saltear un ítem fallido (S13), decide por dónde cae el fallback al pool
+/// de la biblioteca/historial: el fin natural o el sentido del salto manual.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueueAdvance {
+    /// Fin natural de pista: avanza el pool hacia adelante.
+    NaturalEnd,
+    /// Salto manual `n` (+1) o `p` (-1).
+    Step(isize),
+}
+
 struct App {
     mode: Mode,
     /// Panel lateral del explorador superpuesto sobre el reproductor.
@@ -264,6 +344,12 @@ struct App {
     /// ningún ítem de la cola. Las posiciones por debajo se muestran
     /// atenuadas (ya sonaron) y las de arriba, como próximas.
     queue_cursor: Option<usize>,
+    /// Índice de la cola cuya URL se está resolviendo (S13). Si la resolución
+    /// falla, el event loop llama a [`skip_failed_queue_item`]: se saltea con
+    /// aviso y se intenta el próximo ítem (o el pool si la cola se agota).
+    queue_resolving: Option<usize>,
+    /// Disparador que inició el recorrido de la cola, para el fallback (S13).
+    queue_advance: QueueAdvance,
     /// Solapa activa del panel lateral: `false` = Biblioteca, `true` = Cola.
     /// Solo tiene efecto con el panel abierto.
     queue_panel: bool,
@@ -279,6 +365,8 @@ struct App {
     analyzer: SpectrumAnalyzer,
     url_input: Option<String>,
     ytdlp_rx: Option<Receiver<YtDlpMessage>>,
+    /// Receiver del listado `--flat-playlist` en curso (S12).
+    playlist_rx: Option<Receiver<YtDlpListMessage>>,
     ytdlp_request_id: u64,
     is_url: bool,
     /// URL original (nunca la resuelta) + etiqueta de la pista cuando la
@@ -864,6 +952,8 @@ pub fn run(engine: &mut AudioEngine, start: StartMode) -> io::Result<()> {
         shuffle_order: Vec::new(),
         queue: Vec::new(),
         queue_cursor: None,
+        queue_resolving: None,
+        queue_advance: QueueAdvance::NaturalEnd,
         queue_panel: false,
         queue_selected: 0,
         current_path,
@@ -877,6 +967,7 @@ pub fn run(engine: &mut AudioEngine, start: StartMode) -> io::Result<()> {
         analyzer: SpectrumAnalyzer::new(),
         url_input: None,
         ytdlp_rx: None,
+        playlist_rx: None,
         ytdlp_request_id: 0,
         is_url: is_url_start,
         current_url: None,
@@ -897,19 +988,7 @@ pub fn run(engine: &mut AudioEngine, start: StartMode) -> io::Result<()> {
     };
 
     if let Some((url, kind)) = start_url_info {
-        match kind {
-            crate::source::UrlKind::DirectAudio | crate::source::UrlKind::Unknown => {
-                let label = url_display_label(&url);
-                start_url_playback(&mut app, engine, url.clone(), url, label);
-            }
-            crate::source::UrlKind::Page => {
-                app.status = Status::Resolving;
-                app.error = None;
-                app.current_url = Some((url.clone(), url_display_label(&url)));
-                app.ytdlp_request_id = 1;
-                app.ytdlp_rx = Some(spawn_ytdlp_resolution(url, 1));
-            }
-        }
+        start_boot_url(&mut app, engine, url, kind);
     }
     start_scan(&mut app);
     let mut tui = Tui::new()?;
@@ -957,12 +1036,44 @@ fn event_loop(tui: &mut Tui, app: &mut App, engine: &mut AudioEngine) -> io::Res
         }
         poll_scan(app);
 
+        // Listado de playlist (`--flat-playlist`): al llegar, encola el resto
+        // de la lista y resuelve la primera canción (S12).
+        if let Some(rx) = &app.playlist_rx {
+            match rx.try_recv() {
+                Ok((req_id, _orig_playlist_url, result)) => {
+                    app.playlist_rx = None;
+                    handle_playlist_result(app, req_id, result, &mut spawn_ytdlp_resolution);
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    app.playlist_rx = None;
+                }
+            }
+        }
+
         if let Some(rx) = &app.ytdlp_rx {
             match rx.try_recv() {
                 Ok((req_id, orig_url, result)) => {
                     app.ytdlp_rx = None;
+                    // Historia: la URL original que se guarda es la de la
+                    // sesión actual (`current_url`), que para la primera de
+                    // una playlist es la URL de la playlist (S12); para un
+                    // replay el `current_url` ya quedó reh aplicado. El valor
+                    // que devuelve el hilo solo se usa como respaldo si no
+                    // hubiera sesión (no debería ocurrir en esta ruta).
+                    let original = app
+                        .current_url
+                        .as_ref()
+                        .map(|(original, _)| original.clone())
+                        .unwrap_or(orig_url);
                     if let Some((audio_url, title)) = handle_ytdlp_result(app, req_id, result) {
-                        start_url_playback(app, engine, audio_url, orig_url, title);
+                        // Resolución OK: ya no es resolución de ítem de cola.
+                        app.queue_resolving = None;
+                        start_url_playback(app, engine, audio_url, original, title);
+                    } else if req_id == app.ytdlp_request_id {
+                        // Una URL encolada falló al resolver su turno: se
+                        // saltea con aviso y se sigue con el próximo (S13).
+                        skip_failed_queue_item(app, engine, &mut dispatch_url_replay);
                     }
                 }
                 Err(TryRecvError::Empty) => {}
@@ -1476,6 +1587,8 @@ fn handle_url_prompt_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine)
 fn cancel_pending_ytdlp(app: &mut App) {
     app.ytdlp_request_id = app.ytdlp_request_id.wrapping_add(1);
     app.ytdlp_rx = None;
+    app.playlist_rx = None;
+    app.queue_resolving = None;
     app.ytdlp_failed = false;
     app.pending_history = None;
 }
@@ -1873,18 +1986,48 @@ fn spawn_ytdlp_resolution(url: String, req_id: u64) -> Receiver<YtDlpMessage> {
     rx
 }
 
+/// Único punto del programa que lista una playlist de YouTube con yt-dlp
+/// `--flat-playlist`: devuelve el receiver del resultado (mismo patrón de
+/// seam que [`spawn_ytdlp_resolution`], sin tocar red en los tests).
+fn spawn_ytdlp_listing(url: String, req_id: u64) -> Receiver<YtDlpListMessage> {
+    let (tx, rx) = mpsc::channel();
+    let url_clone = url.clone();
+    thread::spawn(move || {
+        let result =
+            crate::source::ytdlp::list_flat(&url, &crate::source::ytdlp::ProcessCommandRunner);
+        let _ = tx.send((req_id, url_clone, result));
+    });
+    rx
+}
+
 fn submit_url_prompt(input: String, app: &mut App, engine: &mut AudioEngine) {
     submit_url_prompt_with(input, app, engine, spawn_ytdlp_resolution)
 }
 
-/// Seam inyectable de [`submit_url_prompt`]: la rama de página recibe el
-/// resolver (`FnOnce(url, req_id) -> receiver`), que en producción es
-/// [`spawn_ytdlp_resolution`] y en tests un doble que no lanza yt-dlp.
+/// Seam inyectable de [`submit_url_prompt`] (resolución): la rama de página
+/// recibe el resolver (`FnOnce(url, req_id) -> receiver`), que en producción
+/// es [`spawn_ytdlp_resolution`] y en tests un doble que no lanza yt-dlp.
+/// El listado de playlist usa el seam de producción; los tests de playlist
+/// usan [`submit_url_prompt_with_seams`] para inyectarlo aislado.
 fn submit_url_prompt_with(
     input: String,
     app: &mut App,
     engine: &mut AudioEngine,
     resolve_page: impl FnOnce(String, u64) -> Receiver<YtDlpMessage>,
+) {
+    submit_url_prompt_with_seams(input, app, engine, resolve_page, spawn_ytdlp_listing)
+}
+
+/// Camino único de URL (página y playlist) con ambos seams inyectables: la
+/// resolución de página y el listado de playlist. El boot por argumento y el
+/// prompt `u` pasan por acá para que el flujo de playlist sea idéntico y
+/// hermético a los tests en los dos puntos de entrada (S12).
+fn submit_url_prompt_with_seams(
+    input: String,
+    app: &mut App,
+    engine: &mut AudioEngine,
+    resolve_page: impl FnOnce(String, u64) -> Receiver<YtDlpMessage>,
+    list_playlist: impl FnOnce(String, u64) -> Receiver<YtDlpListMessage>,
 ) {
     match classify_submit_input(&input) {
         SubmitAction::Empty => {}
@@ -1902,21 +2045,76 @@ fn submit_url_prompt_with(
             start_url_playback(app, engine, url.clone(), url, label);
             app.mode = Mode::Player;
         }
-        SubmitAction::Page(url) => {
-            cancel_pending_ytdlp(app);
-            app.is_url = true;
-            app.current_path = None;
-            app.track_label = url_display_label(&url);
-            app.has_player = true;
-            app.mode = Mode::Player;
-            app.status = Status::Resolving;
-            app.error = None;
-            // La URL original queda guardada desde el input: si la pista que
-            // estaba sonando termina mientras resuelve, One repite ésta.
-            app.current_url = Some((url.clone(), url_display_label(&url)));
+        SubmitAction::Page(url) | SubmitAction::Playlist(url) => {
+            begin_url_flow(app, url, resolve_page, list_playlist);
+        }
+    }
+}
 
-            let req_id = app.ytdlp_request_id;
-            app.ytdlp_rx = Some(resolve_page(url, req_id));
+/// Inicio del flujo de URL de página/playlist (unificado para el boot por
+/// argumento y el prompt `u`): prepara la sesión de URL, valida el `request
+/// id` pendiente y lanza la resolución (página) o el listado `--flat-playlist`
+/// (playlist). En S12 la playlist se lista y la primera canción se resuelve
+/// enseguida; el resto entra a la cola al final cuando llega el listado.
+fn begin_url_flow(
+    app: &mut App,
+    url: String,
+    resolve_page: impl FnOnce(String, u64) -> Receiver<YtDlpMessage>,
+    list_playlist: impl FnOnce(String, u64) -> Receiver<YtDlpListMessage>,
+) {
+    let is_playlist = matches!(
+        crate::source::classify(&url),
+        crate::source::Input::Url {
+            kind: crate::source::UrlKind::Playlist,
+            ..
+        }
+    );
+
+    cancel_pending_ytdlp(app);
+    app.is_url = true;
+    app.current_path = None;
+    app.track_label = url_display_label(&url);
+    app.has_player = true;
+    app.mode = Mode::Player;
+    app.status = Status::Resolving;
+    app.error = None;
+    // La URL original queda guardada desde el input: si la pista que estaba
+    // sonando termina mientras resuelve, One repite ésta. Para la primera de
+    // una playlist, esta es la URL de la playlist que registra el historial.
+    app.current_url = Some((url.clone(), url_display_label(&url)));
+
+    let req_id = app.ytdlp_request_id;
+    if is_playlist {
+        app.playlist_rx = Some(list_playlist(url, req_id));
+    } else {
+        app.ytdlp_rx = Some(resolve_page(url, req_id));
+    }
+}
+
+/// Arranque por argumento de CLI (`mp3tui "<url>"`): URL directa / desconocida
+/// reproduce ya, y página / playlist pasan por el mismo flujo unificado de
+/// [`begin_url_flow`] que el prompt `u`.
+fn start_boot_url(app: &mut App, engine: &mut AudioEngine, url: String, kind: crate::source::UrlKind) {
+    start_boot_url_with(app, engine, url, kind, spawn_ytdlp_resolution, spawn_ytdlp_listing)
+}
+
+/// Variante testeable de [`start_boot_url`] con los seams inyectables de
+/// resolución y listado.
+fn start_boot_url_with(
+    app: &mut App,
+    engine: &mut AudioEngine,
+    url: String,
+    kind: crate::source::UrlKind,
+    resolve_page: impl FnOnce(String, u64) -> Receiver<YtDlpMessage>,
+    list_playlist: impl FnOnce(String, u64) -> Receiver<YtDlpListMessage>,
+) {
+    match kind {
+        crate::source::UrlKind::DirectAudio | crate::source::UrlKind::Unknown => {
+            let label = url_display_label(&url);
+            start_url_playback(app, engine, url.clone(), url, label);
+        }
+        crate::source::UrlKind::Page | crate::source::UrlKind::Playlist => {
+            begin_url_flow(app, url, resolve_page, list_playlist);
         }
     }
 }
@@ -2036,8 +2234,7 @@ fn play_selected_queue_item(app: &mut App, engine: &mut AudioEngine) {
         return;
     }
     let index = app.queue_selected.min(app.queue.len() - 1);
-    let local = matches!(app.queue.get(index), Some(QueueItem::Local(_)));
-    if play_queue_position(app, engine, index, &mut dispatch_url_replay) && local {
+    if play_queue_from(app, engine, index, QueueAdvance::Step(1), &mut dispatch_url_replay) {
         app.mode = Mode::Player;
     }
 }
@@ -2061,31 +2258,112 @@ fn queue_prev_position(app: &App) -> Option<usize> {
     app.queue_cursor?.checked_sub(1)
 }
 
-/// Reproduce la posición `index` de la cola por el camino que ya existe (pista
-/// local o URL pendiente con el replay inyectable) y mueve ahí el cursor de la
-/// cola. Devuelve false sin mover el cursor si el ítem no pudo arrancar.
-fn play_queue_position(
+/// Reproduce desde `start` hacia adelante de la cola saltando los ítems
+/// locales que no abren (S13): aviso visible y se sigue con el próximo. Si el
+/// ítem es una URL se arranca su resolución (asíncrona, esperando su turno,
+/// S3) y se registra `queue_resolving` para saltearla si falla. Mueve el
+/// cursor a la posición que quedó en marcha. Devuelve `false` cuando la cola
+/// quedó agotada (entonces vale el fallback de S5/S6).
+fn play_queue_from(
     app: &mut App,
     engine: &mut AudioEngine,
-    index: usize,
+    start: usize,
+    advance: QueueAdvance,
     replay: &mut impl FnMut(&mut App, &mut AudioEngine, UrlReplayRequest),
 ) -> bool {
-    let Some(item) = app.queue.get(index).cloned() else {
-        return false;
-    };
-    match item {
-        QueueItem::Local(track) => {
-            if !start_local_playback(app, engine, track.path) {
-                return false;
+    let mut index = start;
+    let mut skipped = false;
+    while let Some(item) = app.queue.get(index).cloned() {
+        match item {
+            QueueItem::Url { url, .. } => {
+                // Se resuelve recién ahora: las URLs resueltas vencen. El aviso
+                // de un salto previo se fija DESPUÉS de arrancar, porque los
+                // flujos de reproducción limpian el error al comenzar (S13).
+                replay(app, engine, UrlReplayRequest { original_url: url });
+                app.queue_cursor = Some(index);
+                app.queue_resolving = Some(index);
+                app.queue_advance = advance;
+                if skipped {
+                    app.error = Some(QUEUE_ITEM_FAILED_MSG.to_string());
+                }
+                return true;
+            }
+            QueueItem::Local(track) => {
+                if start_local_playback(app, engine, track.path) {
+                    app.queue_cursor = Some(index);
+                    app.queue_resolving = None;
+                    if skipped {
+                        // Igual que arriba: el aviso va después del arranque.
+                        app.error = Some(QUEUE_ITEM_FAILED_MSG.to_string());
+                    }
+                    return true;
+                }
+                // No abrió: se saltea con aviso (S13).
+                skipped = true;
+                index += 1;
             }
         }
-        QueueItem::Url { url, .. } => {
-            // Se resuelve recién ahora: las URLs resueltas vencen.
-            replay(app, engine, UrlReplayRequest { original_url: url });
+    }
+    if skipped {
+        app.error = Some(QUEUE_ITEM_FAILED_MSG.to_string());
+    }
+    false
+}
+
+/// Ítem encolado que falló al resolver justo cuando le tocaba el turno (S13):
+/// se saltea con aviso visible — el cursor avanza al próximo ítem de la cola y
+/// lo intenta (los locales que tampoco abran se saltean igual, con aviso); si
+/// la cola se agota, vale el fallback de S5/S6. El ítem fallido queda en la
+/// cola y el cursor lo pasa (queda atenuado al sonar lo que sigue).
+fn skip_failed_queue_item(
+    app: &mut App,
+    engine: &mut AudioEngine,
+    replay: impl FnMut(&mut App, &mut AudioEngine, UrlReplayRequest),
+) {
+    let Some(failed) = app.queue_resolving.take() else {
+        return;
+    };
+    let mut replay = replay;
+    let advance = app.queue_advance;
+    let started = play_queue_from(app, engine, failed + 1, advance, &mut replay);
+    if !started {
+        // Cola agotada: fallback al pool. Siempre hacia la misma dirección
+        // del disparador para no volver sobre un ítem recién fallido (garantía
+        // de terminación del bucle de salto).
+        let step = match advance {
+            QueueAdvance::NaturalEnd => 1,
+            QueueAdvance::Step(step) => step,
+        };
+        if step >= 0 {
+            queue_exhausted_pool_fallback(app, engine, step, &mut replay);
+        } else {
+            queue_exhausted_pool_fallback(app, engine, -1, &mut replay);
         }
     }
-    app.queue_cursor = Some(index);
-    true
+    // El aviso queda visible aunque haya arrancado el siguiente (S13).
+    app.error = Some(QUEUE_ITEM_FAILED_MSG.to_string());
+}
+
+/// Fallback de S5/S6 cuando la cola se agotó tras saltar ítems fallidos:
+/// avanza el pool de la biblioteca/historial en `step` (`1` hacia adelante,
+/// `-1` hacia atrás). Sin hacer nada si el pool está vacío o no hay destino.
+fn queue_exhausted_pool_fallback(
+    app: &mut App,
+    engine: &mut AudioEngine,
+    step: isize,
+    replay: &mut impl FnMut(&mut App, &mut AudioEngine, UrlReplayRequest),
+) {
+    let pool = pool_positions_in_view(app);
+    if pool.is_empty() {
+        return;
+    }
+    let current = finished_item_pool_index(app, &pool);
+    let Some(target_idx) =
+        next_track(pool.len(), current, app.repeat, app.shuffle, &app.shuffle_order, step)
+    else {
+        return;
+    };
+    play_pool_target(app, engine, pool[target_idx], replay);
 }
 
 /// Borra el ítem seleccionado de la Cola y acota la selección al nuevo alto.
@@ -2221,15 +2499,15 @@ fn play_step_with(
 ) {
     // La cola manda (D1/S5/S9): `n` y `p` recorren el cursor de la cola en
     // ambos sentidos antes de caer al pool de la biblioteca/historial.
-    let queue_target = if step > 0 {
+    let queue_start = if step > 0 {
         queue_next_position(app)
     } else {
         queue_prev_position(app)
     };
-    if let Some(index) = queue_target {
-        if play_queue_position(app, engine, index, &mut replay) {
-            return;
-        }
+    if let Some(index) = queue_start
+        && play_queue_from(app, engine, index, QueueAdvance::Step(step), &mut replay)
+    {
+        return;
     }
     let pool = pool_positions_in_view(app);
     if pool.is_empty() {
@@ -2333,7 +2611,7 @@ fn handle_natural_end_with(
     // `shuffle` (S5/S9). Agotada la cola, valen las reglas de siempre.
     if let Some(index) = queue_next_position(app) {
         let local = matches!(app.queue.get(index), Some(QueueItem::Local(_)));
-        if play_queue_position(app, engine, index, &mut replay) {
+        if play_queue_from(app, engine, index, QueueAdvance::NaturalEnd, &mut replay) {
             if local {
                 // La selección sigue a la pista que arrancó, igual que
                 // cuando el "siguiente" sale de la biblioteca.
@@ -5773,6 +6051,8 @@ mod tests {
             shuffle_order: Vec::new(),
             queue: Vec::new(),
             queue_cursor: None,
+            queue_resolving: None,
+            queue_advance: QueueAdvance::NaturalEnd,
             queue_panel: false,
             queue_selected: 0,
             current_path: None,
@@ -5784,6 +6064,7 @@ mod tests {
             analyzer: SpectrumAnalyzer::new(),
             url_input: None,
             ytdlp_rx: None,
+            playlist_rx: None,
             ytdlp_request_id: 0,
             is_url: false,
             current_url: None,
@@ -9482,6 +9763,43 @@ mod tests {
         let _ = std::fs::remove_file(&t2);
     }
 
+    /// S13 extendido al fin natural: un ítem local de la cola que no abre en
+    /// el fin de pista se saltea con aviso visible y se sigue con el próximo.
+    #[test]
+    fn queue_natural_end_skips_a_broken_local_with_a_visible_warning() {
+        let (mut app, t1, t2) = queue_fallback_app();
+        let mut engine = match AudioEngine::new() {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        app.status = Status::Playing;
+        app.current_path = Some(t1);
+        let roto = if cfg!(windows) {
+            PathBuf::from(r"C:\mp3tui_no_existe.wav")
+        } else {
+            PathBuf::from("/nonexistent/mp3tui_no_existe.wav")
+        };
+        // Un ítem roto (path inexistente) y detrás una pista real.
+        app.queue.push(QueueItem::Local(track_with_path(roto, "roto")));
+        app.queue.push(QueueItem::Local(track_with_path(t2.clone(), "buena")));
+
+        handle_natural_end_with(&mut app, &mut engine, |_app, _engine, _request| {});
+
+        assert_eq!(
+            app.current_path.as_ref(),
+            Some(&t2),
+            "el fin natural se saltea el ítem roto y sigue con la siguiente"
+        );
+        assert_eq!(app.queue_cursor, Some(1), "el cursor pasa el ítem roto");
+        assert!(
+            app.error.as_deref().is_some_and(|msg| msg.contains("se saltea")),
+            "el salto deja un aviso visible: {:?}",
+            app.error
+        );
+
+        let _ = std::fs::remove_file(&t2);
+    }
+
     /// S9: sin cursor de cola todavía, `p` sigue retrocediendo el pool como
     /// hoy (la cola no tiene «anterior» desde donde está parado).
     #[test]
@@ -10093,5 +10411,419 @@ mod tests {
         expected[0] = BarCellKind::Buffered;
         expected[9] = BarCellKind::Buffered;
         assert_eq!(cells, expected, "los rangos se clampan a [0,1]");
+    }
+
+    // Seams de test para resolución y listado (no lanzan yt-dlp ni red).
+    fn empty_resolve_rx(urls: &std::cell::RefCell<Vec<String>>) -> impl FnMut(String, u64) -> Receiver<YtDlpMessage> + '_ {
+        move |url: String, _req_id: u64| {
+            urls.borrow_mut().push(url);
+            let (_tx, rx) = mpsc::channel();
+            rx
+        }
+    }
+
+    fn empty_list_rx(urls: &std::cell::RefCell<Vec<String>>) -> impl FnMut(String, u64) -> Receiver<YtDlpListMessage> + '_ {
+        move |url: String, _req_id: u64| {
+            urls.borrow_mut().push(url);
+            let (_tx, rx) = mpsc::channel();
+            rx
+        }
+    }
+
+    fn playlist_entry(title: &str, id: &str) -> crate::source::ytdlp::PlaylistEntry {
+        crate::source::ytdlp::PlaylistEntry {
+            title: title.to_string(),
+            page_url: format!("https://www.youtube.com/watch?v={id}"),
+        }
+    }
+
+    /// S12: al listar una playlist, la primera canción se resuelve enseguida y
+    /// el resto entra a la cola AL FINAL de la existente, sin tocar el cursor.
+    #[test]
+    fn playlist_submit_enqueues_rest_at_end_and_resolves_first() {
+        let Some(mut engine) = engine_or_skip() else { return };
+        let mut app = test_app();
+        app.queue.push(QueueItem::Local(track_named("previa")));
+
+        let list_calls = std::cell::RefCell::new(Vec::<String>::new());
+        let resolve_calls = std::cell::RefCell::new(Vec::<String>::new());
+        let playlist_url = "https://www.youtube.com/playlist?list=PLxyz".to_string();
+        submit_url_prompt_with_seams(
+            playlist_url.clone(),
+            &mut app,
+            &mut engine,
+            empty_resolve_rx(&resolve_calls),
+            empty_list_rx(&list_calls),
+        );
+
+        assert_eq!(app.status, Status::Resolving);
+        assert!(app.playlist_rx.is_some(), "arranca el listado de playlist");
+        assert!(app.ytdlp_rx.is_none(), "todavía no resuelve ningún video");
+        assert_eq!(
+            app.current_url.as_ref().map(|(u, _)| u.as_str()),
+            Some(playlist_url.as_str()),
+            "la sesión guarda la URL de la playlist para la historia"
+        );
+        assert_eq!(list_calls.borrow().as_slice(), &[playlist_url.as_str()]);
+
+        let mut resolve_seam = empty_resolve_rx(&resolve_calls);
+        let req_id = app.ytdlp_request_id;
+        handle_playlist_result(
+            &mut app,
+            req_id,
+            Ok(vec![
+                playlist_entry("Primera", "a"),
+                playlist_entry("Segunda", "b"),
+                playlist_entry("Tercera", "c"),
+            ]),
+            &mut resolve_seam,
+        );
+
+        // El resto va al final de la cola existente (D7), sin tocar el cursor.
+        let labels: Vec<&str> = app.queue.iter().map(QueueItem::label).collect();
+        assert_eq!(labels, vec!["previa", "Segunda", "Tercera"]);
+        assert_eq!(app.queue_cursor, None, "el cursor de la cola no cambia");
+        // La primera se resuelve ahora, con su URL de página.
+        assert!(app.ytdlp_rx.is_some());
+        assert_eq!(
+            resolve_calls.borrow().as_slice(),
+            &["https://www.youtube.com/watch?v=a"]
+        );
+        assert_eq!(app.status, Status::Resolving);
+    }
+
+    /// S12: una entrada del listado sin título (video privado/eliminado)
+    /// entra a la cola mostrando su URL de página como etiqueta.
+    #[test]
+    fn playlist_submit_uses_the_page_url_as_label_for_untitled_entries() {
+        let Some(mut engine) = engine_or_skip() else { return };
+        let mut app = test_app();
+        let resolve_calls = std::cell::RefCell::new(Vec::<String>::new());
+        let list_calls = std::cell::RefCell::new(Vec::<String>::new());
+        let playlist_url = "https://www.youtube.com/playlist?list=PLxyz".to_string();
+        submit_url_prompt_with_seams(
+            playlist_url.clone(),
+            &mut app,
+            &mut engine,
+            empty_resolve_rx(&resolve_calls),
+            empty_list_rx(&list_calls),
+        );
+        let mut resolve_seam = empty_resolve_rx(&resolve_calls);
+        let req_id = app.ytdlp_request_id;
+        handle_playlist_result(
+            &mut app,
+            req_id,
+            Ok(vec![
+                playlist_entry("Primera", "a"),
+                playlist_entry("", "b"),
+                playlist_entry("Tercera", "c"),
+            ]),
+            &mut resolve_seam,
+        );
+        let labels: Vec<&str> = app.queue.iter().map(QueueItem::label).collect();
+        assert_eq!(
+            labels,
+            vec!["https://www.youtube.com/watch?v=b", "Tercera"],
+            "el título vacío se muestra como su URL de página"
+        );
+    }
+
+    /// S12: una lista vacía avisa visiblemente y NO toca la cola ni arranca la
+    /// primera.
+    #[test]
+    fn playlist_submit_empty_list_warns_and_leaves_queue_untouched() {
+        let Some(mut engine) = engine_or_skip() else { return };
+        let mut app = test_app();
+        app.queue.push(QueueItem::Local(track_named("previa")));
+
+        let list_calls = std::cell::RefCell::new(Vec::<String>::new());
+        let resolve_calls = std::cell::RefCell::new(Vec::<String>::new());
+        submit_url_prompt_with_seams(
+            "https://www.youtube.com/playlist?list=vacia".to_string(),
+            &mut app,
+            &mut engine,
+            empty_resolve_rx(&resolve_calls),
+            empty_list_rx(&list_calls),
+        );
+
+        let mut resolve_seam = empty_resolve_rx(&resolve_calls);
+        let req_id = app.ytdlp_request_id;
+        handle_playlist_result(&mut app, req_id, Ok(vec![]), &mut resolve_seam);
+
+        assert_eq!(
+            app.queue.iter().map(QueueItem::label).collect::<Vec<_>>(),
+            vec!["previa"],
+            "la cola queda intacta"
+        );
+        assert_eq!(app.queue_cursor, None);
+        assert_eq!(app.error.as_deref(), Some(PLAYLIST_EMPTY_MSG));
+        assert!(app.ytdlp_rx.is_none(), "no arranca la primera");
+        assert_eq!(resolve_calls.borrow().len(), 0);
+    }
+
+    /// S12: un listado que falla avisa visiblemente y NO toca la cola.
+    #[test]
+    fn playlist_submit_listing_failure_warns_and_leaves_queue_untouched() {
+        let Some(mut engine) = engine_or_skip() else { return };
+        let mut app = test_app();
+        app.queue.push(QueueItem::Local(track_named("previa")));
+
+        let list_calls = std::cell::RefCell::new(Vec::<String>::new());
+        let resolve_calls = std::cell::RefCell::new(Vec::<String>::new());
+        submit_url_prompt_with_seams(
+            "https://www.youtube.com/playlist?list=PLfail".to_string(),
+            &mut app,
+            &mut engine,
+            empty_resolve_rx(&resolve_calls),
+            empty_list_rx(&list_calls),
+        );
+
+        let mut resolve_seam = empty_resolve_rx(&resolve_calls);
+        let req_id = app.ytdlp_request_id;
+        handle_playlist_result(
+            &mut app,
+            req_id,
+            Err(crate::source::ytdlp::YtDlpError::Failed("ERROR: boom".to_string())),
+            &mut resolve_seam,
+        );
+
+        assert_eq!(
+            app.queue.iter().map(QueueItem::label).collect::<Vec<_>>(),
+            vec!["previa"],
+            "la cola queda intacta"
+        );
+        assert_eq!(app.error.as_deref(), Some("error al ejecutar yt-dlp: ERROR: boom"));
+        assert!(app.ytdlp_rx.is_none());
+    }
+
+    /// S12: la resolución de la primera que falla es el error normal de URL
+    /// (aviso visible) y la cola queda con lo encolado.
+    #[test]
+    fn playlist_first_entry_resolution_failure_keeps_queued_rest() {
+        let Some(mut engine) = engine_or_skip() else { return };
+        let mut app = test_app();
+        app.queue.push(QueueItem::Local(track_named("previa")));
+
+        let list_calls = std::cell::RefCell::new(Vec::<String>::new());
+        let resolve_calls = std::cell::RefCell::new(Vec::<String>::new());
+        submit_url_prompt_with_seams(
+            "https://www.youtube.com/playlist?list=PLx".to_string(),
+            &mut app,
+            &mut engine,
+            empty_resolve_rx(&resolve_calls),
+            empty_list_rx(&list_calls),
+        );
+        let mut resolve_seam = empty_resolve_rx(&resolve_calls);
+        let req_id = app.ytdlp_request_id;
+        handle_playlist_result(
+            &mut app,
+            req_id,
+            Ok(vec![playlist_entry("Primera", "a"), playlist_entry("Segunda", "b")]),
+            &mut resolve_seam,
+        );
+
+        // La primera no resuelve: error visible y la cola queda intacta.
+        let outcome = handle_ytdlp_result(
+            &mut app,
+            req_id,
+            Err(crate::source::ytdlp::YtDlpError::Failed("ERROR: nope".to_string())),
+        );
+        assert_eq!(outcome, None);
+        assert!(app.error.is_some());
+        assert_eq!(
+            app.queue.iter().map(QueueItem::label).collect::<Vec<_>>(),
+            vec!["previa", "Segunda"],
+            "la cola queda con lo encolado"
+        );
+        assert_eq!(app.queue_resolving, None, "no es una URL encolada: sin salto");
+    }
+
+    /// S12: el arranque por argumento de CLI (boot) pasa por el mismo flujo
+    /// unificado y clasifica la playlist como tal.
+    #[test]
+    fn cli_boot_path_unifies_playlist_flow() {
+        let Some(mut engine) = engine_or_skip() else { return };
+        let mut app = test_app();
+        let list_calls = std::cell::RefCell::new(Vec::<String>::new());
+        let resolve_calls = std::cell::RefCell::new(Vec::<String>::new());
+        let playlist_url = "https://www.youtube.com/playlist?list=PLboot".to_string();
+        start_boot_url_with(
+            &mut app,
+            &mut engine,
+            playlist_url.clone(),
+            crate::source::UrlKind::Playlist,
+            empty_resolve_rx(&resolve_calls),
+            empty_list_rx(&list_calls),
+        );
+
+        assert!(app.playlist_rx.is_some());
+        assert_eq!(app.status, Status::Resolving);
+        assert_eq!(
+            app.current_url.as_ref().map(|(u, _)| u.as_str()),
+            Some(playlist_url.as_str())
+        );
+        assert_eq!(list_calls.borrow().as_slice(), &[playlist_url.as_str()]);
+
+        // Y un Page por argumento va por la resolución normal (seam unificado).
+        let mut page_app = test_app();
+        let page_resolve = std::cell::RefCell::new(Vec::<String>::new());
+        let page_list = std::cell::RefCell::new(Vec::<String>::new());
+        let page_url = "https://www.youtube.com/watch?v=xyz".to_string();
+        start_boot_url_with(
+            &mut page_app,
+            &mut engine,
+            page_url.clone(),
+            crate::source::UrlKind::Page,
+            empty_resolve_rx(&page_resolve),
+            empty_list_rx(&page_list),
+        );
+        assert!(page_app.ytdlp_rx.is_some());
+        assert!(page_app.playlist_rx.is_none());
+        assert_eq!(page_resolve.borrow().as_slice(), &[page_url.as_str()]);
+        assert!(page_list.borrow().is_empty(), "un Page no lista");
+    }
+
+    /// S12: un listado que llega fuera de pedido (request id viejo) se
+    /// descarta sin tocar la cola ni arrancar la primera.
+    #[test]
+    fn stale_playlist_listing_result_is_dropped() {
+        let (mut app, t1, _t2) = queue_fallback_app();
+        app.ytdlp_request_id = 99;
+        app.queue.push(QueueItem::Local(track_named("previa")));
+
+        let resolve_calls = std::cell::RefCell::new(Vec::<String>::new());
+        let mut resolve_seam = empty_resolve_rx(&resolve_calls);
+        handle_playlist_result(
+            &mut app,
+            98,
+            Ok(vec![playlist_entry("Uno", "1"), playlist_entry("Dos", "2")]),
+            &mut resolve_seam,
+        );
+
+        assert_eq!(
+            app.queue.iter().map(QueueItem::label).collect::<Vec<_>>(),
+            vec!["previa"],
+            "el listado viejo no encola"
+        );
+        assert_eq!(app.queue_cursor, None);
+        assert_eq!(resolve_calls.borrow().len(), 0, "no arranca la primera");
+
+        let _ = std::fs::remove_file(&t1);
+    }
+
+    /// PRESERVE: la URL de página normal sigue resolviéndose en el mismo flujo
+    /// de siempre, sin tocar la cola ni el listado.
+    #[test]
+    fn preserve_single_url_submit_resolves_without_queue_changes() {
+        let Some(mut engine) = engine_or_skip() else { return };
+        let mut app = test_app();
+        app.queue.push(QueueItem::Local(track_named("unica")));
+        let page_url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string();
+
+        let resolve_calls = std::cell::RefCell::new(Vec::<String>::new());
+        submit_url_prompt_with(page_url.clone(), &mut app, &mut engine, empty_resolve_rx(&resolve_calls));
+
+        assert!(app.ytdlp_rx.is_some(), "la página se resuelve");
+        assert!(app.playlist_rx.is_none(), "no lista");
+        assert_eq!(app.status, Status::Resolving);
+        assert_eq!(app.queue_cursor, None);
+        assert_eq!(
+            app.queue.iter().map(QueueItem::label).collect::<Vec<_>>(),
+            vec!["unica"],
+            "la cola no cambia"
+        );
+        assert_eq!(resolve_calls.borrow().as_slice(), &[page_url.as_str()]);
+    }
+
+    /// S13: una URL encolada que falla al resolver se saltea — el cursor
+    /// avanza al próximo ítem de la cola y lo intenta (erst la URL siguiente).
+    #[test]
+    fn queue_url_failure_skips_to_next_queue_item() {
+        let Some(mut engine) = engine_or_skip() else { return };
+        let mut app = test_app();
+        app.queue.push(queue_url("uno"));
+        app.queue.push(queue_url("dos"));
+
+        let mut captured: Vec<String> = Vec::new();
+        play_step_with(&mut app, &mut engine, 1, |_app, _engine, request| {
+            captured.push(request.original_url);
+        });
+        assert_eq!(captured, vec!["https://x/uno".to_string()]);
+        assert_eq!(app.queue_cursor, Some(0));
+        assert_eq!(app.queue_resolving, Some(0), "la primera está en resolución");
+
+        // La resolución de "uno" falla: se saltea, se intenta "dos" y el
+        // cursor avanza a "dos" (el ítem fallido queda detrás, atenuado).
+        skip_failed_queue_item(&mut app, &mut engine, |_app, _engine, request| {
+            captured.push(request.original_url);
+        });
+        assert_eq!(captured, vec!["https://x/uno".to_string(), "https://x/dos".to_string()]);
+        assert_eq!(app.queue_cursor, Some(1), "el cursor avanza al próximo ítem");
+        assert_eq!(app.queue_resolving, Some(1), "'dos' queda en resolución");
+        assert_eq!(app.queue.len(), 2, "el ítem fallido sigue en la cola");
+        assert_eq!(
+            app.error.as_deref(),
+            Some(QUEUE_ITEM_FAILED_MSG),
+            "aviso visible al saltear"
+        );
+    }
+
+    /// S13: cuando la cola se agota tras saltar un ítem fallido, vuelve al
+    /// fallback de S5/S6 (el pool de la biblioteca avanza como hoy).
+    #[test]
+    fn queue_url_failure_exhausted_falls_back_to_pool() {
+        let Some(mut engine) = engine_or_skip() else { return };
+        let (mut app, t1, t2) = queue_fallback_app();
+        app.current_path = Some(t1.clone());
+        app.queue.push(queue_url("unica"));
+
+        let mut captured: Vec<String> = Vec::new();
+        play_step_with(&mut app, &mut engine, 1, |_app, _engine, request| {
+            captured.push(request.original_url);
+        });
+        assert_eq!(captured, vec!["https://x/unica".to_string()]);
+        assert_eq!(app.queue_cursor, Some(0));
+        assert_eq!(app.queue_resolving, Some(0));
+
+        // La única URL encolada falla y la cola queda agotada: fallback al pool.
+        skip_failed_queue_item(&mut app, &mut engine, |_app, _engine, request| {
+            captured.push(request.original_url);
+        });
+        assert_eq!(captured.len(), 1, "no hay más ítems de cola que intentar");
+        assert_eq!(
+            app.current_path.as_ref(),
+            Some(&t2),
+            "la cola agotada cae al pool y avanza la biblioteca (S5/S6)"
+        );
+        assert_eq!(app.queue_cursor, Some(0), "el cursor queda en el ítem fallido");
+        assert_eq!(app.queue.len(), 1);
+
+        let _ = std::fs::remove_file(&t1);
+        let _ = std::fs::remove_file(&t2);
+    }
+
+    /// S13: un ítem LOCAL de la cola que no arranca se saltea igual, con
+    /// aviso, y se intenta el próximo.
+    #[test]
+    fn queue_local_failure_is_skipped_and_next_attempted() {
+        let Some(mut engine) = engine_or_skip() else { return };
+        let mut app = test_app();
+        // Ruta local inexistente: start_local_playback falla y se saltea.
+        let mut missing = track_named("no-existe");
+        missing.path = PathBuf::from(r"C:\tmp\no_existe_esta_carpeta\x.mp3");
+        app.queue.push(QueueItem::Local(missing));
+        app.queue.push(queue_url("siguiente"));
+
+        let mut captured: Vec<String> = Vec::new();
+        play_step_with(&mut app, &mut engine, 1, |_app, _engine, request| {
+            captured.push(request.original_url);
+        });
+
+        assert_eq!(
+            captured,
+            vec!["https://x/siguiente".to_string()],
+            "el local fallido se saltea y se intenta la URL siguiente"
+        );
+        assert_eq!(app.queue_cursor, Some(1), "el cursor pasa el ítem fallido");
     }
 }

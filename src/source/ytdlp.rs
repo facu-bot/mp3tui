@@ -211,6 +211,15 @@ pub struct Resolved {
     pub audio_url: String,
 }
 
+/// Entrada de una playlist listada con `--flat-playlist`: solo el título y la
+/// URL de página (sin resolver), que es lo que después se resuelve canción por
+/// canción cuando le toca el turno (las URLs de audio vencen).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaylistEntry {
+    pub title: String,
+    pub page_url: String,
+}
+
 /// Errores posibles al resolver o invocar `yt-dlp`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum YtDlpError {
@@ -336,6 +345,97 @@ pub fn resolve_with_timeout(
     }
 
     Ok(Resolved { title, audio_url })
+}
+
+/// Lista una URL de playlist con `yt-dlp --flat-playlist`: devuelve títulos y
+/// URL de página de cada entrada, sin resolver audio (S3). Es la operación
+/// barata que llena la cola; la resolución de audio se hace recién cuando a
+/// cada canción le toca sonar.
+pub fn list_flat(
+    page_url: &str,
+    runner: &dyn CommandRunner,
+) -> Result<Vec<PlaylistEntry>, YtDlpError> {
+    list_flat_with_timeout(page_url, runner, DEFAULT_TIMEOUT)
+}
+
+/// [`list_flat`] con timeout configurable.
+pub fn list_flat_with_timeout(
+    page_url: &str,
+    runner: &dyn CommandRunner,
+    timeout: Duration,
+) -> Result<Vec<PlaylistEntry>, YtDlpError> {
+    if !is_valid_http_url(page_url) {
+        return Err(YtDlpError::InvalidUrl(format!(
+            "la URL debe comenzar con http:// o https://: {page_url}"
+        )));
+    }
+
+    let args = vec![
+        "--flat-playlist".to_string(),
+        "--no-warnings".to_string(),
+        "--encoding".to_string(),
+        "utf-8".to_string(),
+        "--print".to_string(),
+        "%(title)s".to_string(),
+        "--print".to_string(),
+        "%(url)s".to_string(),
+        "--".to_string(),
+        page_url.to_string(),
+    ];
+
+    let output = match runner.run("yt-dlp", &args, timeout) {
+        Ok(out) => out,
+        Err(RunError::NotFound) => return Err(YtDlpError::NotInstalled),
+        Err(RunError::Timeout) => return Err(YtDlpError::Timeout),
+        Err(RunError::Io(err)) => return Err(YtDlpError::Failed(err)),
+    };
+
+    let stderr_str = String::from_utf8_lossy(&output.stderr);
+    if output.status_code != Some(0) {
+        let stdout_str = String::from_utf8_lossy(&output.stdout);
+        let first_err_line = stderr_str
+            .lines()
+            .map(|l| l.trim())
+            .find(|l| !l.is_empty())
+            .or_else(|| stdout_str.lines().map(|l| l.trim()).find(|l| !l.is_empty()))
+            .unwrap_or("falló el listado de la playlist")
+            .to_string();
+        return Err(YtDlpError::Failed(first_err_line));
+    }
+
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    let mut lines: Vec<&str> = stdout_str
+        .lines()
+        .map(|l| l.trim())
+        .collect();
+    // yt-dlp cierra cada entrada con un salto de línea: la última línea tras
+    // el split queda vacía y se descarta. Las líneas vacías INTERMEDIAS son
+    // títulos vacíos reales (video privado/eliminado en flat mode) y se
+    // conservan para no desalinear el pareo título/URL de página.
+    if lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    }
+
+    // La salida viene en pares título/URL de página: `%(title)s` y `%(url)s`.
+    if lines.len() % 2 != 0 {
+        return Err(YtDlpError::BadOutput(
+            "se esperaban pares de título y URL de página en la salida de yt-dlp".to_string(),
+        ));
+    }
+
+    let mut entries = Vec::with_capacity(lines.len() / 2);
+    for pair in lines.chunks(2) {
+        let title = pair[0].to_string();
+        let page_url = pair[1].to_string();
+        if !is_valid_http_url(&page_url) {
+            return Err(YtDlpError::BadOutput(format!(
+                "la URL de página extraída no comienza con http:// ni https://: {page_url}"
+            )));
+        }
+        entries.push(PlaylistEntry { title, page_url });
+    }
+
+    Ok(entries)
 }
 
 #[cfg(test)]
@@ -676,6 +776,165 @@ mod tests {
             elapsed < Duration::from_secs(2),
             "el join post-exit debe estar acotado a < 2 s, tardó {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn test_list_flat_exact_args_passed() {
+        let fake = FakeRunner::new(Ok(CommandOutput {
+            status_code: Some(0),
+            stdout: b"Cancion Uno\nhttps://www.youtube.com/watch?v=uno\n".to_vec(),
+            stderr: Vec::new(),
+        }));
+        let res = list_flat("https://www.youtube.com/playlist?list=PL123", &fake);
+        assert!(res.is_ok(), "list_flat debe tener éxito: {res:?}");
+
+        let calls = fake.calls();
+        assert_eq!(calls.len(), 1);
+        let (prog, args, _timeout) = &calls[0];
+        assert_eq!(prog, "yt-dlp");
+        assert_eq!(
+            args,
+            &[
+                "--flat-playlist".to_string(),
+                "--no-warnings".to_string(),
+                "--encoding".to_string(),
+                "utf-8".to_string(),
+                "--print".to_string(),
+                "%(title)s".to_string(),
+                "--print".to_string(),
+                "%(url)s".to_string(),
+                "--".to_string(),
+                "https://www.youtube.com/playlist?list=PL123".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_list_flat_parses_title_and_page_url_pairs() {
+        let fake = FakeRunner::new(Ok(CommandOutput {
+            status_code: Some(0),
+            stdout: b"Uno\nhttps://www.youtube.com/watch?v=uno\nDos\nhttps://www.youtube.com/watch?v=dos\n".to_vec(),
+            stderr: Vec::new(),
+        }));
+        let entries = list_flat("https://www.youtube.com/playlist?list=PL123", &fake)
+            .expect("lista válida");
+        assert_eq!(
+            entries,
+            vec![
+                PlaylistEntry {
+                    title: "Uno".to_string(),
+                    page_url: "https://www.youtube.com/watch?v=uno".to_string(),
+                },
+                PlaylistEntry {
+                    title: "Dos".to_string(),
+                    page_url: "https://www.youtube.com/watch?v=dos".to_string(),
+                },
+            ]
+        );
+    }
+
+    /// S12: una entrada sin título (video privado/eliminado en flat mode) no
+    /// desalinea el pareo título/URL: la línea vacía del medio se conserva
+    /// como título vacío y solo se descarta el salto de línea final.
+    #[test]
+    fn test_list_flat_keeps_empty_title_entries_aligned() {
+        let fake = FakeRunner::new(Ok(CommandOutput {
+            status_code: Some(0),
+            stdout: b"\nhttps://www.youtube.com/watch?v=uno\nDos\nhttps://www.youtube.com/watch?v=dos\n"
+                .to_vec(),
+            stderr: Vec::new(),
+        }));
+        let entries = list_flat("https://www.youtube.com/playlist?list=PL123", &fake)
+            .expect("la lista con título vacío sigue parseando");
+        assert_eq!(
+            entries,
+            vec![
+                PlaylistEntry {
+                    title: String::new(),
+                    page_url: "https://www.youtube.com/watch?v=uno".to_string(),
+                },
+                PlaylistEntry {
+                    title: "Dos".to_string(),
+                    page_url: "https://www.youtube.com/watch?v=dos".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_list_flat_empty_output_is_empty_vec() {
+        let fake = FakeRunner::new(Ok(CommandOutput {
+            status_code: Some(0),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        }));
+        let entries = list_flat("https://www.youtube.com/playlist?list=vacia", &fake)
+            .expect("lista vacía es válida");
+        assert!(entries.is_empty(), "una salida vacía no tiene entradas: {entries:?}");
+    }
+
+    #[test]
+    fn test_list_flat_rejects_invalid_url_without_running() {
+        let fake = FakeRunner::new(Ok(CommandOutput {
+            status_code: Some(0),
+            stdout: b"Uno\nhttps://www.youtube.com/watch?v=uno\n".to_vec(),
+            stderr: Vec::new(),
+        }));
+        let res = list_flat("ftp://example.com/playlist", &fake);
+        assert!(
+            matches!(res, Err(YtDlpError::InvalidUrl(_))),
+            "una URL no http debe fallar: {res:?}"
+        );
+        assert_eq!(fake.calls().len(), 0, "no se invoca yt-dlp con URL inválida");
+    }
+
+    #[test]
+    fn test_list_flat_output_with_non_http_url_is_bad_output() {
+        let fake = FakeRunner::new(Ok(CommandOutput {
+            status_code: Some(0),
+            stdout: b"Uno\nnot-a-url\n".to_vec(),
+            stderr: Vec::new(),
+        }));
+        let res = list_flat("https://www.youtube.com/playlist?list=PL123", &fake);
+        assert!(
+            matches!(res, Err(YtDlpError::BadOutput(_))),
+            "una URL de página no http es salida inválida: {res:?}"
+        );
+    }
+
+    #[test]
+    fn test_list_flat_odd_line_count_is_bad_output() {
+        let fake = FakeRunner::new(Ok(CommandOutput {
+            status_code: Some(0),
+            stdout: b"Solo un titulo sin url\n".to_vec(),
+            stderr: Vec::new(),
+        }));
+        let res = list_flat("https://www.youtube.com/playlist?list=PL123", &fake);
+        assert!(
+            matches!(res, Err(YtDlpError::BadOutput(_))),
+            "un número impar de líneas es salida inválida: {res:?}"
+        );
+    }
+
+    #[test]
+    fn test_list_flat_non_zero_exit_returns_failed() {
+        let fake = FakeRunner::new(Ok(CommandOutput {
+            status_code: Some(1),
+            stdout: Vec::new(),
+            stderr: b"ERROR: Playlist unavailable\n".to_vec(),
+        }));
+        let err = list_flat("https://www.youtube.com/playlist?list=PL123", &fake).unwrap_err();
+        assert_eq!(
+            err,
+            YtDlpError::Failed("ERROR: Playlist unavailable".to_string())
+        );
+    }
+
+    #[test]
+    fn test_list_flat_missing_binary_returns_not_installed() {
+        let fake = FakeRunner::new(Err(RunError::NotFound));
+        let err = list_flat("https://www.youtube.com/playlist?list=PL123", &fake).unwrap_err();
+        assert_eq!(err, YtDlpError::NotInstalled);
     }
 
     #[test]

@@ -68,7 +68,7 @@ mp3tui "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 | `s` / `r` | Aleatorio / repetir |
 | `Tab` | Biblioteca (panel lateral) |
 | `b` | Buscar |
-| `u` | Reproducir una URL |
+| `u` | Reproducir una URL (una URL de playlist se lista y encola el resto) |
 | `a` | Encolar la pista seleccionada de la Biblioteca |
 | `c` | Alternar el panel lateral entre Biblioteca y Cola |
 | `d` | Borrar el ítem seleccionado de la Cola |
@@ -89,3 +89,25 @@ normal de la biblioteca (con `repeat` y shuffle como siempre).
 Mientras hay algo después del cursor, el panel del reproductor muestra la
 próxima pista (una línea `Siguiente: …` y, si queda más de una, un `(+N)` con
 cuántas faltan detrás). Sin nada por delante esa línea no aparece.
+
+### Playlists de YouTube
+
+Si la URL que das (por el prompt `u` o como argumento `mp3tui "URL"`) es una
+playlist —tiene `list=` en la query o su path es `/playlist`—, se lista con
+`yt-dlp --flat-playlist` (solo títulos, sin bajar audio). La primera canción se
+reproduce enseguida y el resto entra a la cola **al final** de la existente;
+cada canción se resuelve **recién cuando le toca su turno** (las URLs de audio
+directo que devuelve yt-dlp vencen, así que las playlists largas se aguantan
+sin romperse). El historial guarda la URL de la playlist cuando suena su
+primera canción y la URL de cada canción cuando suena desde la cola.
+
+Si la playlist sale vacía o el listado falla, se muestra un aviso visible y la
+cola no se toca.
+
+### Fallo de un ítem encolado
+
+Si una URL encolada no se puede resolver cuando llega su turno (o una pista
+local encolada no abre), el ítem se **saltea con un aviso** en la línea de
+estado: el cursor avanza al próximo ítem de la cola y lo intenta. Si la cola se
+agota, se vuelve al recorrido normal de la biblioteca/historial. El ítem
+fallido queda en la cola, atenuado, y el cursor lo pasa.
