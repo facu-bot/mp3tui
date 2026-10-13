@@ -2304,23 +2304,30 @@ fn refresh_next_up(app: &mut App) {
         return;
     }
     let current = finished_item_pool_index(app, &pool);
-    let Some(target_idx) = next_track(
+    // El siguiente estricto (respeta repeat/shuffle: con repeat Off y en la
+    // última pista no hay nada que suene después).
+    let target = next_track(
         pool.len(),
         current,
         app.repeat,
         app.shuffle,
         &app.shuffle_order,
         1,
-    ) else {
-        app.next_up = None;
-        return;
-    };
-    let label = match app.view[pool[target_idx]] {
-        ViewItem::Track(library_index) => {
-            library_get(app, library_index).map(|track| track.title.clone())
+    )
+    .map(|target_idx| pool[target_idx])
+    .or_else(|| {
+        // La franja NO debe desaparecer mientras suena algo y el pool tiene
+        // ítems: en el borde (repeat Off, última pista) muestra el primero
+        // del recorrido como próximo del panel (el avance real de `n` sigue
+        // respetando repeat).
+        pool.first().copied()
+    });
+    let label = match target.and_then(|view_pos| app.view.get(view_pos)) {
+        Some(ViewItem::Track(library_index)) => {
+            library_get(app, *library_index).map(|track| track.title.clone())
         }
-        ViewItem::History(history_index) => {
-            app.history.get(history_index).map(|entry| {
+        Some(ViewItem::History(history_index)) => {
+            app.history.get(*history_index).map(|entry| {
                 if entry.title.is_empty() {
                     entry.url.clone()
                 } else {
@@ -2328,6 +2335,7 @@ fn refresh_next_up(app: &mut App) {
                 }
             })
         }
+        None => None,
     };
     app.next_up = Some(label.unwrap_or_default());
 }
@@ -3456,12 +3464,15 @@ fn render_library(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
     let inner = block.inner(area);
     // La sección «Próxima canción» (T1) va DENTRO del rectángulo del panel,
     // en su último tramo: lista → separador → etiqueta → título (marquee), y
-    // el borde de abajo del panel cierra todo el bloque. Sin próximo no
-    // agrega ruido, igual que la línea del reproductor.
-    let has_next = matches!(
-        &app.next_up,
-        Some(title) if !title.is_empty()
-    );
+    // el borde de abajo del panel cierra todo el bloque. Solo existe en el
+    // PANEL lateral (sesión de audio con Tab abierto): en el explorador a
+    // pantalla completa sin player no hay panel y no se dibuja. Sin próximo
+    // no agrega ruido, igual que la línea del reproductor.
+    let has_next = app.has_player
+        && matches!(
+            &app.next_up,
+            Some(title) if !title.is_empty()
+        );
     let list_area = if has_next {
         let split = Layout::default()
             .direction(Direction::Vertical)
@@ -11315,6 +11326,48 @@ mod tests {
         );
     }
 
+    /// Fix de T1: la franja NO desaparece mientras suena algo con pool cargado
+    /// —en el borde del recorrido (repeat Off, última pista) muestra el
+    /// primero del pool— y en el explorador a pantalla completa sin player no
+    /// se dibuja: la sección vive sólo en el panel de Tab.
+    #[test]
+    fn next_up_wraps_at_the_list_end_and_is_absent_in_browser_mode() {
+        let Some(engine) = engine_or_skip() else { return };
+
+        // Última pista sonando con repeat Off: el próximo del panel = el
+        // primero del pool (el avance real de `n` sigue respetando repeat).
+        let mut app = library_with_three();
+        app.mode = Mode::Player;
+        app.has_player = true;
+        app.explorer_open = true;
+        app.status = Status::Playing;
+        app.current_path = Some(PathBuf::from(r"C:\x\gamma.mp3"));
+        app.track_label = "gamma.mp3".to_string();
+        refresh_next_up(&mut app);
+        assert_eq!(
+            app.next_up.as_deref(),
+            Some("alpha"),
+            "en el borde la franja muestra el primero del pool"
+        );
+
+        // Modo Browser (sin sesión de audio): el pool existe pero la franja no
+        // se dibuja (solo vive en el panel lateral de Tab).
+        let mut app = library_with_three();
+        app.mode = Mode::Browser;
+        refresh_next_up(&mut app);
+        assert!(app.next_up.is_some(), "hay próximo en el pool");
+        let backend = ratatui::backend::TestBackend::new(100, 40);
+        let mut terminal = ratatui::Terminal::new(backend).expect("term");
+        terminal
+            .draw(|frame| render(frame, &app, &engine))
+            .expect("draw");
+        let text = player_screen_text(&terminal.backend().buffer().clone());
+        assert!(
+            !text.contains("Próxima canción"),
+            "sin player la franja no aparece (solo en el panel de Tab)"
+        );
+    }
+
     /// S13: una URL encolada que falla al resolver se saltea — el cursor
     /// avanza al próximo ítem de la cola y lo intenta (erst la URL siguiente).
     #[test]
@@ -11406,4 +11459,5 @@ mod tests {
         );
         assert_eq!(app.queue_cursor, Some(1), "el cursor pasa el ítem fallido");
     }
+
 }
