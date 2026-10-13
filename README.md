@@ -10,7 +10,13 @@ Se maneja por teclado.
 ## Demo
 
 <p align="center">
-  <video src="assets/demo-mp3tui.mp4" controls width="820" alt="Demo de mp3tui"></video>
+  <video controls muted loop width="820" src="https://raw.githubusercontent.com/facu-bot/mp3tui-prototipo/main/assets/demo-mp3tui.mp4">
+    <a href="assets/demo-mp3tui.mp4">▶ Ver la demo en video</a>
+  </video>
+</p>
+
+<p align="center">
+  <a href="assets/demo-mp3tui.mp4">▶ Ver / descargar la demo (demo-mp3tui.mp4)</a>
 </p>
 
 <p align="center">
