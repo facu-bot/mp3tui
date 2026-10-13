@@ -63,6 +63,33 @@ mp3tui "cancion.mp3"
 mp3tui "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 ```
 
+## Estructura del proyecto
+
+Cada módulo tiene su dominio y sus funciones; la interfaz se divide por
+responsabilidad para que sea fácil de mantener.
+
+```
+src/
+├── main.rs                 # punto de entrada
+├── ui/                     # interfaz en terminal
+│   ├── mod.rs              #   App, ciclo de eventos y dispatch
+│   ├── render.rs           #   dibujado (player, panel, visualizador, barras)
+│   ├── queue.rs            #   cola de reproducción y flujos de URL
+│   ├── keys.rs             #   atajos, menús y prompt
+│   ├── mouse.rs            #   clics y zonas interactivas
+│   └── tests_common.rs     #   helpers de los tests
+├── source/                 # orígenes de audio
+│   ├── http_stream.rs      #   streaming por HTTP con rangos
+│   └── ytdlp.rs            #   resolución de links (YouTube, etc.)
+├── visualizer/             # analizador de espectro y arte del modo miku
+├── audio/                  # motor de audio
+├── playlist/               # biblioteca local (escaneo y tags)
+├── config.rs               # config.toml, temas y teclas
+├── playback.rs             # lógica de reproducción (repeat, shuffle)
+├── history.rs              # historial de URLs
+└── runtime.rs              # estado activo compartido
+```
+
 ## Información
 
 Proyecto open source: el código completo vive en este repositorio. Si
