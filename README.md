@@ -32,8 +32,8 @@ Se maneja por teclado.
 ## Clonar y correr
 
 ```sh
-git clone https://github.com/facu-bot/mp3tui-prototipo.git
-cd mp3tui-prototipo
+git clone https://github.com/facu-bot/mp3tui.git
+cd mp3tui
 
 cargo run "cancion.mp3"        # archivo local
 cargo run "C:/Musica"          # carpeta con la biblioteca
