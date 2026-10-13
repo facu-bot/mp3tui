@@ -75,36 +75,29 @@ const DANCE_MIN_SWITCH_FRAMES: u32 = 3;
 /// Sonando sin beat: la bailarina avanza igual por timer (respiración) cada
 /// estos frames, para que «baile» aunque le falte el bajo.
 const DANCE_IDLE_FRAMES: u32 = 20;
-/// En pausa (no suena): avanza solo por timer, más lento.
-const DANCE_PAUSE_FRAMES: u32 = 40;
 
 /// Paso puro del baile Miku (testeable): la pose avanza cuando la energía de
 /// graves pega —el nivel del frame supera el 20% + piso sobre una envolvente
 /// con decay— con un enfriamiento mínimo de frames; sin beat, vale el timer
-/// (respiración): `DANCE_IDLE_FRAMES` sonando, `DANCE_PAUSE_FRAMES` en pausa.
-/// Devuelve la nueva pose, los frames desde el último salto y si fue un beat.
+/// de respiración (`DANCE_IDLE_FRAMES`). Devuelve la nueva pose, los frames
+/// desde el último salto y si fue un beat. En pausa el baile NO avanza: eso
+/// lo decide `tick_dance` (congela todo el estado cuando no suena).
 fn next_dance_pose(
     current: usize,
     pose_count: usize,
     bass: f32,
     envelope: &mut f32,
     frames_since_switch: u32,
-    playing: bool,
 ) -> (usize, u32, bool) {
     let prev = *envelope;
     let frames = frames_since_switch.saturating_add(1);
     let beat =
-        playing && frames >= DANCE_MIN_SWITCH_FRAMES && bass > prev * 1.2 + 0.02 && bass > 0.02;
+        frames >= DANCE_MIN_SWITCH_FRAMES && bass > prev * 1.2 + 0.02 && bass > 0.02;
     // Envolvente con decay lento: un pulso de graves razonable la supera; el
     // silencio la baja hasta el piso, de modo que el próximo golpe vuelve a
     // contar como beat.
     *envelope = prev.mul_add(0.85, bass * 0.15);
-    let idle = if playing {
-        DANCE_IDLE_FRAMES
-    } else {
-        DANCE_PAUSE_FRAMES
-    };
-    if beat || frames >= idle {
+    if beat || frames >= DANCE_IDLE_FRAMES {
         (((current + 1) % pose_count.max(1)), 0, beat)
     } else {
         (current, frames, false)
@@ -190,9 +183,13 @@ impl SpectrumAnalyzer {
 
     /// Avanza la pose de la bailarina (modo `miku`) un paso por frame: un
     /// pulso de graves salta a la siguiente pose (con enfriamiento), y sin
-    /// beat vale el timer — sonando o en pausa. Se llama en el loop de UI,
-    /// después de `analyze()`.
+    /// beat vale el timer de respiración. Se llama en el loop de UI, después
+    /// de `analyze()`. EN PAUSA el baile se congela: ni la pose ni el frame
+    /// del arte avanzan hasta reanudar (`playing` vuelve a ser true).
     pub fn tick_dance(&mut self, playing: bool) {
+        if !playing {
+            return;
+        }
         let bass_bands = 4.min(NUM_BANDS);
         let bass = self.bands[..bass_bands].iter().sum::<f32>() / bass_bands as f32;
         let (pose, frames, _beat) = next_dance_pose(
@@ -201,7 +198,6 @@ impl SpectrumAnalyzer {
             bass,
             &mut self.dance_envelope,
             self.dance_frames,
-            playing,
         );
         self.dance_pose = pose;
         self.dance_frames = frames;
@@ -908,53 +904,81 @@ mod tests {
     fn dance_pose_advances_on_a_bass_pulse_with_cooldown_and_wraps() {
         let mut env = 0.0;
         // Pulso fuerte sobre el silencio: salta.
-        let (pose, frames, beat) = next_dance_pose(0, 4, 0.6, &mut env, 3, true);
+        let (pose, frames, beat) = next_dance_pose(0, 4, 0.6, &mut env, 3);
         assert_eq!(pose, 1, "el primer pulso avanza");
         assert_eq!(frames, 0, "se reinicia el enfriamiento");
         assert!(beat);
 
         // Valle: no hay beat ni timer aún.
-        let (pose, frames, beat) = next_dance_pose(1, 4, 0.1, &mut env, 1, true);
+        let (pose, frames, beat) = next_dance_pose(1, 4, 0.1, &mut env, 1);
         assert_eq!(pose, 1);
         assert_eq!(frames, 2);
         assert!(!beat);
 
         // Segundo pulso dentro del enfriamiento (frames < mínimo): no salta.
-        let (pose, frames, beat) = next_dance_pose(1, 4, 0.7, &mut env, 1, true);
+        let (pose, frames, beat) = next_dance_pose(1, 4, 0.7, &mut env, 1);
         assert_eq!(pose, 1, "enfriamiento: todavía no");
         assert_eq!(frames, 2);
         assert!(!beat);
 
         // Pulso siguiente con el enfriamiento cumplido: salta de nuevo.
-        let (pose, frames, beat) = next_dance_pose(1, 4, 0.7, &mut env, 3, true);
+        let (pose, frames, beat) = next_dance_pose(1, 4, 0.7, &mut env, 3);
         assert_eq!(pose, 2);
         assert_eq!(frames, 0);
         assert!(beat);
 
         // Envuelve: la última pose vuelve a la primera.
-        let (pose, _, _) = next_dance_pose(3, 4, 0.7, &mut env, 3, true);
+        let (pose, _, _) = next_dance_pose(3, 4, 0.7, &mut env, 3);
         assert_eq!(pose, 0, "el baile vuelve a la pose inicial");
     }
 
     #[test]
-    fn dance_pose_advances_by_timer_when_playing_and_paused() {
+    fn dance_pose_advances_by_timer_when_playing() {
         // Sonando sin beat: a los DANCE_IDLE_FRAMES avanza por timer.
         let mut env = 0.0;
-        let (pose, frames, _) = next_dance_pose(2, 4, 0.0, &mut env, DANCE_IDLE_FRAMES - 2, true);
+        let (pose, frames, _) =
+            next_dance_pose(2, 4, 0.0, &mut env, DANCE_IDLE_FRAMES - 2);
         assert_eq!(pose, 2, "todavía no llega el timer");
         assert_eq!(frames, DANCE_IDLE_FRAMES - 1);
         let (pose, frames, beat) =
-            next_dance_pose(2, 4, 0.0, &mut env, DANCE_IDLE_FRAMES - 1, true);
+            next_dance_pose(2, 4, 0.0, &mut env, DANCE_IDLE_FRAMES - 1);
         assert_eq!(pose, 3, "sin beat, el timer baila igual");
         assert_eq!(frames, 0);
         assert!(!beat);
+    }
 
-        // En pausa: los beats no cuentan, solo el timer más lento.
-        let mut env = 0.0;
-        let (pose, _, _) = next_dance_pose(0, 4, 0.9, &mut env, 3, false);
-        assert_eq!(pose, 0, "en pausa un pulso de graves no es un beat");
-        let (pose, _, _) = next_dance_pose(0, 4, 0.0, &mut env, DANCE_PAUSE_FRAMES, false);
-        assert_eq!(pose, 1, "en pausa baila por timer (más lento)");
+    #[test]
+    fn tick_dance_freezes_the_dancer_while_paused() {
+        let mut analyzer = SpectrumAnalyzer::new();
+        // Un pulso real mueve la pose y el reloj (frame del arte).
+        analyzer.bands[0] = 0.9;
+        for _ in 0..DANCE_MIN_SWITCH_FRAMES {
+            analyzer.tick_dance(true);
+        }
+        assert_ne!(analyzer.dance_pose(), 0, "sonando baila");
+        let clock_playing = analyzer.dance_clock();
+        let pose_playing = analyzer.dance_pose();
+
+        // En pausa: ni pose ni frame avanzan, por más ticks que pasen
+        // (la bailarina se congela hasta reanudar).
+        for _ in 0..DANCE_IDLE_FRAMES * 2 {
+            analyzer.tick_dance(false);
+        }
+        assert_eq!(
+            analyzer.dance_pose(),
+            pose_playing,
+            "pausado: la pose se congela"
+        );
+        assert_eq!(
+            analyzer.dance_clock(),
+            clock_playing,
+            "pausado: el frame del arte no avanza"
+        );
+
+        // Al reanudar, el baile retoma desde donde quedó.
+        analyzer.bands[0] = 0.9;
+        analyzer.tick_dance(true);
+        assert_ne!(analyzer.dance_clock(), clock_playing, "reanudó el baile");
     }
 
     #[test]
@@ -972,14 +996,13 @@ mod tests {
         assert_eq!(analyzer.dance_pose(), 1, "el pulso avanzó la pose");
         assert_eq!(analyzer.dance_frames, 0);
 
-        // En pausa no hay beats: la pose queda quieta hasta el timer.
-        for _ in 0..DANCE_PAUSE_FRAMES {
+        // En pausa la pose se congela (lo cubre
+        // `tick_dance_freezes_the_dancer_while_paused`); acá solo se confirma
+        // que el estado queda igual tras ticks de pausa.
+        let frozen = analyzer.dance_pose();
+        for _ in 0..DANCE_IDLE_FRAMES * 2 {
             analyzer.tick_dance(false);
         }
-        assert_eq!(
-            analyzer.dance_pose(),
-            2,
-            "en pausa el timer (más lento) sigue bailando"
-        );
+        assert_eq!(analyzer.dance_pose(), frozen, "pausado: no avanza");
     }
 }
