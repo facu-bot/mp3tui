@@ -356,6 +356,12 @@ struct App {
     /// Selección dentro de la Cola (independiente de `selected`, la de la
     /// Biblioteca): cada lista conserva la suya al alternar.
     queue_selected: usize,
+    /// «Próximo» a tocar para la franja del panel (S3): el ítem que sigue al
+    /// cursor de la cola, y con la cola agotada el siguiente del pool
+    /// (biblioteca/historial con shuffle); `None` la oculta.
+    next_up: Option<String>,
+    /// Reloj de frames del render: alimenta el marquee de la franja.
+    ui_frame: u64,
     current_path: Option<PathBuf>,
     has_player: bool,
     track_label: String,
@@ -966,6 +972,8 @@ pub fn run(engine: &mut AudioEngine, start: StartMode) -> io::Result<()> {
         queue_advance: QueueAdvance::NaturalEnd,
         queue_panel: false,
         queue_selected: 0,
+        next_up: None,
+        ui_frame: 0,
         current_path,
         has_player,
         track_label,
@@ -1103,6 +1111,10 @@ fn event_loop(tui: &mut Tui, app: &mut App, engine: &mut AudioEngine) -> io::Res
         // Bailarina (modo `miku`): la pose avanza por frame según la energía
         // de graves (o por timer en pausa).
         app.analyzer.tick_dance(app.status == Status::Playing);
+        // Reloj del render y franja «Próxima canción» (T1): se actualizan por
+        // frame para el marquee y para no calcular el próximo en el draw.
+        app.ui_frame = app.ui_frame.wrapping_add(1);
+        refresh_next_up(app);
 
         tui.terminal.draw(|frame| render(frame, app, engine))?;
 
@@ -2276,6 +2288,50 @@ fn queue_prev_position(app: &App) -> Option<usize> {
     app.queue_cursor?.checked_sub(1)
 }
 
+/// El «próximo» de la franja del panel lateral (T1/S3): el ítem que sigue al
+/// cursor de la cola; con la cola agotada (o vacía), el siguiente que sonaría
+/// del pool de la biblioteca/historial con repeat/shuffle como están; sin
+/// nada → `None` (la franja no aparece). Se refresca una vez por frame en el
+/// loop, para que el draw solo lea.
+fn refresh_next_up(app: &mut App) {
+    if let Some(index) = queue_next_position(app) {
+        app.next_up = Some(app.queue[index].label().to_string());
+        return;
+    }
+    let pool = pool_positions_in_view(app);
+    if pool.is_empty() {
+        app.next_up = None;
+        return;
+    }
+    let current = finished_item_pool_index(app, &pool);
+    let Some(target_idx) = next_track(
+        pool.len(),
+        current,
+        app.repeat,
+        app.shuffle,
+        &app.shuffle_order,
+        1,
+    ) else {
+        app.next_up = None;
+        return;
+    };
+    let label = match app.view[pool[target_idx]] {
+        ViewItem::Track(library_index) => {
+            library_get(app, library_index).map(|track| track.title.clone())
+        }
+        ViewItem::History(history_index) => {
+            app.history.get(history_index).map(|entry| {
+                if entry.title.is_empty() {
+                    entry.url.clone()
+                } else {
+                    entry.title.clone()
+                }
+            })
+        }
+    };
+    app.next_up = Some(label.unwrap_or_default());
+}
+
 /// Reproduce desde `start` hacia adelante de la cola saltando los ítems
 /// locales que no abren (S13): aviso visible y se sigue con el próximo. Si el
 /// ítem es una URL se arranca su resolución (asíncrona, esperando su turno,
@@ -3400,9 +3456,36 @@ fn render_library(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    // Franja «Próxima canción» (T1/S3): reserva las últimas 3 filas del panel
+    // cuando hay próximo y deja el resto a la lista. Sin próximo no agrega
+    // ruido, igual que la línea del reproductor.
+    let marquee_budget = match &app.next_up {
+        Some(title) if !title.is_empty() => 3u16,
+        _ => 0,
+    };
+    let list_area = if marquee_budget > 0 {
+        let split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(1),
+                Constraint::Length(marquee_budget),
+            ])
+            .split(inner);
+        let (list_area, marquee_area) = (split[0], split[1]);
+        render_next_up_marquee(
+            frame,
+            marquee_area,
+            app.next_up.as_deref().unwrap_or_default(),
+            app.ui_frame,
+        );
+        list_area
+    } else {
+        inner
+    };
+
     if queue_view {
-        let lines = queue_rows(app, inner.width, inner.height);
-        frame.render_widget(Paragraph::new(lines), inner);
+        let lines = queue_rows(app, list_area.width, list_area.height);
+        frame.render_widget(Paragraph::new(lines), list_area);
         return;
     }
 
@@ -3414,7 +3497,7 @@ fn render_library(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
                 Style::default().fg(theme().accent),
             ))
             .alignment(Alignment::Center),
-            inner,
+            list_area,
         );
         return;
     };
@@ -3431,12 +3514,40 @@ fn render_library(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
                 Style::default().fg(theme().accent),
             )
         };
-        frame.render_widget(Paragraph::new(Line::styled(message, style)), inner);
+        frame.render_widget(Paragraph::new(Line::styled(message, style)), list_area);
         return;
     }
 
-    let lines = library_rows(app, inner.width, inner.height);
-    frame.render_widget(Paragraph::new(lines), inner);
+    let lines = library_rows(app, list_area.width, list_area.height);
+    frame.render_widget(Paragraph::new(lines), list_area);
+}
+
+/// Franja del pie del panel lateral: `--- próxima canción ---`, el título en
+/// marquee y el cierre (T1/S1). Ocupa `area` (3 filas) y recorta las líneas
+/// fijas al ancho disponible.
+fn render_next_up_marquee(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    title: &str,
+    frame_clock: u64,
+) {
+    let width = area.width as usize;
+    let fixed = |text: &str| {
+        let value: String = text.chars().take(width).collect();
+        Line::from(Span::styled(value, Style::default().fg(theme().dim)))
+    };
+    let title_line = Line::from(Span::styled(
+        marquee_window(title, width, frame_clock as usize),
+        Style::default().fg(theme().text),
+    ));
+    frame.render_widget(
+        Paragraph::new(vec![
+            fixed("--- próxima canción ---"),
+            title_line,
+            fixed("------------------------"),
+        ]),
+        area,
+    );
 }
 
 fn item_group<'a>(app: &'a App, item: &ViewItem) -> Option<&'a str> {
@@ -3634,6 +3745,22 @@ fn library_rows(app: &App, width: u16, height: u16) -> Vec<Line<'static>> {
         }
     }
     lines
+}
+
+/// Ventana de marquee para un título de `width` celdas (T1/D2): si entra,
+/// pegado a la izquierda (con padding a `width`); si no, recorre una ventana
+/// de `width` celdas sobre `título + separador + título` en bucle continuo,
+/// avanzando un carácter por frame.
+fn marquee_window(text: &str, width: usize, frame: usize) -> String {
+    let width = width.max(1);
+    let chars = text.chars().count();
+    if chars <= width {
+        return format!("{text:<width$}");
+    }
+    let sep = "   ";
+    let cycle: Vec<char> = format!("{text}{sep}{text}{sep}").chars().collect();
+    let step = frame % (chars + sep.chars().count());
+    cycle.iter().skip(step).take(width).collect()
 }
 
 /// Estado de una fila de la cola respecto del cursor de reproducción (S9): lo
@@ -6188,6 +6315,8 @@ mod tests {
             queue_advance: QueueAdvance::NaturalEnd,
             queue_panel: false,
             queue_selected: 0,
+            next_up: None,
+            ui_frame: 0,
             current_path: None,
             has_player: false,
             track_label: String::new(),
@@ -11105,6 +11234,87 @@ mod tests {
         let wide_text: String = wide.spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(buttons_wide.len(), 5, "con ancho 60 entran los cinco botones");
         assert!(wide_text.contains("repetir: todo"), "{wide_text:?}");
+    }
+
+    /// T1/D2: el marquee de un título que entra lo deja pegado a la izquierda
+    /// con padding; el que no entra recorre una ventana en bucle, avanzando
+    /// un carácter por frame.
+    #[test]
+    fn marquee_window_fits_short_titles_and_cycles_long_ones() {
+        assert_eq!(marquee_window("corto", 10, 0), "corto     ", "entra y va a la izquierda");
+        assert_eq!(
+            marquee_window("corto", 10, 42),
+            "corto     ",
+            "los frames no mueven un título que entra"
+        );
+
+        let title = "una canción super larga";
+        let width = 8;
+        let zero = marquee_window(title, width, 0);
+        assert_eq!(zero.chars().count(), width, "ventana de ancho exacto");
+        let one = marquee_window(title, width, 1);
+        assert_ne!(
+            one, zero,
+            "el frame avanza la ventana un carácter"
+        );
+        let cycle = title.chars().count() + 3; // título + separador
+        assert_eq!(
+            marquee_window(title, width, cycle),
+            zero,
+            "el bucle envuelve a la posición inicial"
+        );
+        assert_eq!(
+            marquee_window(title, 0, 7),
+            marquee_window(title, 1, 7),
+            "ancho 0 se trata como 1 (sin panico)"
+        );
+    }
+
+    /// T1/S3: con un próximo (cola o pool), el panel muestra la franja
+    /// «próxima canción» con el título; sin próximo, no aparece.
+    #[test]
+    fn next_up_panel_section_shows_the_marquee_and_hides_without_a_next() {
+        let Some(engine) = engine_or_skip() else { return };
+
+        // Con la cola cargada: la franja muestra el próximo de la cola.
+        let mut app = library_with_three();
+        app.mode = Mode::Player;
+        app.has_player = true;
+        app.explorer_open = true;
+        app.queue.push(queue_url("próxima canción"));
+        refresh_next_up(&mut app);
+        let buffer = render_player_frame(&app, &engine);
+        let text = player_screen_text(&buffer);
+        assert!(
+            text.contains("próxima canción"),
+            "el título próximo aparece en el panel: {text}"
+        );
+
+        // Con la cola vacía y biblioteca cargada: el próximo del pool.
+        let mut app = library_with_three();
+        app.mode = Mode::Player;
+        app.has_player = true;
+        app.explorer_open = true;
+        refresh_next_up(&mut app);
+        assert_eq!(
+            app.next_up.as_deref(),
+            Some("alpha"),
+            "cola vacía → el primero del pool"
+        );
+
+        // Sin nada próximo (cola vacía y pool vacío): la franja no aparece.
+        let mut app = test_app();
+        app.mode = Mode::Player;
+        app.has_player = true;
+        app.explorer_open = true;
+        refresh_next_up(&mut app);
+        assert_eq!(app.next_up, None, "sin pool no hay próximo");
+        let buffer = render_player_frame(&app, &engine);
+        let text = player_screen_text(&buffer);
+        assert!(
+            !text.contains("próxima canción"),
+            "sin próximo la franja no se dibuja: {text}"
+        );
     }
 
     /// S13: una URL encolada que falla al resolver se saltea — el cursor
