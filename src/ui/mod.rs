@@ -4049,7 +4049,9 @@ fn render_visualizer(frame: &mut Frame<'_>, area: Rect, analyzer: &SpectrumAnaly
             &theme(),
             ascii,
         ),
-        VisualizerPaint::Miku => paint_miku(frame.buffer_mut(), inner, analyzer, &theme()),
+        VisualizerPaint::Miku => {
+            paint_miku(frame.buffer_mut(), inner, analyzer, &theme(), ascii)
+        }
     }
 }
 
@@ -4119,11 +4121,174 @@ const MIKU_FRAMES: [&str; crate::visualizer::MIKU_POSES] = [
 ",
 ];
 
-/// Pintor de la bailarina (modo `miku`): escribe la pose actual centrada al
-/// ancho del área (se recorta si el área es más angosta), limpia el fondo de
-/// cada fila y coloriza por clase de glifo: coletas/acentos con `spectrum_mid`
-/// (turquesa en el tema miku), la cara con `text` y el resto con `dim`.
+/// Pintor de la bailarina (modo `miku`). Con estilo unicode dibuja la textura
+/// real de Miku (`miku_art`, 49×38) animada: salto de 0..3 filas según el
+/// arco de `dance_pose` (el beat de graves lo dispara) y vaivén horizontal
+/// por el reloj; cuando el área no alcanza, la textura se reduce a medios
+/// bloques (▀/▄/█ por cada 2×2 texels braile) y se muestra una ventana
+/// centrada de la imagen reducida. Con estilo ascii (sin unicode) usa las 4
+/// poses simples de `MIKU_FRAMES`, que no dependen de glifos especiales.
 fn paint_miku(
+    buf: &mut ratatui::buffer::Buffer,
+    inner: Rect,
+    analyzer: &SpectrumAnalyzer,
+    theme: &Theme,
+    ascii: bool,
+) {
+    if ascii {
+        paint_miku_poses(buf, inner, analyzer, theme);
+        return;
+    }
+
+    // La constante abre con un salto de línea: se descarta esa entrada vacía.
+    let art_original: Vec<&str> = crate::visualizer::miku_art::MIKU_ART
+        .lines()
+        .filter(|l| !l.is_empty())
+        .collect();
+    let bright_texel = |ch: char| ch != '\u{2800}' && ch != ' ';
+    // Recorte automático de los márgenes vacíos de la pieza (trae aire
+    // arriba, abajo y a los costados): la figura queda centrada y grande.
+    let min_r = art_original
+        .iter()
+        .position(|l| l.chars().any(bright_texel))
+        .unwrap_or(0);
+    let max_r = art_original
+        .iter()
+        .rposition(|l| l.chars().any(bright_texel))
+        .unwrap_or(0);
+    let full_width = art_original
+        .iter()
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap_or(0);
+    let min_c = (0..full_width)
+        .find(|&c| {
+            art_original
+                .iter()
+                .any(|l| l.chars().nth(c).is_some_and(bright_texel))
+        })
+        .unwrap_or(0);
+    let max_c = (0..full_width)
+        .rfind(|&c| {
+            art_original
+                .iter()
+                .any(|l| l.chars().nth(c).is_some_and(bright_texel))
+        })
+        .unwrap_or(full_width - 1);
+    let art: Vec<&str> = art_original[min_r..=max_r].to_vec();
+    let art_w = max_c - min_c + 1;
+    let art_h = art.len();
+    if art_h == 0 || art_w == 0 {
+        return;
+    }
+    // Acceso a un texel ya recortado: columna de la textura = min_c + c.
+    let texel = |row: usize, col: usize| -> char {
+        art[row].chars().nth(col).unwrap_or(' ')
+    };
+    let texel_min_c = min_c;
+    let (rows_avail, cols_avail) = (inner.height as usize, inner.width as usize);
+    // En áreas chicas la textura se reduce a medios bloques (2×2 → 1 celda).
+    let scale = if rows_avail >= art_h && cols_avail >= art_w {
+        1
+    } else {
+        2
+    };
+    let out_rows = art_h.div_ceil(scale);
+    let out_cols = art_w.div_ceil(scale);
+    let rows = out_rows.min(rows_avail);
+    let cols = out_cols.min(cols_avail);
+    if rows == 0 || cols == 0 {
+        return;
+    }
+
+    // Animación: arco de salto (0 reposo / 1..=3 arriba-bajando) por el beat,
+    // y vaivén horizontal lento por el reloj.
+    let dy: i16 = match analyzer.dance_pose() {
+        1 => -2,
+        2 => -3,
+        3 => -1,
+        _ => 0,
+    };
+    let dx: i16 = if (analyzer.dance_clock() / 8) % 2 == 0 { 0 } else { 1 };
+
+    // Ventana dentro de la imagen (cuando el área es más chica que la imagen
+    // reducida) y desplazamiento de la imagen dentro del área (centrado + la
+    // animación). Se separan a propósito: uno recorta la fuente, el otro
+    // posiciona el resultado.
+    let win_r = if out_rows > rows {
+        (((out_rows - rows) / 2) as i16 + dy)
+            .clamp(0, (out_rows - rows) as i16) as usize
+    } else {
+        0
+    };
+    let win_c = if out_cols > cols {
+        (((out_cols - cols) / 2) as i16 + dx)
+            .clamp(0, (out_cols - cols) as i16) as usize
+    } else {
+        0
+    };
+    let pos_r = if rows_avail > rows {
+        (((rows_avail - rows) / 2) as i16 + dy)
+            .clamp(0, (rows_avail - rows) as i16) as usize
+    } else {
+        0
+    };
+    let pos_c = if cols_avail > cols {
+        (((cols_avail - cols) / 2) as i16 + dx)
+            .clamp(0, (cols_avail - cols) as i16) as usize
+    } else {
+        0
+    };
+
+    for y in inner.y..inner.y + inner.height {
+        buf.set_string(inner.x, y, " ".repeat(inner.width as usize), Style::default());
+    }
+    let style = Style::default().fg(theme.spectrum_mid);
+    for r in 0..rows {
+        let y = inner.y + (pos_r + r) as u16;
+        for c in 0..cols {
+            let (ch, on) = if scale == 1 {
+                let ch = texel(win_r + r, texel_min_c + win_c + c);
+                (ch, bright_texel(ch))
+            } else {
+                let top = bright_texel(texel(
+                    (win_r + r) * 2,
+                    texel_min_c + (win_c + c) * 2,
+                )) || bright_texel(texel(
+                    (win_r + r) * 2,
+                    texel_min_c + (win_c + c) * 2 + 1,
+                ));
+                let bottom = bright_texel(texel(
+                    (win_r + r) * 2 + 1,
+                    texel_min_c + (win_c + c) * 2,
+                )) || bright_texel(texel(
+                    (win_r + r) * 2 + 1,
+                    texel_min_c + (win_c + c) * 2 + 1,
+                ));
+                (
+                    if top && bottom {
+                        '\u{2588}'
+                    } else if top {
+                        '\u{2580}'
+                    } else if bottom {
+                        '\u{2584}'
+                    } else {
+                        ' '
+                    },
+                    top || bottom,
+                )
+            };
+            if on {
+                buf.set_string(inner.x + (pos_c + c) as u16, y, ch.to_string(), style);
+            }
+        }
+    }
+}
+
+/// Variante en estilo ascii del pintor de la bailarina: las 4 poses simples
+/// centradas y colorizadas por clase de glifo (coletas con `spectrum_mid`, la
+/// cara con `text`, el resto con `dim`).
+fn paint_miku_poses(
     buf: &mut ratatui::buffer::Buffer,
     inner: Rect,
     analyzer: &SpectrumAnalyzer,
@@ -8786,6 +8951,61 @@ mod tests {
         terminal
             .draw(|frame| render(frame, &app, &engine))
             .expect("draw sin panico con el panel abierto");
+    }
+
+    /// Modo `miku` en estilo unicode: dibuja la textura real de Miku
+    /// (emojicombos) reducida a medios bloques, animada con el arco de salto,
+    /// y se recorta sin paniquear con el panel abierto.
+    #[test]
+    fn visualizer_miku_unicode_paints_the_real_art_animated() {
+        let Some(engine) = engine_or_skip() else { return };
+        let previous = runtime::active_visualizer_style();
+        runtime::preview_visualizer_style(config::VisualizerStyle::Unicode);
+        runtime::preview_visualizer_mode(config::VisualizerMode::Miku);
+
+        let mut app = test_app();
+        app.mode = Mode::Player;
+        app.has_player = true;
+        let mut analyzer = SpectrumAnalyzer::new();
+        // Silencio: el timer de respiración saca la pose del reposo y activa
+        // el arco de salto (el camino del beat está cubierto en los tests
+        // puros de `next_dance_pose`).
+        for _ in 0..25 {
+            analyzer.tick_dance(true);
+        }
+        assert!(
+            analyzer.dance_pose() != 0,
+            "el timer movió la pose al arco de salto"
+        );
+        app.analyzer = analyzer;
+
+        let backend = ratatui::backend::TestBackend::new(100, 40);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &app, &engine))
+            .expect("draw");
+        let text = player_screen_text(&terminal.backend().buffer().clone());
+        assert!(
+            text.contains('\u{25a0}')
+                || text.contains('\u{2580}')
+                || text.contains('\u{2584}')
+                || text.contains('\u{28ff}')
+                || text.contains('\u{28bf}'),
+            "la textura de Miku (braile o reducida a bloques) está en pantalla"
+        );
+        assert!(
+            !text.contains("MIKU"),
+            "estilo unicode usa la textura real, no las poses ascii"
+        );
+
+        app.explorer_open = true;
+        let small = ratatui::backend::TestBackend::new(64, 24);
+        let mut terminal = ratatui::Terminal::new(small).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &app, &engine))
+            .expect("draw sin panico en 64x24 con panel abierto");
+
+        runtime::preview_visualizer_style(previous);
     }
 
     #[test]

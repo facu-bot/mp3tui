@@ -113,6 +113,10 @@ fn next_dance_pose(
     }
 }
 
+/// Pieza «Hatsune Miku full body» de emojicombos.com/hatsune-miku-ascii-art
+/// como textura braile (49×38), para el modo `miku` en estilo unicode.
+pub mod miku_art;
+
 pub struct SpectrumAnalyzer {
     fft: Arc<dyn Fft<f32>>,
     fft_scratch: Vec<Complex<f32>>,
@@ -143,6 +147,9 @@ pub struct SpectrumAnalyzer {
     dance_frames: u32,
     /// Envolvente de energía de graves para detectar el pulso.
     dance_envelope: f32,
+    /// Reloj de baile: avanza un tick por `tick_dance`; lo usa el pintor para
+    /// el vaivén horizontal (independiente de los beats).
+    dance_clock: u64,
     band_ranges: Vec<(usize, usize)>,
     sample_rate: u32,
 }
@@ -177,6 +184,7 @@ impl SpectrumAnalyzer {
             dance_pose: 0,
             dance_frames: 0,
             dance_envelope: 0.0,
+            dance_clock: 0,
             band_ranges: Self::compute_ranges(44_100),
             sample_rate: 0,
         }
@@ -200,11 +208,18 @@ impl SpectrumAnalyzer {
         );
         self.dance_pose = pose;
         self.dance_frames = frames;
+        self.dance_clock = self.dance_clock.wrapping_add(1);
     }
 
-    /// Pose actual de la bailarina (modo `miku`): índice en `MIKU_FRAMES`.
+    /// Pose actual de la bailarina (modo `miku`): nivel del arco de salto
+    /// (0 = reposo, 1..=2 arriba, 3 bajando).
     pub fn dance_pose(&self) -> usize {
         self.dance_pose
+    }
+
+    /// Reloj de baile en ticks (`tick_dance`): vaivén del pintor.
+    pub fn dance_clock(&self) -> u64 {
+        self.dance_clock
     }
 
     /// Copia las muestras disponibles del tap al buffer circular del analizador.
