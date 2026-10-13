@@ -6,9 +6,9 @@
 //! Windows, `~/.config/mp3tui` en Linux/macOS; o el directorio indicado por
 //! `MP3TUI_CONFIG`).
 
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
-use serde::{Deserialize, Serialize};
 
 pub const MAX_ENTRIES: usize = 20;
 pub const HISTORY_FILE_NAME: &str = "history.toml";
@@ -136,7 +136,9 @@ pub fn save_to(history: &History, path: &std::path::Path) -> Result<(), String> 
     let content = history.to_toml()?;
     let temp_name = format!(
         "{}.tmp.{}.{}",
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("history"),
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("history"),
         std::process::id(),
         TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     );
@@ -162,13 +164,22 @@ mod tests {
     #[test]
     fn test_history_add_and_dedup_moves_to_top() {
         let mut history = History::new();
-        history.add("Canción 1".to_string(), "https://example.com/1.mp3".to_string());
-        history.add("Canción 2".to_string(), "https://example.com/2.mp3".to_string());
+        history.add(
+            "Canción 1".to_string(),
+            "https://example.com/1.mp3".to_string(),
+        );
+        history.add(
+            "Canción 2".to_string(),
+            "https://example.com/2.mp3".to_string(),
+        );
         assert_eq!(history.len(), 2);
         assert_eq!(history.get(0).unwrap().title, "Canción 2");
 
         // Re-agregar URL existente: debe refrescar el título y moverlo al inicio
-        history.add("Canción 1 Nueva".to_string(), "https://example.com/1.mp3".to_string());
+        history.add(
+            "Canción 1 Nueva".to_string(),
+            "https://example.com/1.mp3".to_string(),
+        );
         assert_eq!(history.len(), 2, "no debe duplicar la URL existente");
         assert_eq!(history.get(0).unwrap().title, "Canción 1 Nueva");
         assert_eq!(history.get(0).unwrap().url, "https://example.com/1.mp3");
@@ -179,20 +190,39 @@ mod tests {
     fn test_history_trim_to_max_20() {
         let mut history = History::new();
         for i in 0..25 {
-            history.add(format!("Canción {i}"), format!("https://example.com/{i}.mp3"));
+            history.add(
+                format!("Canción {i}"),
+                format!("https://example.com/{i}.mp3"),
+            );
         }
         assert_eq!(history.len(), 20, "debe acotar a un máximo de 20 entradas");
-        assert_eq!(history.get(0).unwrap().title, "Canción 24", "la más reciente debe estar arriba");
-        assert_eq!(history.get(19).unwrap().title, "Canción 5", "la más antigua preservada");
+        assert_eq!(
+            history.get(0).unwrap().title,
+            "Canción 24",
+            "la más reciente debe estar arriba"
+        );
+        assert_eq!(
+            history.get(19).unwrap().title,
+            "Canción 5",
+            "la más antigua preservada"
+        );
     }
 
     #[test]
     fn test_history_toml_round_trip() {
         let mut history = History::new();
-        history.add("Tema 1".to_string(), "https://example.com/1.mp3".to_string());
-        history.add("Tema 2".to_string(), "https://example.com/2.mp3".to_string());
+        history.add(
+            "Tema 1".to_string(),
+            "https://example.com/1.mp3".to_string(),
+        );
+        history.add(
+            "Tema 2".to_string(),
+            "https://example.com/2.mp3".to_string(),
+        );
 
-        let toml_str = history.to_toml().expect("serialización toml debe funcionar");
+        let toml_str = history
+            .to_toml()
+            .expect("serialización toml debe funcionar");
         let parsed = History::from_toml(&toml_str).expect("deserialización toml debe funcionar");
         assert_eq!(history, parsed);
     }
@@ -209,7 +239,8 @@ mod tests {
     #[test]
     fn test_history_persistence_in_temp_dir_via_config_override() {
         let _guard = ENV_MUTEX.lock().unwrap();
-        let temp_dir = std::env::temp_dir().join(format!("mp3tui_hist_test_{}", std::process::id()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("mp3tui_hist_test_{}", std::process::id()));
         let _ = fs::create_dir_all(&temp_dir);
         let config_file = temp_dir.join("config.toml");
         let _ = fs::write(&config_file, "");
@@ -219,11 +250,17 @@ mod tests {
         }
 
         let mut history = History::new();
-        history.add("Canción Guardada".to_string(), "https://example.com/saved.mp3".to_string());
+        history.add(
+            "Canción Guardada".to_string(),
+            "https://example.com/saved.mp3".to_string(),
+        );
         save(&history).expect("debe guardar en temp dir");
 
         let (loaded, warning) = load();
-        assert!(warning.is_none(), "no debe dar warning para archivo válido: {warning:?}");
+        assert!(
+            warning.is_none(),
+            "no debe dar warning para archivo válido: {warning:?}"
+        );
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded.get(0).unwrap().title, "Canción Guardada");
 
@@ -237,7 +274,8 @@ mod tests {
     #[test]
     fn test_history_load_corrupt_file_returns_warning() {
         let _guard = ENV_MUTEX.lock().unwrap();
-        let temp_dir = std::env::temp_dir().join(format!("mp3tui_hist_corrupt_{}", std::process::id()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("mp3tui_hist_corrupt_{}", std::process::id()));
         let _ = fs::create_dir_all(&temp_dir);
         let config_file = temp_dir.join("config.toml");
         let _ = fs::write(&config_file, "");
@@ -249,8 +287,15 @@ mod tests {
         }
 
         let (loaded, warning) = load();
-        assert_eq!(loaded.len(), 0, "debe dar historial vacío si el archivo es corrupto");
-        assert!(warning.is_some(), "debe retornar un warning ante archivo corrupto");
+        assert_eq!(
+            loaded.len(),
+            0,
+            "debe dar historial vacío si el archivo es corrupto"
+        );
+        assert!(
+            warning.is_some(),
+            "debe retornar un warning ante archivo corrupto"
+        );
         assert!(warning.unwrap().contains("corrupto"));
 
         unsafe {
@@ -291,7 +336,10 @@ mod tests {
         assert!(warn.is_some());
         assert_eq!(hist.len(), 0);
 
-        hist.add("New Title".to_string(), "https://example.com/audio.mp3".to_string());
+        hist.add(
+            "New Title".to_string(),
+            "https://example.com/audio.mp3".to_string(),
+        );
         save_to(&hist, &hist_file).unwrap();
 
         let bak_file = hist_file.with_extension("toml.bak");
@@ -307,19 +355,26 @@ mod tests {
 
     #[test]
     fn test_save_to_uses_temp_and_rename_without_leaving_temp_files() {
-        let temp_dir = std::env::temp_dir().join(format!("mp3tui_hist_atomic_{}", std::process::id()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("mp3tui_hist_atomic_{}", std::process::id()));
         let _ = fs::create_dir_all(&temp_dir);
         let hist_file = temp_dir.join("history.toml");
 
         let mut hist = History::new();
-        hist.add("Atomic Title".to_string(), "https://example.com/atomic.mp3".to_string());
+        hist.add(
+            "Atomic Title".to_string(),
+            "https://example.com/atomic.mp3".to_string(),
+        );
         save_to(&hist, &hist_file).unwrap();
 
         assert!(hist_file.exists());
         let entries = fs::read_dir(&temp_dir).unwrap();
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            assert!(!name.contains("tmp"), "no debe quedar archivo temporal: {name}");
+            assert!(
+                !name.contains("tmp"),
+                "no debe quedar archivo temporal: {name}"
+            );
         }
 
         let _ = fs::remove_dir_all(&temp_dir);

@@ -12,8 +12,8 @@ pub const ANIM_TICKS: usize = 7;
 /// Bbox global de la figura sobre el lienzo (márgenes recortados).
 pub const CROP_LEFT: usize = 24;
 pub const CROP_TOP: usize = 0;
-pub const CROP_RIGHT: usize = 54;  // inclusive
-pub const CROP_BOTTOM: usize = 23;      // inclusive
+pub const CROP_RIGHT: usize = 54; // inclusive
+pub const CROP_BOTTOM: usize = 23; // inclusive
 
 /// Un frame por string: `CANVAS_H` filas de `CANVAS_W` chars unidas con '\n'.
 pub const FRAME_CHARS: [&str; 26] = [

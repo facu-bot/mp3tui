@@ -93,10 +93,8 @@ fn next_dance_pose(
 ) -> (usize, u32, bool) {
     let prev = *envelope;
     let frames = frames_since_switch.saturating_add(1);
-    let beat = playing
-        && frames >= DANCE_MIN_SWITCH_FRAMES
-        && bass > prev * 1.2 + 0.02
-        && bass > 0.02;
+    let beat =
+        playing && frames >= DANCE_MIN_SWITCH_FRAMES && bass > prev * 1.2 + 0.02 && bass > 0.02;
     // Envolvente con decay lento: un pulso de graves razonable la supera; el
     // silencio la baja hasta el piso, de modo que el próximo golpe vuelve a
     // contar como beat.
@@ -196,8 +194,7 @@ impl SpectrumAnalyzer {
     /// después de `analyze()`.
     pub fn tick_dance(&mut self, playing: bool) {
         let bass_bands = 4.min(NUM_BANDS);
-        let bass =
-            self.bands[..bass_bands].iter().sum::<f32>() / bass_bands as f32;
+        let bass = self.bands[..bass_bands].iter().sum::<f32>() / bass_bands as f32;
         let (pose, frames, _beat) = next_dance_pose(
             self.dance_pose,
             MIKU_POSES,
@@ -337,8 +334,7 @@ impl SpectrumAnalyzer {
         match target {
             Some(rms) => {
                 let level = db_meter_level(rms);
-                self.vu +=
-                    (level - self.vu) * if level > self.vu { ATTACK } else { DECAY };
+                self.vu += (level - self.vu) * if level > self.vu { ATTACK } else { DECAY };
             }
             None => {
                 // Sin muestras nuevas el RMS del ring sería rancio: el nivel
@@ -366,7 +362,9 @@ impl SpectrumAnalyzer {
             return raw;
         }
         let gain = self.wave_gain();
-        raw.into_iter().map(|s| (s * gain).clamp(-1.0, 1.0)).collect()
+        raw.into_iter()
+            .map(|s| (s * gain).clamp(-1.0, 1.0))
+            .collect()
     }
 
     /// Cantidad de muestras de la ventana del osciloscopio para la
@@ -399,7 +397,12 @@ impl SpectrumAnalyzer {
     /// nuevo, dejando lugar para que el disparador tenga margen de
     /// búsqueda). Devuelve el `back` de la muestra del cruce (el extremo
     /// más viejo de la ventana), o `None` si no hay un cruce así.
-    fn find_rising_crossing(&self, window: usize, margin: usize, available: usize) -> Option<usize> {
+    fn find_rising_crossing(
+        &self,
+        window: usize,
+        margin: usize,
+        available: usize,
+    ) -> Option<usize> {
         let search_start = margin + window;
         if search_start > available.saturating_sub(1) {
             return None;
@@ -423,7 +426,9 @@ impl SpectrumAnalyzer {
     /// terminando en `start_back - window + 1` (en `back`), empezando en
     /// `start_back`.
     fn window_from_start(&self, start_back: usize, window: usize) -> Vec<f32> {
-        (0..window).map(|i| self.sample_back(start_back - i)).collect()
+        (0..window)
+            .map(|i| self.sample_back(start_back - i))
+            .collect()
     }
 
     /// Ventana cruda (sin ganancia) del osciloscopio: triggered cuando hay
@@ -606,7 +611,10 @@ mod tests {
         analyzer.wave_peak = 0.1;
         let window = analyzer.scope_window();
         assert!(!window.is_empty());
-        let max_abs = window.iter().cloned().fold(0.0f32, |acc, v| acc.max(v.abs()));
+        let max_abs = window
+            .iter()
+            .cloned()
+            .fold(0.0f32, |acc, v| acc.max(v.abs()));
         assert!(
             max_abs > 0.6,
             "una señal floja debe usar buena parte del alto disponible, obtenido {max_abs}"
@@ -641,7 +649,10 @@ mod tests {
             *slot = if i % 2 == 0 { 0.001 } else { -0.001 };
         }
         let window = noisy.scope_window();
-        let max_abs = window.iter().cloned().fold(0.0f32, |acc, v| acc.max(v.abs()));
+        let max_abs = window
+            .iter()
+            .cloned()
+            .fold(0.0f32, |acc, v| acc.max(v.abs()));
         assert!(
             max_abs < 0.1,
             "ruido de piso no debe amplificarse a escala completa, obtenido {max_abs}"
@@ -797,9 +808,15 @@ mod tests {
             let mut previous_high = 0;
             for (index, (low, high)) in ranges.iter().copied().enumerate() {
                 assert!(low >= 1 && low < n_bins, "sr={sample_rate} low={low}");
-                assert!(high > low && high <= n_bins, "sr={sample_rate} {low}..{high}");
+                assert!(
+                    high > low && high <= n_bins,
+                    "sr={sample_rate} {low}..{high}"
+                );
                 if index > 0 {
-                    assert_eq!(low, previous_high, "hueco o traslape en banda {index} (sr={sample_rate})");
+                    assert_eq!(
+                        low, previous_high,
+                        "hueco o traslape en banda {index} (sr={sample_rate})"
+                    );
                 }
                 previous_high = high;
             }
@@ -818,7 +835,10 @@ mod tests {
         analyzer.bands[0] = 0.8;
         analyzer.analyze();
         let after = analyzer.bands()[0];
-        assert!(after > 0.0 && after < 0.8, "debe decaer lentamente, obtenido {after}");
+        assert!(
+            after > 0.0 && after < 0.8,
+            "debe decaer lentamente, obtenido {after}"
+        );
     }
 
     #[test]
@@ -920,8 +940,7 @@ mod tests {
     fn dance_pose_advances_by_timer_when_playing_and_paused() {
         // Sonando sin beat: a los DANCE_IDLE_FRAMES avanza por timer.
         let mut env = 0.0;
-        let (pose, frames, _) =
-            next_dance_pose(2, 4, 0.0, &mut env, DANCE_IDLE_FRAMES - 2, true);
+        let (pose, frames, _) = next_dance_pose(2, 4, 0.0, &mut env, DANCE_IDLE_FRAMES - 2, true);
         assert_eq!(pose, 2, "todavía no llega el timer");
         assert_eq!(frames, DANCE_IDLE_FRAMES - 1);
         let (pose, frames, beat) =
@@ -933,12 +952,8 @@ mod tests {
         // En pausa: los beats no cuentan, solo el timer más lento.
         let mut env = 0.0;
         let (pose, _, _) = next_dance_pose(0, 4, 0.9, &mut env, 3, false);
-        assert_eq!(
-            pose, 0,
-            "en pausa un pulso de graves no es un beat"
-        );
-        let (pose, _, _) =
-            next_dance_pose(0, 4, 0.0, &mut env, DANCE_PAUSE_FRAMES, false);
+        assert_eq!(pose, 0, "en pausa un pulso de graves no es un beat");
+        let (pose, _, _) = next_dance_pose(0, 4, 0.0, &mut env, DANCE_PAUSE_FRAMES, false);
         assert_eq!(pose, 1, "en pausa baila por timer (más lento)");
     }
 

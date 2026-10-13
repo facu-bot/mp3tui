@@ -95,9 +95,7 @@ pub struct Playlist {
 
 impl Playlist {
     pub fn new() -> Self {
-        Self {
-            tracks: Vec::new(),
-        }
+        Self { tracks: Vec::new() }
     }
 
     /// Escaneo recursivo de `root` con `std::fs` (sin crates externos),
@@ -313,11 +311,7 @@ mod tests {
         );
         assert!(!names.iter().any(|name| name.ends_with(".txt")));
 
-        let root_name = root
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
+        let root_name = root.file_name().unwrap().to_string_lossy().into_owned();
         let folders: Vec<&str> = playlist
             .tracks()
             .iter()
@@ -346,8 +340,7 @@ mod tests {
         fs::write(root_a.join("sub").join("gamma.wav"), b"").unwrap();
         fs::write(root_b.join("delta.flac"), b"").unwrap();
 
-        let playlist =
-            Playlist::from_dirs_scan(&[root_a.clone(), root_b.clone()]);
+        let playlist = Playlist::from_dirs_scan(&[root_a.clone(), root_b.clone()]);
         let names: Vec<String> = playlist
             .tracks()
             .iter()
@@ -374,12 +367,7 @@ mod tests {
             .collect();
         assert_eq!(
             folders,
-            vec![
-                name_a.as_str(),
-                name_a.as_str(),
-                "sub",
-                name_b.as_str()
-            ]
+            vec![name_a.as_str(), name_a.as_str(), "sub", name_b.as_str()]
         );
 
         let _ = fs::remove_dir_all(&root_a);

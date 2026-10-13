@@ -64,7 +64,6 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    
 
     if let ui::StartMode::PlayFile(path) = &start
         && let Err(err) = engine.play(path)

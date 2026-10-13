@@ -121,7 +121,13 @@ pub fn next_track(
     };
 
     // `resolve` traduce posición de navegación → índice de playlist.
-    let resolve = |position: usize| if use_shuffle { order[position] } else { position };
+    let resolve = |position: usize| {
+        if use_shuffle {
+            order[position]
+        } else {
+            position
+        }
+    };
 
     match pos {
         // Sin pista conocida: la extrema según la dirección del salto.
@@ -230,7 +236,11 @@ pub fn natural_end_action(
     // Una URL terminada solo ocupa posición del pool cuando el shuffle está
     // activo (entrada del historial); con el shuffle apagado no tiene lugar en
     // la lista local y entra desde el inicio del orden.
-    let current = if finished_url && !shuffle { None } else { current };
+    let current = if finished_url && !shuffle {
+        None
+    } else {
+        current
+    };
     match next_track(len, current, repeat, shuffle, order, 1) {
         Some(index) => NextAction::Play(index),
         None => NextAction::Stop,
@@ -350,7 +360,10 @@ mod tests {
     #[test]
     fn shuffle_of_small_lists_is_a_permutation_too() {
         // Extremo donde Fisher-Yates no tiene dónde moverse.
-        assert_eq!(shuffle_order_with(0, &mut SplitMix64::new(1)), Vec::<usize>::new());
+        assert_eq!(
+            shuffle_order_with(0, &mut SplitMix64::new(1)),
+            Vec::<usize>::new()
+        );
         assert_eq!(shuffle_order_with(1, &mut SplitMix64::new(1)), vec![0]);
     }
 
@@ -410,17 +423,23 @@ mod tests {
     #[test]
     fn without_current_track_next_goes_first_and_prev_goes_last() {
         let order: [usize; 0] = [];
-        assert_eq!(next_track(4, None, RepeatMode::Off, false, &order, 1), Some(0));
-        assert_eq!(next_track(4, None, RepeatMode::Off, false, &order, -1), Some(3));
+        assert_eq!(
+            next_track(4, None, RepeatMode::Off, false, &order, 1),
+            Some(0)
+        );
+        assert_eq!(
+            next_track(4, None, RepeatMode::Off, false, &order, -1),
+            Some(3)
+        );
     }
 
     #[test]
     fn empty_playlist_has_no_next_or_previous() {
+        assert_eq!(next_track(0, None, RepeatMode::All, false, &[], 1), None);
         assert_eq!(
-            next_track(0, None, RepeatMode::All, false, &[], 1),
+            next_track(0, Some(0), RepeatMode::Off, false, &[], -1),
             None
         );
-        assert_eq!(next_track(0, Some(0), RepeatMode::Off, false, &[], -1), None);
     }
 
     #[test]
@@ -480,17 +499,41 @@ mod tests {
         let order = [2usize, 0, 3, 1];
         // Local en el medio, sin shuffle.
         assert_eq!(
-            natural_end_action(RepeatMode::One, false, 4, Some(1), &order, false, Duration::ZERO),
+            natural_end_action(
+                RepeatMode::One,
+                false,
+                4,
+                Some(1),
+                &order,
+                false,
+                Duration::ZERO
+            ),
             NextAction::Replay
         );
         // Local en la última pista.
         assert_eq!(
-            natural_end_action(RepeatMode::One, false, 4, Some(3), &order, false, Duration::ZERO),
+            natural_end_action(
+                RepeatMode::One,
+                false,
+                4,
+                Some(3),
+                &order,
+                false,
+                Duration::ZERO
+            ),
             NextAction::Replay
         );
         // Con shuffle (posición en el medio del orden mezclado).
         assert_eq!(
-            natural_end_action(RepeatMode::One, true, 4, Some(2), &order, false, Duration::ZERO),
+            natural_end_action(
+                RepeatMode::One,
+                true,
+                4,
+                Some(2),
+                &order,
+                false,
+                Duration::ZERO
+            ),
             NextAction::Replay
         );
         // URL con sesión suficientemente larga, con y sin shuffle: se repite.
@@ -505,7 +548,15 @@ mod tests {
         );
         // Lista vacía: la pista terminada es el propio objetivo de repetición.
         assert_eq!(
-            natural_end_action(RepeatMode::One, false, 0, None, &order, false, Duration::ZERO),
+            natural_end_action(
+                RepeatMode::One,
+                false,
+                0,
+                None,
+                &order,
+                false,
+                Duration::ZERO
+            ),
             NextAction::Replay
         );
         assert_eq!(
@@ -518,22 +569,54 @@ mod tests {
     fn natural_end_repeat_off_advances_then_stops_at_the_end() {
         let order: [usize; 0] = [];
         assert_eq!(
-            natural_end_action(RepeatMode::Off, false, 4, Some(0), &order, false, Duration::ZERO),
+            natural_end_action(
+                RepeatMode::Off,
+                false,
+                4,
+                Some(0),
+                &order,
+                false,
+                Duration::ZERO
+            ),
             NextAction::Play(1),
             "Off avanza en el medio de la lista"
         );
         assert_eq!(
-            natural_end_action(RepeatMode::Off, false, 4, Some(2), &order, false, Duration::ZERO),
+            natural_end_action(
+                RepeatMode::Off,
+                false,
+                4,
+                Some(2),
+                &order,
+                false,
+                Duration::ZERO
+            ),
             NextAction::Play(3)
         );
         assert_eq!(
-            natural_end_action(RepeatMode::Off, false, 4, Some(3), &order, false, Duration::ZERO),
+            natural_end_action(
+                RepeatMode::Off,
+                false,
+                4,
+                Some(3),
+                &order,
+                false,
+                Duration::ZERO
+            ),
             NextAction::Stop,
             "Off en la última pista: se detiene, no envuelve"
         );
         // Lista vacía: nada que avanzar.
         assert_eq!(
-            natural_end_action(RepeatMode::Off, false, 0, None, &order, false, Duration::ZERO),
+            natural_end_action(
+                RepeatMode::Off,
+                false,
+                0,
+                None,
+                &order,
+                false,
+                Duration::ZERO
+            ),
             NextAction::Stop
         );
     }
@@ -542,14 +625,30 @@ mod tests {
     fn natural_end_repeat_off_after_url_starts_the_library_list() {
         let order: [usize; 0] = [];
         assert_eq!(
-            natural_end_action(RepeatMode::Off, false, 4, None, &order, true, Duration::ZERO),
+            natural_end_action(
+                RepeatMode::Off,
+                false,
+                4,
+                None,
+                &order,
+                true,
+                Duration::ZERO
+            ),
             NextAction::Play(0),
             "URL terminada: el siguiente sale de la biblioteca local"
         );
         // Una selección residual de la lista no cuenta como pista actual de
         // una URL: no hay «siguiente URL», se entra a la biblioteca.
         assert_eq!(
-            natural_end_action(RepeatMode::Off, false, 4, Some(2), &order, true, Duration::ZERO),
+            natural_end_action(
+                RepeatMode::Off,
+                false,
+                4,
+                Some(2),
+                &order,
+                true,
+                Duration::ZERO
+            ),
             NextAction::Play(0)
         );
     }
@@ -558,23 +657,55 @@ mod tests {
     fn natural_end_repeat_all_wraps() {
         let order: [usize; 0] = [];
         assert_eq!(
-            natural_end_action(RepeatMode::All, false, 4, Some(2), &order, false, Duration::ZERO),
+            natural_end_action(
+                RepeatMode::All,
+                false,
+                4,
+                Some(2),
+                &order,
+                false,
+                Duration::ZERO
+            ),
             NextAction::Play(3),
             "All avanza en el medio"
         );
         assert_eq!(
-            natural_end_action(RepeatMode::All, false, 4, Some(3), &order, false, Duration::ZERO),
+            natural_end_action(
+                RepeatMode::All,
+                false,
+                4,
+                Some(3),
+                &order,
+                false,
+                Duration::ZERO
+            ),
             NextAction::Play(0),
             "All envuelve de la última a la primera"
         );
         assert_eq!(
-            natural_end_action(RepeatMode::All, false, 4, None, &order, true, Duration::ZERO),
+            natural_end_action(
+                RepeatMode::All,
+                false,
+                4,
+                None,
+                &order,
+                true,
+                Duration::ZERO
+            ),
             NextAction::Play(0),
             "URL + All: entra a la biblioteca local"
         );
         // Lista vacía: no hay nada que sonar.
         assert_eq!(
-            natural_end_action(RepeatMode::All, false, 0, None, &order, false, Duration::ZERO),
+            natural_end_action(
+                RepeatMode::All,
+                false,
+                0,
+                None,
+                &order,
+                false,
+                Duration::ZERO
+            ),
             NextAction::Stop
         );
     }
@@ -584,19 +715,51 @@ mod tests {
         // Orden mezclado: la lista [A,B,C,D] se navega 2 → 0 → 3 → 1.
         let order = [2usize, 0, 3, 1];
         assert_eq!(
-            natural_end_action(RepeatMode::Off, true, 4, Some(2), &order, false, Duration::ZERO),
+            natural_end_action(
+                RepeatMode::Off,
+                true,
+                4,
+                Some(2),
+                &order,
+                false,
+                Duration::ZERO
+            ),
             NextAction::Play(0)
         );
         assert_eq!(
-            natural_end_action(RepeatMode::Off, true, 4, Some(0), &order, false, Duration::ZERO),
+            natural_end_action(
+                RepeatMode::Off,
+                true,
+                4,
+                Some(0),
+                &order,
+                false,
+                Duration::ZERO
+            ),
             NextAction::Play(3)
         );
         assert_eq!(
-            natural_end_action(RepeatMode::Off, true, 4, Some(3), &order, false, Duration::ZERO),
+            natural_end_action(
+                RepeatMode::Off,
+                true,
+                4,
+                Some(3),
+                &order,
+                false,
+                Duration::ZERO
+            ),
             NextAction::Play(1)
         );
         assert_eq!(
-            natural_end_action(RepeatMode::Off, true, 4, Some(1), &order, false, Duration::ZERO),
+            natural_end_action(
+                RepeatMode::Off,
+                true,
+                4,
+                Some(1),
+                &order,
+                false,
+                Duration::ZERO
+            ),
             NextAction::Stop,
             "agotó el orden mezclado sin repetir: se detiene"
         );
@@ -607,13 +770,29 @@ mod tests {
         );
         // All + shuffle: envuelve dentro del orden mezclado.
         assert_eq!(
-            natural_end_action(RepeatMode::All, true, 4, Some(1), &order, false, Duration::ZERO),
+            natural_end_action(
+                RepeatMode::All,
+                true,
+                4,
+                Some(1),
+                &order,
+                false,
+                Duration::ZERO
+            ),
             NextAction::Play(2)
         );
         // Orden desactualizado (cambió el filtro): se ignora el shuffle.
         let stale = [1usize, 0];
         assert_eq!(
-            natural_end_action(RepeatMode::Off, true, 4, Some(0), &stale, false, Duration::ZERO),
+            natural_end_action(
+                RepeatMode::Off,
+                true,
+                4,
+                Some(0),
+                &stale,
+                false,
+                Duration::ZERO
+            ),
             NextAction::Play(1)
         );
     }
@@ -625,7 +804,15 @@ mod tests {
         // al instante (cuerpo vacío, truncado, rate limit) no puede armar un
         // bucle de yt-dlp + red.
         assert_eq!(
-            natural_end_action(RepeatMode::One, false, 4, None, &order, true, Duration::ZERO),
+            natural_end_action(
+                RepeatMode::One,
+                false,
+                4,
+                None,
+                &order,
+                true,
+                Duration::ZERO
+            ),
             NextAction::StopTooSoon,
             "URL sin reproducir nada no se repite"
         );
@@ -670,17 +857,41 @@ mod tests {
         );
         // El freno es solo de URL: un archivo local corto sigue en «una».
         assert_eq!(
-            natural_end_action(RepeatMode::One, false, 4, Some(1), &order, false, Duration::ZERO),
+            natural_end_action(
+                RepeatMode::One,
+                false,
+                4,
+                Some(1),
+                &order,
+                false,
+                Duration::ZERO
+            ),
             NextAction::Replay,
             "local corto: sin mínimo de duración"
         );
         // Tampoco cambia off/todas con URL corta: avanzan a la biblioteca.
         assert_eq!(
-            natural_end_action(RepeatMode::Off, false, 4, None, &order, true, Duration::ZERO),
+            natural_end_action(
+                RepeatMode::Off,
+                false,
+                4,
+                None,
+                &order,
+                true,
+                Duration::ZERO
+            ),
             NextAction::Play(0)
         );
         assert_eq!(
-            natural_end_action(RepeatMode::All, false, 4, None, &order, true, Duration::ZERO),
+            natural_end_action(
+                RepeatMode::All,
+                false,
+                4,
+                None,
+                &order,
+                true,
+                Duration::ZERO
+            ),
             NextAction::Play(0)
         );
     }
@@ -692,29 +903,69 @@ mod tests {
         // current = None pero NO es un fin de URL. Sin posición no hay
         // «siguiente»: se detiene como en la base, no se reinicia la lista.
         assert_eq!(
-            natural_end_action(RepeatMode::Off, false, 4, None, &order, false, Duration::ZERO),
+            natural_end_action(
+                RepeatMode::Off,
+                false,
+                4,
+                None,
+                &order,
+                false,
+                Duration::ZERO
+            ),
             NextAction::Stop,
             "Off: fuera de la vista no reinicia desde la primera pista"
         );
         assert_eq!(
-            natural_end_action(RepeatMode::All, false, 4, None, &order, false, Duration::ZERO),
+            natural_end_action(
+                RepeatMode::All,
+                false,
+                4,
+                None,
+                &order,
+                false,
+                Duration::ZERO
+            ),
             NextAction::Stop,
             "All: sin posición no se salta a la primera"
         );
         assert_eq!(
-            natural_end_action(RepeatMode::Off, true, 4, None, &order, false, Duration::ZERO),
+            natural_end_action(
+                RepeatMode::Off,
+                true,
+                4,
+                None,
+                &order,
+                false,
+                Duration::ZERO
+            ),
             NextAction::Stop,
             "Off + shuffle: sin posición se detiene"
         );
         // One no navega la lista: repite el archivo local aunque esté oculto.
         assert_eq!(
-            natural_end_action(RepeatMode::One, false, 4, None, &order, false, Duration::ZERO),
+            natural_end_action(
+                RepeatMode::One,
+                false,
+                4,
+                None,
+                &order,
+                false,
+                Duration::ZERO
+            ),
             NextAction::Replay
         );
         // El caso URL conserva su regla: finished_url sigue entrando a la
         // biblioteca local (la distinción es exactamente ese flag).
         assert_eq!(
-            natural_end_action(RepeatMode::Off, false, 4, None, &order, true, Duration::ZERO),
+            natural_end_action(
+                RepeatMode::Off,
+                false,
+                4,
+                None,
+                &order,
+                true,
+                Duration::ZERO
+            ),
             NextAction::Play(0),
             "un fin de URL NO es un local oculto"
         );
@@ -736,12 +987,7 @@ mod tests {
                 Some("The Smiths"),
                 Some("Hatful of Hollow"),
             ),
-            track(
-                r"C:\m\03-blank.mp3",
-                "Untitled",
-                None,
-                None,
-            ),
+            track(r"C:\m\03-blank.mp3", "Untitled", None, None),
         ]
     }
 
@@ -761,7 +1007,11 @@ mod tests {
             vec![0],
             "album"
         );
-        assert_eq!(filter_tracks(&tracks, Some("03-")), vec![2], "nombre de archivo");
+        assert_eq!(
+            filter_tracks(&tracks, Some("03-")),
+            vec![2],
+            "nombre de archivo"
+        );
     }
 
     #[test]

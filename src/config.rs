@@ -63,7 +63,7 @@ pub struct Config {
     /// miku. El valor eliminado `caida` avisa específicamente y cae a `barras`.
     pub visualizer_mode: VisualizerMode,
     /// `true` cuando `[visualizer] mode` viene explicitado en config.toml: un
-    /// modo escrito a mano gana sobre el default que el tema declara (D1: el
+    /// modo escrito a mano gana sobre el default que el tema declara (el
     /// tema miku arranca en modo bailarina solo si no hay modo explícito).
     pub(crate) visualizer_mode_explicit: bool,
     /// `true` cuando `parse()` encontró el valor eliminado `caida` en
@@ -127,9 +127,7 @@ fn base_config_dir() -> Option<PathBuf> {
 
 fn resolve_path() -> Option<(PathBuf, bool)> {
     match env::var(CONFIG_ENV_OVERRIDE) {
-        Ok(custom) if !custom.trim().is_empty() => {
-            Some((PathBuf::from(custom), true))
-        }
+        Ok(custom) if !custom.trim().is_empty() => Some((PathBuf::from(custom), true)),
         _ => default_path().map(|path| (path, false)),
     }
 }
@@ -174,10 +172,7 @@ pub fn load() -> Config {
             }
         }
         Err(err) => Config {
-            warnings: vec![format!(
-                "no se pudo leer '{}': {err}",
-                path.display()
-            )],
+            warnings: vec![format!("no se pudo leer '{}': {err}", path.display())],
             ..Config::default()
         },
     }
@@ -222,9 +217,7 @@ pub fn parse(text: &str) -> Config {
     for section in table.keys() {
         match section.as_str() {
             "theme" | "keybindings" | "library" | "ui" | "visualizer" => {}
-            other => warnings.push(format!(
-                "sección desconocida «[{other}]» (se ignora)"
-            )),
+            other => warnings.push(format!("sección desconocida «[{other}]» (se ignora)")),
         }
     }
 
@@ -243,9 +236,7 @@ pub fn parse(text: &str) -> Config {
     match table.get("keybindings") {
         None => {}
         Some(value) => match value.as_table() {
-            Some(section) => {
-                parse_keybindings(section, &mut config.keys, &mut warnings)
-            }
+            Some(section) => parse_keybindings(section, &mut config.keys, &mut warnings),
             None => warnings.push(
                 "[keybindings] debe ser una tabla con claves de la forma \
                  clave = \"valor\""
@@ -258,21 +249,18 @@ pub fn parse(text: &str) -> Config {
         None => {}
         Some(value) => match value.as_table() {
             Some(section) => parse_ui(section, &mut config, &mut warnings),
-            None => warnings.push(
-                "[ui] debe ser una tabla, por ejemplo: mouse = false".to_string(),
-            ),
+            None => {
+                warnings.push("[ui] debe ser una tabla, por ejemplo: mouse = false".to_string())
+            }
         },
     }
 
     match table.get("visualizer") {
         None => {}
         Some(value) => match value.as_table() {
-            Some(section) => {
-                parse_visualizer(section, &mut config, &mut warnings)
-            }
+            Some(section) => parse_visualizer(section, &mut config, &mut warnings),
             None => warnings.push(
-                "[visualizer] debe ser una tabla, por ejemplo: style = \"ascii\""
-                    .to_string(),
+                "[visualizer] debe ser una tabla, por ejemplo: style = \"ascii\"".to_string(),
             ),
         },
     }
@@ -280,9 +268,7 @@ pub fn parse(text: &str) -> Config {
     match table.get("library") {
         None => {}
         Some(value) => match value.as_table() {
-            Some(section) => {
-                parse_library(section, &mut config.library, &mut warnings)
-            }
+            Some(section) => parse_library(section, &mut config.library, &mut warnings),
             None => warnings.push(
                 "[library] debe ser una tabla con claves de la forma \
                  roots = [\"ruta\", ...]"
@@ -291,7 +277,7 @@ pub fn parse(text: &str) -> Config {
         },
     }
 
-    // D1: el tema Miku arranca en modo bailarina salvo que `[visualizer]
+    // el tema Miku arranca en modo bailarina salvo que `[visualizer]
     // mode` venga explicitado (un modo a mano gana, y se cambia desde el
     // sub-modal de modo).
     if !config.visualizer_mode_explicit && config.theme_name == "miku" {
@@ -365,8 +351,8 @@ impl Default for Theme {
             // Gradiente del visualizador dentro de la paleta Dragon:
             // violeta (base) → celeste (mitad) → rojo (pico): frío en lo
             // bajo, cálido solo en los máximos, coherente con el resto.
-            spectrum_low: Color::Rgb(0x89, 0x92, 0xA7),  // dragonViolet
-            spectrum_mid: Color::Rgb(0x7F, 0xB4, 0xCA),  // springBlue
+            spectrum_low: Color::Rgb(0x89, 0x92, 0xA7), // dragonViolet
+            spectrum_mid: Color::Rgb(0x7F, 0xB4, 0xCA), // springBlue
             spectrum_high: Color::Rgb(0xC4, 0x74, 0x6E), // dragonRed
             // dragonSilver / dragonGray: franja clara sobre el gris de la barra.
             buffered: Color::Rgb(0xA6, 0xA6, 0x9C),
@@ -374,20 +360,13 @@ impl Default for Theme {
     }
 }
 
-fn parse_theme(
-    section: &toml::Table,
-    config: &mut Config,
-    warnings: &mut Vec<String>,
-) {
+fn parse_theme(section: &toml::Table, config: &mut Config, warnings: &mut Vec<String>) {
     // Pass 1: `name` — resuelve la paleta base ANTES de los overrides de
     // color, que siguen pisando lo que sea.
     match section.get("name") {
         None => {}
         Some(value) => match value.as_str() {
-            Some(raw) => match builtin_themes()
-                .iter()
-                .find(|(id, _)| *id == raw)
-            {
+            Some(raw) => match builtin_themes().iter().find(|(id, _)| *id == raw) {
                 Some((id, theme)) => {
                     config.theme_name = id.to_string();
                     config.theme = theme.clone();
@@ -476,7 +455,7 @@ pub fn parse_color(raw: &str) -> Option<Color> {
 }
 
 // ---------------------------------------------------------------------------
-// Paletas builtin 
+// Paletas builtin
 // ---------------------------------------------------------------------------
 
 /// Las 7 paletas oficiales, en orden estable de menú. El id es el identificador
@@ -491,107 +470,128 @@ pub fn builtin_themes() -> &'static [(&'static str, Theme)] {
                 // Kanagawa Dragon == Theme::default() (rebelot/kanagawa.nvim).
                 ("kanagawa-dragon", Theme::default()),
                 // folke/tokyonight.nvim, variante `night`.
-                ("tokyonight", Theme {
-                    accent: Color::Rgb(0x7A, 0xA2, 0xF7),   // blue
-                    text: Color::Rgb(0xC0, 0xCA, 0xF5),     // fg
-                    dim: Color::Rgb(0x56, 0x5F, 0x89),      // comment
-                    select_bg: Color::Rgb(0x29, 0x2E, 0x42), // bg_highlight
-                    error: Color::Rgb(0xF7, 0x76, 0x8E),    // red
-                    ok: Color::Rgb(0x9E, 0xCE, 0x6A),       // green
-                    warn: Color::Rgb(0xE0, 0xAF, 0x68),     // yellow
-                    spectrum_low: Color::Rgb(0x7D, 0xCF, 0xFF), // cyan
-                    spectrum_mid: Color::Rgb(0x7A, 0xA2, 0xF7), // blue
-                    spectrum_high: Color::Rgb(0xF7, 0x76, 0x8E), // red
-                    buffered: Color::Rgb(0x54, 0x5C, 0x7E), // dark3
-                }),
+                (
+                    "tokyonight",
+                    Theme {
+                        accent: Color::Rgb(0x7A, 0xA2, 0xF7),        // blue
+                        text: Color::Rgb(0xC0, 0xCA, 0xF5),          // fg
+                        dim: Color::Rgb(0x56, 0x5F, 0x89),           // comment
+                        select_bg: Color::Rgb(0x29, 0x2E, 0x42),     // bg_highlight
+                        error: Color::Rgb(0xF7, 0x76, 0x8E),         // red
+                        ok: Color::Rgb(0x9E, 0xCE, 0x6A),            // green
+                        warn: Color::Rgb(0xE0, 0xAF, 0x68),          // yellow
+                        spectrum_low: Color::Rgb(0x7D, 0xCF, 0xFF),  // cyan
+                        spectrum_mid: Color::Rgb(0x7A, 0xA2, 0xF7),  // blue
+                        spectrum_high: Color::Rgb(0xF7, 0x76, 0x8E), // red
+                        buffered: Color::Rgb(0x54, 0x5C, 0x7E),      // dark3
+                    },
+                ),
                 // catppuccin/catppuccin, flavor `mocha`.
-                ("catppuccin-mocha", Theme {
-                    accent: Color::Rgb(0xCB, 0xA6, 0xF7),   // mauve
-                    text: Color::Rgb(0xCD, 0xD6, 0xF4),     // text
-                    dim: Color::Rgb(0x6C, 0x70, 0x86),      // overlay0
-                    select_bg: Color::Rgb(0x45, 0x47, 0x5A), // surface1
-                    error: Color::Rgb(0xF3, 0x8B, 0xA8),    // red
-                    ok: Color::Rgb(0xA6, 0xE3, 0xA1),       // green
-                    warn: Color::Rgb(0xF9, 0xE2, 0xAF),     // yellow
-                    spectrum_low: Color::Rgb(0x89, 0xDC, 0xEB), // sky
-                    spectrum_mid: Color::Rgb(0xB4, 0xBE, 0xFE), // lavender
-                    spectrum_high: Color::Rgb(0xF3, 0x8B, 0xA8), // red
-                    buffered: Color::Rgb(0x7F, 0x84, 0x9C), // overlay1
-                }),
+                (
+                    "catppuccin-mocha",
+                    Theme {
+                        accent: Color::Rgb(0xCB, 0xA6, 0xF7),        // mauve
+                        text: Color::Rgb(0xCD, 0xD6, 0xF4),          // text
+                        dim: Color::Rgb(0x6C, 0x70, 0x86),           // overlay0
+                        select_bg: Color::Rgb(0x45, 0x47, 0x5A),     // surface1
+                        error: Color::Rgb(0xF3, 0x8B, 0xA8),         // red
+                        ok: Color::Rgb(0xA6, 0xE3, 0xA1),            // green
+                        warn: Color::Rgb(0xF9, 0xE2, 0xAF),          // yellow
+                        spectrum_low: Color::Rgb(0x89, 0xDC, 0xEB),  // sky
+                        spectrum_mid: Color::Rgb(0xB4, 0xBE, 0xFE),  // lavender
+                        spectrum_high: Color::Rgb(0xF3, 0x8B, 0xA8), // red
+                        buffered: Color::Rgb(0x7F, 0x84, 0x9C),      // overlay1
+                    },
+                ),
                 // dracula/dracula-theme (colores core).
-                ("dracula", Theme {
-                    accent: Color::Rgb(0xBD, 0x93, 0xF9),   // purple
-                    text: Color::Rgb(0xF8, 0xF8, 0xF2),     // fg
-                    dim: Color::Rgb(0x62, 0x72, 0xA4),      // comment
-                    select_bg: Color::Rgb(0x44, 0x47, 0x5A), // selection
-                    error: Color::Rgb(0xFF, 0x55, 0x55),    // red
-                    ok: Color::Rgb(0x50, 0xFA, 0x7B),       // green
-                    warn: Color::Rgb(0xF1, 0xFA, 0x8C),     // yellow
-                    spectrum_low: Color::Rgb(0x8B, 0xE9, 0xFD), // cyan
-                    spectrum_mid: Color::Rgb(0xFF, 0x79, 0xC6), // pink
-                    spectrum_high: Color::Rgb(0xFF, 0x55, 0x55), // red
-                    // El set core de Dracula no tiene un neutro claro extra:
-                    // la franja `buffered` reusa el fg («franja clara»).
-                    buffered: Color::Rgb(0xF8, 0xF8, 0xF2), // fg
-                }),
+                (
+                    "dracula",
+                    Theme {
+                        accent: Color::Rgb(0xBD, 0x93, 0xF9),        // purple
+                        text: Color::Rgb(0xF8, 0xF8, 0xF2),          // fg
+                        dim: Color::Rgb(0x62, 0x72, 0xA4),           // comment
+                        select_bg: Color::Rgb(0x44, 0x47, 0x5A),     // selection
+                        error: Color::Rgb(0xFF, 0x55, 0x55),         // red
+                        ok: Color::Rgb(0x50, 0xFA, 0x7B),            // green
+                        warn: Color::Rgb(0xF1, 0xFA, 0x8C),          // yellow
+                        spectrum_low: Color::Rgb(0x8B, 0xE9, 0xFD),  // cyan
+                        spectrum_mid: Color::Rgb(0xFF, 0x79, 0xC6),  // pink
+                        spectrum_high: Color::Rgb(0xFF, 0x55, 0x55), // red
+                        // El set core de Dracula no tiene un neutro claro extra:
+                        // la franja `buffered` reusa el fg («franja clara»).
+                        buffered: Color::Rgb(0xF8, 0xF8, 0xF2), // fg
+                    },
+                ),
                 // morhetz/gruvbox (dark; tonos bright para estados).
-                ("gruvbox-dark", Theme {
-                    accent: Color::Rgb(0xFE, 0x80, 0x19),   // orange
-                    text: Color::Rgb(0xEB, 0xDB, 0xB2),     // fg bright
-                    dim: Color::Rgb(0x7C, 0x6F, 0x64),      // dark4
-                    select_bg: Color::Rgb(0x3C, 0x38, 0x36), // bg1
-                    error: Color::Rgb(0xFB, 0x49, 0x34),    // red bright
-                    ok: Color::Rgb(0xB8, 0xBB, 0x26),       // green bright
-                    warn: Color::Rgb(0xFA, 0xBD, 0x2F),     // yellow bright
-                    spectrum_low: Color::Rgb(0x8E, 0xC0, 0x7C), // aqua bright
-                    spectrum_mid: Color::Rgb(0x83, 0xA5, 0x98), // blue bright
-                    spectrum_high: Color::Rgb(0xFE, 0x80, 0x19), // orange
-                    buffered: Color::Rgb(0x92, 0x83, 0x74), // gray
-                }),
+                (
+                    "gruvbox-dark",
+                    Theme {
+                        accent: Color::Rgb(0xFE, 0x80, 0x19),        // orange
+                        text: Color::Rgb(0xEB, 0xDB, 0xB2),          // fg bright
+                        dim: Color::Rgb(0x7C, 0x6F, 0x64),           // dark4
+                        select_bg: Color::Rgb(0x3C, 0x38, 0x36),     // bg1
+                        error: Color::Rgb(0xFB, 0x49, 0x34),         // red bright
+                        ok: Color::Rgb(0xB8, 0xBB, 0x26),            // green bright
+                        warn: Color::Rgb(0xFA, 0xBD, 0x2F),          // yellow bright
+                        spectrum_low: Color::Rgb(0x8E, 0xC0, 0x7C),  // aqua bright
+                        spectrum_mid: Color::Rgb(0x83, 0xA5, 0x98),  // blue bright
+                        spectrum_high: Color::Rgb(0xFE, 0x80, 0x19), // orange
+                        buffered: Color::Rgb(0x92, 0x83, 0x74),      // gray
+                    },
+                ),
                 // nordtheme/nord (nord0–nord15).
-                ("nord", Theme {
-                    accent: Color::Rgb(0x88, 0xC0, 0xD0),   // nord8
-                    text: Color::Rgb(0xD8, 0xDE, 0xE9),     // nord4
-                    dim: Color::Rgb(0x4C, 0x56, 0x6A),      // nord3
-                    select_bg: Color::Rgb(0x3B, 0x42, 0x52), // nord1
-                    error: Color::Rgb(0xBF, 0x61, 0x6A),    // nord11
-                    ok: Color::Rgb(0xA3, 0xBE, 0x8C),       // nord14
-                    warn: Color::Rgb(0xEB, 0xCB, 0x8B),     // nord13
-                    spectrum_low: Color::Rgb(0x8F, 0xBC, 0xBB), // nord7
-                    spectrum_mid: Color::Rgb(0x81, 0xA1, 0xC1), // nord9
-                    spectrum_high: Color::Rgb(0xD0, 0x87, 0x70), // nord12
-                    buffered: Color::Rgb(0x5E, 0x81, 0xAC), // nord10
-                }),
+                (
+                    "nord",
+                    Theme {
+                        accent: Color::Rgb(0x88, 0xC0, 0xD0),        // nord8
+                        text: Color::Rgb(0xD8, 0xDE, 0xE9),          // nord4
+                        dim: Color::Rgb(0x4C, 0x56, 0x6A),           // nord3
+                        select_bg: Color::Rgb(0x3B, 0x42, 0x52),     // nord1
+                        error: Color::Rgb(0xBF, 0x61, 0x6A),         // nord11
+                        ok: Color::Rgb(0xA3, 0xBE, 0x8C),            // nord14
+                        warn: Color::Rgb(0xEB, 0xCB, 0x8B),          // nord13
+                        spectrum_low: Color::Rgb(0x8F, 0xBC, 0xBB),  // nord7
+                        spectrum_mid: Color::Rgb(0x81, 0xA1, 0xC1),  // nord9
+                        spectrum_high: Color::Rgb(0xD0, 0x87, 0x70), // nord12
+                        buffered: Color::Rgb(0x5E, 0x81, 0xAC),      // nord10
+                    },
+                ),
                 // rosé-pine/main (Rosé Pine).
-                ("rose-pine", Theme {
-                    accent: Color::Rgb(0xC4, 0xA7, 0xE7),   // iris
-                    text: Color::Rgb(0xE0, 0xDE, 0xF4),     // text
-                    dim: Color::Rgb(0x6E, 0x6A, 0x86),      // muted
-                    select_bg: Color::Rgb(0x40, 0x3D, 0x52), // highlightMed
-                    error: Color::Rgb(0xEB, 0x6F, 0x92),    // love
-                    ok: Color::Rgb(0x31, 0x74, 0x8F),       // pine
-                    warn: Color::Rgb(0xF6, 0xC1, 0x77),     // gold
-                    spectrum_low: Color::Rgb(0x9C, 0xCF, 0xD8), // foam
-                    spectrum_mid: Color::Rgb(0xC4, 0xA7, 0xE7), // iris
-                    spectrum_high: Color::Rgb(0xEB, 0xBC, 0xBA), // rose
-                    buffered: Color::Rgb(0x90, 0x8C, 0xAA), // subtle
-                }),
+                (
+                    "rose-pine",
+                    Theme {
+                        accent: Color::Rgb(0xC4, 0xA7, 0xE7),        // iris
+                        text: Color::Rgb(0xE0, 0xDE, 0xF4),          // text
+                        dim: Color::Rgb(0x6E, 0x6A, 0x86),           // muted
+                        select_bg: Color::Rgb(0x40, 0x3D, 0x52),     // highlightMed
+                        error: Color::Rgb(0xEB, 0x6F, 0x92),         // love
+                        ok: Color::Rgb(0x31, 0x74, 0x8F),            // pine
+                        warn: Color::Rgb(0xF6, 0xC1, 0x77),          // gold
+                        spectrum_low: Color::Rgb(0x9C, 0xCF, 0xD8),  // foam
+                        spectrum_mid: Color::Rgb(0xC4, 0xA7, 0xE7),  // iris
+                        spectrum_high: Color::Rgb(0xEB, 0xBC, 0xBA), // rose
+                        buffered: Color::Rgb(0x90, 0x8C, 0xAA),      // subtle
+                    },
+                ),
                 // Hatsune Miku: turquesa/cian de su paleta oficial, con el
                 // rosa como acento cálido. El modo visualizador default de
-                // este tema es la bailarina (ver parse: D1).
-                ("miku", Theme {
-                    accent: Color::Rgb(0x39, 0xC5, 0xBB),   // miku turquesa
-                    text: Color::Rgb(0xE8, 0xF1, 0xF3),     // hielo
-                    dim: Color::Rgb(0x7F, 0xA8, 0xAC),      // teal grisáceo
-                    select_bg: Color::Rgb(0x1F, 0x2E, 0x33), // teal noche
-                    error: Color::Rgb(0xFF, 0x6E, 0x9B),    // miku rosa
-                    ok: Color::Rgb(0x7B, 0xE0, 0xC0),       // menta
-                    warn: Color::Rgb(0xFF, 0xD1, 0x66),     // amarillo cálido
-                    spectrum_low: Color::Rgb(0x39, 0xC5, 0xBB), // turquesa
-                    spectrum_mid: Color::Rgb(0x6B, 0xE5, 0xF5), // cian
-                    spectrum_high: Color::Rgb(0xFF, 0x9F, 0xD0), // rosa
-                    buffered: Color::Rgb(0x4A, 0x8B, 0x90), // teal oscuro
-                }),
+                // este tema es la bailarina (ver parse).
+                (
+                    "miku",
+                    Theme {
+                        accent: Color::Rgb(0x39, 0xC5, 0xBB),        // miku turquesa
+                        text: Color::Rgb(0xE8, 0xF1, 0xF3),          // hielo
+                        dim: Color::Rgb(0x7F, 0xA8, 0xAC),           // teal grisáceo
+                        select_bg: Color::Rgb(0x1F, 0x2E, 0x33),     // teal noche
+                        error: Color::Rgb(0xFF, 0x6E, 0x9B),         // miku rosa
+                        ok: Color::Rgb(0x7B, 0xE0, 0xC0),            // menta
+                        warn: Color::Rgb(0xFF, 0xD1, 0x66),          // amarillo cálido
+                        spectrum_low: Color::Rgb(0x39, 0xC5, 0xBB),  // turquesa
+                        spectrum_mid: Color::Rgb(0x6B, 0xE5, 0xF5),  // cian
+                        spectrum_high: Color::Rgb(0xFF, 0x9F, 0xD0), // rosa
+                        buffered: Color::Rgb(0x4A, 0x8B, 0x90),      // teal oscuro
+                    },
+                ),
             ]
         })
         .as_slice()
@@ -719,11 +719,11 @@ fn edit_section_key(text: &str, section: &str, key: &str, value: &str) -> String
         ""
     }
 
-    let mut lines: Vec<String> =
-        text.split('\n').map(str::to_string).collect();
+    let mut lines: Vec<String> = text.split('\n').map(str::to_string).collect();
 
-    let Some(start) =
-        lines.iter().position(|l| header_section(l) == Some(section))
+    let Some(start) = lines
+        .iter()
+        .position(|l| header_section(l) == Some(section))
     else {
         // Sin sección: agregarla al final, sin tocar lo existente.
         let mut out = text.to_string();
@@ -798,9 +798,7 @@ fn persist_key_at(
 ) -> Result<(), String> {
     let existing = match fs::read_to_string(path) {
         Ok(text) => text,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            String::new()
-        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(err) => {
             return Err(format!("no se pudo leer '{}': {err}", path.display()));
         }
@@ -810,7 +808,12 @@ fn persist_key_at(
     let persisted = updated
         .parse::<toml::Table>()
         .ok()
-        .and_then(|table| table.get(section)?.get(key).map(|saved| value.matches(saved)))
+        .and_then(|table| {
+            table
+                .get(section)?
+                .get(key)
+                .map(|saved| value.matches(saved))
+        })
         .unwrap_or(false);
     if !persisted {
         return Err(format!(
@@ -842,7 +845,7 @@ fn persist_key_at(
     }
 }
 
-// Persistencia del tema 
+// Persistencia del tema
 // ---------------------------------------------------------------------------
 
 /// Actualiza (o inserta) solo la clave `name` dentro de `[theme]` de un texto
@@ -865,9 +868,7 @@ pub(crate) fn persist_theme_name_at(path: &Path, name: &str) -> Result<(), Strin
 /// `MP3TUI_CONFIG`).
 pub fn persist_theme_name(name: &str) -> Result<(), String> {
     let Some((path, _)) = resolve_path() else {
-        return Err(
-            "no se pudo guardar el tema: sin ruta de config".to_string(),
-        );
+        return Err("no se pudo guardar el tema: sin ruta de config".to_string());
     };
     persist_theme_name_at(&path, name)
 }
@@ -968,11 +969,7 @@ impl Default for Keys {
     }
 }
 
-fn parse_keybindings(
-    section: &toml::Table,
-    keys: &mut Keys,
-    warnings: &mut Vec<String>,
-) {
+fn parse_keybindings(section: &toml::Table, keys: &mut Keys, warnings: &mut Vec<String>) {
     for (key, value) in section {
         let field = match key.as_str() {
             "quit" => &mut keys.quit,
@@ -1003,9 +1000,7 @@ fn parse_keybindings(
             "select" => &mut keys.select,
             "back" => &mut keys.back,
             other => {
-                warnings.push(format!(
-                    "[keybindings] acción desconocida «{other}»"
-                ));
+                warnings.push(format!("[keybindings] acción desconocida «{other}»"));
                 continue;
             }
         };
@@ -1071,7 +1066,11 @@ fn resolve_key_collisions(keys: &mut Keys, warnings: &mut Vec<String>) {
         ("open_url", &mut keys.open_url, &defaults.open_url),
         ("enqueue", &mut keys.enqueue, &defaults.enqueue),
         ("queue_panel", &mut keys.queue_panel, &defaults.queue_panel),
-        ("queue_delete", &mut keys.queue_delete, &defaults.queue_delete),
+        (
+            "queue_delete",
+            &mut keys.queue_delete,
+            &defaults.queue_delete,
+        ),
         ("settings", &mut keys.settings, &defaults.settings),
         ("move_up", &mut keys.move_up, &defaults.move_up),
         ("move_down", &mut keys.move_down, &defaults.move_down),
@@ -1099,8 +1098,7 @@ fn resolve_key_collisions(keys: &mut Keys, warnings: &mut Vec<String>) {
                     // Misma tecla repetida dentro de la misma acción.
                 }
                 Some((_, winner, winner_default)) => {
-                    let inherited = winner_default.contains(&key)
-                        && default.contains(&key);
+                    let inherited = winner_default.contains(&key) && default.contains(&key);
                     if inherited {
                         // Colisión heredada de los defaults: el orden del
                         // dispatch ya la resuelve; se conserva tal cual.
@@ -1131,11 +1129,7 @@ fn resolve_key_collisions(keys: &mut Keys, warnings: &mut Vec<String>) {
         let restored: Vec<KeyCode> = default
             .iter()
             .copied()
-            .filter(|key| {
-                !owned
-                    .iter()
-                    .any(|(k, _, _)| *k == normalize_key(*key))
-            })
+            .filter(|key| !owned.iter().any(|(k, _, _)| *k == normalize_key(*key)))
             .collect();
         if restored.is_empty() {
             continue;
@@ -1148,8 +1142,7 @@ fn resolve_key_collisions(keys: &mut Keys, warnings: &mut Vec<String>) {
 
     // Un warning por acción perdedora, agrupando sus teclas perdidas.
     let mut order: Vec<&'static str> = Vec::new();
-    let mut groups: Vec<(&'static str, Vec<(KeyCode, &'static str)>)> =
-        Vec::new();
+    let mut groups: Vec<(&'static str, Vec<(KeyCode, &'static str)>)> = Vec::new();
     for (loser, key, winner) in &lost {
         if !order.contains(loser) {
             order.push(loser);
@@ -1180,14 +1173,8 @@ fn resolve_key_collisions(keys: &mut Keys, warnings: &mut Vec<String>) {
                 ganadores.push(winner);
             }
         }
-        let (final_keys, emptied) = match entries
-            .iter()
-            .find(|(name, _, _)| *name == loser)
-        {
-            Some((name, list, _)) => (
-                (**list).clone(),
-                emptied_actions.contains(name),
-            ),
+        let (final_keys, emptied) = match entries.iter().find(|(name, _, _)| *name == loser) {
+            Some((name, list, _)) => ((**list).clone(), emptied_actions.contains(name)),
             None => (Vec::new(), false),
         };
         let destino = if final_keys.is_empty() {
@@ -1198,10 +1185,7 @@ fn resolve_key_collisions(keys: &mut Keys, warnings: &mut Vec<String>) {
                 key_labels(&final_keys)
             )
         } else {
-            format!(
-                "conserva sus otras teclas ({})",
-                key_labels(&final_keys)
-            )
+            format!("conserva sus otras teclas ({})", key_labels(&final_keys))
         };
         warnings.push(format!(
             "[keybindings] {loser} pierde {teclas} frente a {} \
@@ -1268,7 +1252,7 @@ pub fn pressed_ctrl(bindings: &[KeyCode], key: KeyEvent) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Biblioteca 
+// Biblioteca
 // ---------------------------------------------------------------------------
 
 /// Carpetas a escanear cuando la CLI no recibe ningún path. El
@@ -1317,9 +1301,7 @@ fn known_dirs_from(home: &Path, config_home: &Path) -> Vec<PathBuf> {
     let xdg = xdg_user_dirs(config_home, home);
     KNOWN_DIR_NAMES
         .iter()
-        .map(|name| {
-            xdg.get(*name).cloned().unwrap_or_else(|| home.join(name))
-        })
+        .map(|name| xdg.get(*name).cloned().unwrap_or_else(|| home.join(name)))
         .filter(|path| path.is_dir())
         .collect()
 }
@@ -1366,8 +1348,11 @@ fn xdg_user_dirs(
             .replace("${HOME}", &home_str)
             .replace("$HOME", &home_str);
         let path = PathBuf::from(expanded);
-        let path =
-            if path.is_absolute() { path } else { home.join(path) };
+        let path = if path.is_absolute() {
+            path
+        } else {
+            home.join(path)
+        };
         dirs.insert(*name, path);
     }
     dirs
@@ -1442,7 +1427,7 @@ pub fn resolve_visualizer_style(
 }
 
 // ---------------------------------------------------------------------------
-// Persistencia del estilo de bandas 
+// Persistencia del estilo de bandas
 // ---------------------------------------------------------------------------
 
 /// Actualiza (o inserta) solo la clave `style` dentro de `[visualizer]` de un
@@ -1463,10 +1448,7 @@ pub fn update_visualizer_style(text: &str, style: &str) -> String {
 /// Escribe el `style` en `path` de forma atómica (archivo temporal +
 /// rename). Crea el archivo (y su directorio) si no existe. Nunca toca la
 /// config real: las pruebas usan rutas temporales vía esta función.
-pub(crate) fn persist_visualizer_style_at(
-    path: &Path,
-    style: &str,
-) -> Result<(), String> {
+pub(crate) fn persist_visualizer_style_at(path: &Path, style: &str) -> Result<(), String> {
     persist_key_at(
         path,
         "visualizer",
@@ -1480,15 +1462,13 @@ pub(crate) fn persist_visualizer_style_at(
 /// `MP3TUI_CONFIG`).
 pub fn persist_visualizer_style(style: &str) -> Result<(), String> {
     let Some((path, _)) = resolve_path() else {
-        return Err(
-            "no se pudo guardar el estilo: sin ruta de config".to_string(),
-        );
+        return Err("no se pudo guardar el estilo: sin ruta de config".to_string());
     };
     persist_visualizer_style_at(&path, style)
 }
 
 // ---------------------------------------------------------------------------
-// Modo del visualizador 
+// Modo del visualizador
 // ---------------------------------------------------------------------------
 
 /// Modo de dibujo del visualizador (`[visualizer] mode`).
@@ -1552,10 +1532,7 @@ pub fn update_visualizer_mode(text: &str, mode: &str) -> String {
 /// Escribe el `mode` en `path` de forma atómica (archivo temporal +
 /// rename). Crea el archivo (y su directorio) si no existe. Nunca toca la
 /// config real: las pruebas usan rutas temporales vía esta función.
-pub(crate) fn persist_visualizer_mode_at(
-    path: &Path,
-    mode: &str,
-) -> Result<(), String> {
+pub(crate) fn persist_visualizer_mode_at(path: &Path, mode: &str) -> Result<(), String> {
     persist_key_at(
         path,
         "visualizer",
@@ -1569,9 +1546,7 @@ pub(crate) fn persist_visualizer_mode_at(
 /// `MP3TUI_CONFIG`).
 pub fn persist_visualizer_mode(mode: &str) -> Result<(), String> {
     let Some((path, _)) = resolve_path() else {
-        return Err(
-            "no se pudo guardar el modo: sin ruta de config".to_string(),
-        );
+        return Err("no se pudo guardar el modo: sin ruta de config".to_string());
     };
     persist_visualizer_mode_at(&path, mode)
 }
@@ -1583,9 +1558,7 @@ pub fn persist_visualizer_mode(mode: &str) -> Result<(), String> {
 /// archivos). Best-effort: un fallo al escribir se agrega a `warnings` en
 /// vez de entrar en pánico; sin reintentos.
 fn migrate_removed_visualizer_mode_at(path: &Path, warnings: &mut Vec<String>) {
-    if let Err(err) =
-        persist_visualizer_mode_at(path, VisualizerMode::Barras.as_str())
-    {
+    if let Err(err) = persist_visualizer_mode_at(path, VisualizerMode::Barras.as_str()) {
         warnings.push(format!(
             "no se pudo corregir automáticamente [visualizer] mode \
              («caida» → «barras») en '{}': {err}",
@@ -1595,7 +1568,7 @@ fn migrate_removed_visualizer_mode_at(path: &Path, warnings: &mut Vec<String>) {
 }
 
 // ---------------------------------------------------------------------------
-// Persistencia del toggle de mouse 
+// Persistencia del toggle de mouse
 // ---------------------------------------------------------------------------
 
 /// Actualiza (o inserta) solo la clave `mouse` dentro de `[ui]` de un texto
@@ -1619,9 +1592,7 @@ pub(crate) fn persist_mouse_enabled_at(path: &Path, enabled: bool) -> Result<(),
 /// `MP3TUI_CONFIG`).
 pub fn persist_mouse_enabled(enabled: bool) -> Result<(), String> {
     let Some((path, _)) = resolve_path() else {
-        return Err(
-            "no se pudo guardar el mouse: sin ruta de config".to_string(),
-        );
+        return Err("no se pudo guardar el mouse: sin ruta de config".to_string());
     };
     persist_mouse_enabled_at(&path, enabled)
 }
@@ -1632,27 +1603,19 @@ pub fn persist_mouse_enabled(enabled: bool) -> Result<(), String> {
 /// y cae a `barras` (`load()` migra la config real, ver
 /// `migrate_removed_visualizer_mode_at`). Merge campo a campo como el
 /// resto: lo inválido avisa y cae al default sin tocar lo demás.
-fn parse_visualizer(
-    section: &toml::Table,
-    config: &mut Config,
-    warnings: &mut Vec<String>,
-) {
+fn parse_visualizer(section: &toml::Table, config: &mut Config, warnings: &mut Vec<String>) {
     for (key, value) in section {
         match key.as_str() {
             "style" => match value.as_str() {
-                Some(raw) => {
-                    match raw.trim().to_ascii_lowercase().as_str() {
-                        "auto" => config.visualizer_style = VisualizerStyle::Auto,
-                        "ascii" => config.visualizer_style = VisualizerStyle::Ascii,
-                        "unicode" => {
-                            config.visualizer_style = VisualizerStyle::Unicode
-                        }
-                        _ => warnings.push(format!(
-                            "[visualizer] style «{raw}» no reconocido \
+                Some(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+                    "auto" => config.visualizer_style = VisualizerStyle::Auto,
+                    "ascii" => config.visualizer_style = VisualizerStyle::Ascii,
+                    "unicode" => config.visualizer_style = VisualizerStyle::Unicode,
+                    _ => warnings.push(format!(
+                        "[visualizer] style «{raw}» no reconocido \
                              (válidos: auto, ascii, unicode); se usa «auto»"
-                        )),
-                    }
-                }
+                    )),
+                },
                 None => warnings.push(
                     "[visualizer] style debe ser un texto entre comillas, \
                      p. ej. style = \"ascii\"; se usa «auto»"
@@ -1663,7 +1626,7 @@ fn parse_visualizer(
                 Some(raw) => {
                     let normalized = raw.trim().to_ascii_lowercase();
                     // La clave existe (aunque el valor sea inválido): un modo
-                    // explícito gana sobre el default del tema (D1).
+                    // explícito gana sobre el default del tema.
                     config.visualizer_mode_explicit = true;
                     match VisualizerMode::options()
                         .into_iter()
@@ -1692,7 +1655,7 @@ fn parse_visualizer(
                     }
                 }
                 None => {
-                    // La clave existe: cuenta como modo explícito (D1).
+                    // La clave existe: cuenta como modo explícito.
                     config.visualizer_mode_explicit = true;
                     warnings.push(
                         "[visualizer] mode debe ser un texto entre comillas, \
@@ -1714,20 +1677,16 @@ fn parse_ui(section: &toml::Table, config: &mut Config, warnings: &mut Vec<Strin
         match key.as_str() {
             "mouse" => match value.as_bool() {
                 Some(enabled) => config.mouse = enabled,
-                None => warnings.push(
-                    "[ui] mouse debe ser true o false; se deja activado".to_string(),
-                ),
+                None => {
+                    warnings.push("[ui] mouse debe ser true o false; se deja activado".to_string())
+                }
             },
             other => warnings.push(format!("[ui] clave desconocida «{other}» (se ignora)")),
         }
     }
 }
 
-fn parse_library(
-    section: &toml::Table,
-    library: &mut LibraryConfig,
-    warnings: &mut Vec<String>,
-) {
+fn parse_library(section: &toml::Table, library: &mut LibraryConfig, warnings: &mut Vec<String>) {
     for (key, value) in section {
         match key.as_str() {
             "roots" => match value.as_array() {
@@ -1743,10 +1702,7 @@ fn parse_library(
                             continue;
                         };
                         if text.trim().is_empty() {
-                            warnings.push(
-                                "[library] roots: ruta vacía; se ignora"
-                                    .to_string(),
-                            );
+                            warnings.push("[library] roots: ruta vacía; se ignora".to_string());
                             continue;
                         }
                         let path = PathBuf::from(text);
@@ -1771,9 +1727,7 @@ fn parse_library(
                         .to_string(),
                 ),
             },
-            other => warnings.push(format!(
-                "[library] clave desconocida «{other}»"
-            )),
+            other => warnings.push(format!("[library] clave desconocida «{other}»")),
         }
     }
 }
@@ -1828,24 +1782,34 @@ mod tests {
     #[test]
     fn ui_mouse_defaults_on_and_can_be_disabled() {
         assert!(parse("").mouse, "mouse activado por defecto");
-        let off = parse("[ui]
-mouse = false");
+        let off = parse(
+            "[ui]
+mouse = false",
+        );
         assert!(!off.mouse);
         assert!(off.warnings.is_empty(), "{:?}", off.warnings);
     }
 
     #[test]
     fn ui_mouse_invalid_values_warn_and_keep_default() {
-        let bad = parse("[ui]
-mouse = \"no\"");
+        let bad = parse(
+            "[ui]
+mouse = \"no\"",
+        );
         assert!(bad.mouse, "un valor inválido no desactiva el mouse");
         assert_eq!(bad.warnings.len(), 1, "{:?}", bad.warnings);
         assert!(bad.warnings[0].contains("mouse"), "{:?}", bad.warnings);
 
-        let unknown = parse("[ui]
-zoom = 2");
+        let unknown = parse(
+            "[ui]
+zoom = 2",
+        );
         assert_eq!(unknown.warnings.len(), 1, "{:?}", unknown.warnings);
-        assert!(unknown.warnings[0].contains("zoom"), "{:?}", unknown.warnings);
+        assert!(
+            unknown.warnings[0].contains("zoom"),
+            "{:?}",
+            unknown.warnings
+        );
     }
 
     #[test]
@@ -1871,12 +1835,21 @@ zoom = 2");
 
         let not_a_string = parse("[visualizer]\nstyle = 42");
         assert_eq!(not_a_string.visualizer_style, VisualizerStyle::Auto);
-        assert_eq!(not_a_string.warnings.len(), 1, "{:?}", not_a_string.warnings);
+        assert_eq!(
+            not_a_string.warnings.len(),
+            1,
+            "{:?}",
+            not_a_string.warnings
+        );
 
         let unknown = parse("[visualizer]\nzoom = 2");
         assert_eq!(unknown.visualizer_style, VisualizerStyle::Auto);
         assert_eq!(unknown.warnings.len(), 1, "{:?}", unknown.warnings);
-        assert!(unknown.warnings[0].contains("zoom"), "{:?}", unknown.warnings);
+        assert!(
+            unknown.warnings[0].contains("zoom"),
+            "{:?}",
+            unknown.warnings
+        );
     }
 
     #[test]
@@ -1892,10 +1865,7 @@ zoom = 2");
         use VisualizerStyle::{Ascii, Auto, Unicode};
         assert_eq!(resolve_visualizer_style(Auto, None), Ascii);
         assert_eq!(resolve_visualizer_style(Auto, Some(""),), Ascii);
-        assert_eq!(
-            resolve_visualizer_style(Auto, Some("6e5b..."),),
-            Unicode
-        );
+        assert_eq!(resolve_visualizer_style(Auto, Some("6e5b..."),), Unicode);
         assert_eq!(resolve_visualizer_style(Ascii, Some("6e5b..."),), Ascii);
         assert_eq!(resolve_visualizer_style(Unicode, None), Unicode);
     }
@@ -1904,8 +1874,16 @@ zoom = 2");
     fn default_keys_use_b_search_tab_explorer_and_esc_only_to_quit() {
         let keys = Keys::default();
         assert_eq!(keys.search, vec![KeyCode::Char('b')], "b busca");
-        assert_eq!(keys.explorer, vec![KeyCode::Tab], "Tab abre/cierra el explorador");
-        assert_eq!(keys.quit, vec![KeyCode::Esc], "solo Esc sale (doble pulsación)");
+        assert_eq!(
+            keys.explorer,
+            vec![KeyCode::Tab],
+            "Tab abre/cierra el explorador"
+        );
+        assert_eq!(
+            keys.quit,
+            vec![KeyCode::Esc],
+            "solo Esc sale (doble pulsación)"
+        );
     }
 
     #[test]
@@ -1924,7 +1902,11 @@ zoom = 2");
     fn rose_pine_uses_main_variant_palette() {
         // rose-pine/palette, variante principal (no Moon ni Dawn).
         let theme = builtin_theme("rose-pine").expect("rose-pine existe");
-        assert_eq!(theme.select_bg, Color::Rgb(0x40, 0x3D, 0x52), "highlightMed");
+        assert_eq!(
+            theme.select_bg,
+            Color::Rgb(0x40, 0x3D, 0x52),
+            "highlightMed"
+        );
         assert_eq!(theme.spectrum_high, Color::Rgb(0xEB, 0xBC, 0xBA), "rose");
     }
 
@@ -1976,10 +1958,13 @@ zoom = 2");
             "##,
         );
         assert_eq!(config.theme.accent, Color::Rgb(0xAA, 0xBB, 0xCC));
-        assert_eq!(config.theme, Theme {
-            accent: Color::Rgb(0xAA, 0xBB, 0xCC),
-            ..Theme::default()
-        });
+        assert_eq!(
+            config.theme,
+            Theme {
+                accent: Color::Rgb(0xAA, 0xBB, 0xCC),
+                ..Theme::default()
+            }
+        );
         assert_eq!(config.keys, Keys::default());
         assert!(config.warnings.is_empty());
     }
@@ -2320,7 +2305,11 @@ zoom = 2");
             "#,
         );
         assert_eq!(config.keys.open_url, vec![KeyCode::Char('U')]);
-        assert!(config.warnings.is_empty(), "warnings: {:?}", config.warnings);
+        assert!(
+            config.warnings.is_empty(),
+            "warnings: {:?}",
+            config.warnings
+        );
     }
 
     #[test]
@@ -2334,8 +2323,16 @@ zoom = 2");
         );
         // shuffle va antes en dispatch de prioridad; open_url pierde 'u' y vuelve al default si está libre
         assert_eq!(config.warnings.len(), 1, "warnings: {:?}", config.warnings);
-        assert!(config.warnings[0].contains("open_url"), "{:?}", config.warnings);
-        assert!(config.warnings[0].contains("shuffle"), "{:?}", config.warnings);
+        assert!(
+            config.warnings[0].contains("open_url"),
+            "{:?}",
+            config.warnings
+        );
+        assert!(
+            config.warnings[0].contains("shuffle"),
+            "{:?}",
+            config.warnings
+        );
     }
 
     #[test]
@@ -2367,7 +2364,11 @@ zoom = 2");
         assert_eq!(config.keys.enqueue, vec![KeyCode::Char('w')]);
         assert_eq!(config.keys.queue_panel, vec![KeyCode::Char('C')]);
         assert_eq!(config.keys.queue_delete, vec![KeyCode::Delete]);
-        assert!(config.warnings.is_empty(), "warnings: {:?}", config.warnings);
+        assert!(
+            config.warnings.is_empty(),
+            "warnings: {:?}",
+            config.warnings
+        );
     }
 
     #[test]
@@ -2376,7 +2377,11 @@ zoom = 2");
         let config = parse("[keybindings]\nenqueue = \"voltear\"\n");
         assert_eq!(config.keys.enqueue, Keys::default().enqueue);
         assert_eq!(config.warnings.len(), 1, "warnings: {:?}", config.warnings);
-        assert!(config.warnings[0].contains("enqueue"), "{:?}", config.warnings);
+        assert!(
+            config.warnings[0].contains("enqueue"),
+            "{:?}",
+            config.warnings
+        );
     }
 
     #[test]
@@ -2390,7 +2395,11 @@ zoom = 2");
             "##,
         );
         assert_eq!(config.theme.buffered, Color::Rgb(0x12, 0x34, 0x56));
-        assert!(config.warnings.is_empty(), "warnings: {:?}", config.warnings);
+        assert!(
+            config.warnings.is_empty(),
+            "warnings: {:?}",
+            config.warnings
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -2399,8 +2408,7 @@ zoom = 2");
 
     #[test]
     fn theme_palette_table_lists_eight_ids_and_kanagawa_matches_default() {
-        let ids: Vec<&str> =
-            builtin_themes().iter().map(|(id, _)| *id).collect();
+        let ids: Vec<&str> = builtin_themes().iter().map(|(id, _)| *id).collect();
         assert_eq!(
             ids,
             vec![
@@ -2442,7 +2450,11 @@ zoom = 2");
             "##,
         );
         assert_eq!(config.theme_name, "dracula");
-        assert!(config.warnings.is_empty(), "warnings: {:?}", config.warnings);
+        assert!(
+            config.warnings.is_empty(),
+            "warnings: {:?}",
+            config.warnings
+        );
         // El override de color pisa la paleta elegida…
         assert_eq!(config.theme.accent, Color::Rgb(0x12, 0x34, 0x56));
         // …y el resto de los slots viene de la paleta dracula, no del default.
@@ -2513,7 +2525,11 @@ zoom = 2");
 
         let config = parse("[keybindings]\nsettings = \"o\"\n");
         assert_eq!(config.keys.settings, vec![KeyCode::Char('o')]);
-        assert!(config.warnings.is_empty(), "warnings: {:?}", config.warnings);
+        assert!(
+            config.warnings.is_empty(),
+            "warnings: {:?}",
+            config.warnings
+        );
     }
 
     #[test]
@@ -2521,7 +2537,11 @@ zoom = 2");
         // `settings` (Ctrl+P) y `prev_track` (p) comparten la letra pero no la
         // combinación: los defaults no generan avisos y ambos conservan su tecla.
         let config = parse("");
-        assert!(config.warnings.is_empty(), "warnings: {:?}", config.warnings);
+        assert!(
+            config.warnings.is_empty(),
+            "warnings: {:?}",
+            config.warnings
+        );
         assert_eq!(config.keys.settings, vec![KeyCode::Char('p')]);
         assert_eq!(config.keys.prev_track, vec![KeyCode::Char('p')]);
     }
@@ -2531,11 +2551,17 @@ zoom = 2");
         use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
         let bindings = vec![KeyCode::Char('p')];
         let plain = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE);
-        assert!(!pressed_ctrl(&bindings, plain), "la letra suelta no dispara settings");
+        assert!(
+            !pressed_ctrl(&bindings, plain),
+            "la letra suelta no dispara settings"
+        );
         let ctrl = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL);
         assert!(pressed_ctrl(&bindings, ctrl), "Ctrl+P sí");
         let other = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
-        assert!(!pressed_ctrl(&bindings, other), "otra tecla con Ctrl tampoco");
+        assert!(
+            !pressed_ctrl(&bindings, other),
+            "otra tecla con Ctrl tampoco"
+        );
         let upper = KeyEvent::new(KeyCode::Char('P'), KeyModifiers::CONTROL);
         assert!(pressed_ctrl(&bindings, upper), "sin distinguir mayúsculas");
     }
@@ -2579,8 +2605,7 @@ zoom = 2");
     fn update_theme_name_inserts_into_existing_section() {
         let out = update_theme_name("[theme]\naccent = \"#111111\"\n", "nord");
         assert_eq!(
-            out,
-            "[theme]\nname = \"nord\"\naccent = \"#111111\"\n",
+            out, "[theme]\nname = \"nord\"\naccent = \"#111111\"\n",
             "inserta name justo después del encabezado"
         );
 
@@ -2605,8 +2630,7 @@ zoom = 2");
             "nord",
         );
         assert_eq!(
-            out,
-            "[theme]\nname = \"nord\" # viejo\nok = \"#00FF00\"\n",
+            out, "[theme]\nname = \"nord\" # viejo\nok = \"#00FF00\"\n",
             "reemplaza solo el valor y conserva el comentario"
         );
 
@@ -2614,11 +2638,9 @@ zoom = 2");
         assert_eq!(out, "[theme]\nname = \"gruvbox-dark\"\n");
 
         // Un comentario que menciona [theme] no abre una sección.
-        let out =
-            update_theme_name("# [theme]\n[library]\nroots = []\n", "nord");
+        let out = update_theme_name("# [theme]\n[library]\nroots = []\n", "nord");
         assert!(
-            out.starts_with("# [theme]\n")
-                && out.ends_with("[theme]\nname = \"nord\"\n"),
+            out.starts_with("# [theme]\n") && out.ends_with("[theme]\nname = \"nord\"\n"),
             "{out:?}"
         );
     }
@@ -2628,22 +2650,19 @@ zoom = 2");
         let crlf = "[theme]\r\nname = \"nord\"\r\naccent = \"#111111\"\r\n";
         let out = update_theme_name(crlf, "tokyonight");
         assert_eq!(
-            out,
-            "[theme]\r\nname = \"tokyonight\"\r\naccent = \"#111111\"\r\n",
+            out, "[theme]\r\nname = \"tokyonight\"\r\naccent = \"#111111\"\r\n",
             "reemplazo con CRLF: solo cambia el valor"
         );
 
         let out = update_theme_name("[theme]\r\naccent = \"#111111\"\r\n", "nord");
         assert_eq!(
-            out,
-            "[theme]\r\nname = \"nord\"\r\naccent = \"#111111\"\r\n",
+            out, "[theme]\r\nname = \"nord\"\r\naccent = \"#111111\"\r\n",
             "inserción con CRLF"
         );
 
         let out = update_theme_name("[library]\r\nroots = []", "nord");
         assert_eq!(
-            out,
-            "[library]\r\nroots = []\r\n[theme]\r\nname = \"nord\"\r\n",
+            out, "[library]\r\nroots = []\r\n[theme]\r\nname = \"nord\"\r\n",
             "creación con CRLF y sin salto final previo"
         );
     }
@@ -2688,8 +2707,8 @@ zoom = 2");
 
     #[test]
     fn persist_theme_name_at_updates_or_creates_and_reports_errors() {
-        let path = std::env::temp_dir()
-            .join(format!("mp3tui_theme_cfg_{}.toml", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("mp3tui_theme_cfg_{}.toml", std::process::id()));
         let _ = std::fs::remove_file(&path);
 
         // 1. No existe: lo crea con la sección mínima.
@@ -2715,12 +2734,10 @@ zoom = 2");
         );
 
         // 3. Destino no escribible (directorio): error corto, sin pánico.
-        let dir = std::env::temp_dir()
-            .join(format!("mp3tui_theme_dir_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("mp3tui_theme_dir_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let err = persist_theme_name_at(&dir, "nord")
-            .expect_err("un directorio no es escribible");
+        let err = persist_theme_name_at(&dir, "nord").expect_err("un directorio no es escribible");
         assert!(!err.is_empty(), "mensaje de error no vacío");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -2769,31 +2786,20 @@ zoom = 2");
 
     #[test]
     fn update_visualizer_style_replaces_and_inserts_preserving_comments() {
-        let out = update_visualizer_style(
-            "[visualizer]\nstyle = \"unicode\"  # viejo\n",
-            "ascii",
-        );
+        let out = update_visualizer_style("[visualizer]\nstyle = \"unicode\"  # viejo\n", "ascii");
         assert_eq!(
-            out,
-            "[visualizer]\nstyle = \"ascii\" # viejo\n",
+            out, "[visualizer]\nstyle = \"ascii\" # viejo\n",
             "reemplaza solo el valor y conserva el comentario"
         );
 
-        let out = update_visualizer_style(
-            "[visualizer]\nmode = 3\n",
-            "auto",
-        );
+        let out = update_visualizer_style("[visualizer]\nmode = 3\n", "auto");
         assert_eq!(
-            out,
-            "[visualizer]\nstyle = \"auto\"\nmode = 3\n",
+            out, "[visualizer]\nstyle = \"auto\"\nmode = 3\n",
             "inserta style justo después del encabezado"
         );
 
         // Un comentario que menciona [visualizer] no abre una sección.
-        let out = update_visualizer_style(
-            "# [visualizer]\n[library]\nroots = []\n",
-            "ascii",
-        );
+        let out = update_visualizer_style("# [visualizer]\n[library]\nroots = []\n", "ascii");
         assert!(
             out.starts_with("# [visualizer]\n")
                 && out.ends_with("[visualizer]\nstyle = \"ascii\"\n"),
@@ -2847,8 +2853,8 @@ zoom = 2");
 
     #[test]
     fn persist_visualizer_style_at_updates_or_creates_and_reports_errors() {
-        let path = std::env::temp_dir()
-            .join(format!("mp3tui_bands_cfg_{}.toml", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("mp3tui_bands_cfg_{}.toml", std::process::id()));
         let _ = std::fs::remove_file(&path);
 
         // 1. No existe: lo crea con la sección mínima.
@@ -2874,12 +2880,11 @@ zoom = 2");
         );
 
         // 3. Destino no escribible (directorio): error corto, sin pánico.
-        let dir = std::env::temp_dir()
-            .join(format!("mp3tui_bands_dir_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("mp3tui_bands_dir_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let err = persist_visualizer_style_at(&dir, "ascii")
-            .expect_err("un directorio no es escribible");
+        let err =
+            persist_visualizer_style_at(&dir, "ascii").expect_err("un directorio no es escribible");
         assert!(!err.is_empty(), "mensaje de error no vacío");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -2913,15 +2918,13 @@ zoom = 2");
     fn update_ui_mouse_replaces_and_inserts_preserving_comments() {
         let out = update_ui_mouse("[ui]\nmouse = true  # viejo\n", false);
         assert_eq!(
-            out,
-            "[ui]\nmouse = false # viejo\n",
+            out, "[ui]\nmouse = false # viejo\n",
             "reemplaza solo el valor y conserva el comentario"
         );
 
         let out = update_ui_mouse("[ui]\nvolume = 50\n", true);
         assert_eq!(
-            out,
-            "[ui]\nmouse = true\nvolume = 50\n",
+            out, "[ui]\nmouse = true\nvolume = 50\n",
             "inserta mouse justo después del encabezado"
         );
 
@@ -2979,8 +2982,8 @@ zoom = 2");
 
     #[test]
     fn persist_mouse_enabled_at_updates_or_creates_and_reports_errors() {
-        let path = std::env::temp_dir()
-            .join(format!("mp3tui_mouse_cfg_{}.toml", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("mp3tui_mouse_cfg_{}.toml", std::process::id()));
         let _ = std::fs::remove_file(&path);
 
         // 1. No existe: lo crea con la sección mínima.
@@ -2990,8 +2993,7 @@ zoom = 2");
 
         // 2. Existe: solo cambia mouse; comentarios y otras secciones
         //    intactos, sin archivo temporal colgando.
-        let original =
-            "# mío\n[ui]\nmouse = true\n[visualizer]\nstyle = \"ascii\"\n";
+        let original = "# mío\n[ui]\nmouse = true\n[visualizer]\nstyle = \"ascii\"\n";
         std::fs::write(&path, original).unwrap();
         persist_mouse_enabled_at(&path, false).expect("actualiza");
         let text = std::fs::read_to_string(&path).unwrap();
@@ -3007,12 +3009,10 @@ zoom = 2");
         );
 
         // 3. Destino no escribible (directorio): error corto, sin pánico.
-        let dir = std::env::temp_dir()
-            .join(format!("mp3tui_mouse_dir_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("mp3tui_mouse_dir_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let err = persist_mouse_enabled_at(&dir, true)
-            .expect_err("un directorio no es escribible");
+        let err = persist_mouse_enabled_at(&dir, true).expect_err("un directorio no es escribible");
         assert!(!err.is_empty(), "mensaje de error no vacío");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -3079,19 +3079,25 @@ zoom = 2");
         assert!(!bad.removed_visualizer_mode);
 
         let not_a_string = parse("[visualizer]\nmode = 42");
+        assert_eq!(not_a_string.visualizer_mode, VisualizerMode::Barras);
         assert_eq!(
-            not_a_string.visualizer_mode,
-            VisualizerMode::Barras
+            not_a_string.warnings.len(),
+            1,
+            "{:?}",
+            not_a_string.warnings
         );
-        assert_eq!(not_a_string.warnings.len(), 1, "{:?}", not_a_string.warnings);
 
         let unknown = parse("[visualizer]\ntempo = 2");
         assert_eq!(unknown.visualizer_mode, VisualizerMode::Barras);
         assert_eq!(unknown.warnings.len(), 1, "{:?}", unknown.warnings);
-        assert!(unknown.warnings[0].contains("tempo"), "{:?}", unknown.warnings);
+        assert!(
+            unknown.warnings[0].contains("tempo"),
+            "{:?}",
+            unknown.warnings
+        );
     }
 
-    /// D1: el modo «miku» parsea como los demás, y el tema Miku arranca en
+    /// El modo «miku» parsea como los demás, y el tema Miku arranca en
     /// modo Miku cuando `[visualizer] mode` NO está explicitado; un modo
     /// explícito gana sobre el default del tema.
     #[test]
@@ -3108,8 +3114,7 @@ zoom = 2");
             "sin modo explícito el tema Miku activa la bailarina"
         );
 
-        let explicit_wins =
-            parse("[theme]\nname = \"miku\"\n[visualizer]\nmode = \"barras\"\n");
+        let explicit_wins = parse("[theme]\nname = \"miku\"\n[visualizer]\nmode = \"barras\"\n");
         assert_eq!(
             explicit_wins.visualizer_mode,
             VisualizerMode::Barras,
@@ -3189,13 +3194,9 @@ zoom = 2");
 
     #[test]
     fn update_visualizer_mode_replaces_and_inserts_preserving_comments() {
-        let out = update_visualizer_mode(
-            "[visualizer]\nmode = \"barras\"  # viejo\n",
-            "onda",
-        );
+        let out = update_visualizer_mode("[visualizer]\nmode = \"barras\"  # viejo\n", "onda");
         assert_eq!(
-            out,
-            "[visualizer]\nmode = \"onda\" # viejo\n",
+            out, "[visualizer]\nmode = \"onda\" # viejo\n",
             "reemplaza solo el valor y conserva el comentario"
         );
 
@@ -3203,19 +3204,14 @@ zoom = 2");
         // después del encabezado.
         let out = update_visualizer_mode("[visualizer]\nstyle = \"ascii\"\n", "espejo");
         assert_eq!(
-            out,
-            "[visualizer]\nmode = \"espejo\"\nstyle = \"ascii\"\n",
+            out, "[visualizer]\nmode = \"espejo\"\nstyle = \"ascii\"\n",
             "inserta mode justo después del encabezado"
         );
 
         // Un comentario que menciona [visualizer] no abre una sección.
-        let out = update_visualizer_mode(
-            "# [visualizer]\n[library]\nroots = []\n",
-            "vu",
-        );
+        let out = update_visualizer_mode("# [visualizer]\n[library]\nroots = []\n", "vu");
         assert!(
-            out.starts_with("# [visualizer]\n")
-                && out.ends_with("[visualizer]\nmode = \"vu\"\n"),
+            out.starts_with("# [visualizer]\n") && out.ends_with("[visualizer]\nmode = \"vu\"\n"),
             "{out:?}"
         );
 
@@ -3266,8 +3262,8 @@ zoom = 2");
 
     #[test]
     fn persist_visualizer_mode_at_updates_or_creates_and_reports_errors() {
-        let path = std::env::temp_dir()
-            .join(format!("mp3tui_mode_cfg_{}.toml", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("mp3tui_mode_cfg_{}.toml", std::process::id()));
         let _ = std::fs::remove_file(&path);
 
         // 1. No existe: lo crea con la sección mínima.
@@ -3294,12 +3290,11 @@ zoom = 2");
         );
 
         // 3. Destino no escribible (directorio): error corto, sin pánico.
-        let dir = std::env::temp_dir()
-            .join(format!("mp3tui_mode_dir_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("mp3tui_mode_dir_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let err = persist_visualizer_mode_at(&dir, "onda")
-            .expect_err("un directorio no es escribible");
+        let err =
+            persist_visualizer_mode_at(&dir, "onda").expect_err("un directorio no es escribible");
         assert!(!err.is_empty(), "mensaje de error no vacío");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -3308,8 +3303,8 @@ zoom = 2");
 
     #[test]
     fn migrate_removed_visualizer_mode_at_rewrites_caida_to_barras_once() {
-        let path = std::env::temp_dir()
-            .join(format!("mp3tui_mode_migrate_{}.toml", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("mp3tui_mode_migrate_{}.toml", std::process::id()));
         std::fs::write(&path, "# mío\n[visualizer]\nmode = \"caida\"\n").unwrap();
 
         let mut warnings = Vec::new();
@@ -3326,8 +3321,8 @@ zoom = 2");
     fn migrate_removed_visualizer_mode_at_reports_write_failure_as_warning() {
         // Destino no escribible (directorio): el error se agrega a
         // `warnings`, nunca entra en pánico ni se reintenta.
-        let dir = std::env::temp_dir()
-            .join(format!("mp3tui_mode_migrate_dir_{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("mp3tui_mode_migrate_dir_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -3340,4 +3335,3 @@ zoom = 2");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
-

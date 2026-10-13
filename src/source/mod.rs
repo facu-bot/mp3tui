@@ -74,9 +74,9 @@ fn is_page_host(host: &str) -> bool {
 /// `true` si la query trae un parámetro `list` (playlist de YouTube u otro
 /// servicio que use `?list=`). El nombre del parámetro no distingue mayúsculas.
 fn has_list_query_param(query: &str) -> bool {
-    query.split('&').any(|pair| {
-        matches!(pair.split_once('='), Some((key, _)) if key.eq_ignore_ascii_case("list"))
-    })
+    query.split('&').any(
+        |pair| matches!(pair.split_once('='), Some((key, _)) if key.eq_ignore_ascii_case("list")),
+    )
 }
 
 /// Clasifica una entrada de usuario como ruta local o URL remota.

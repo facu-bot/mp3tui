@@ -160,7 +160,6 @@ impl VisualizerTap {
         self.sample_rate
     }
 
-
     /// Lee hasta `out.len()` muestras mono. Devuelve la cantidad leída.
     pub fn read_mono(&mut self, out: &mut [f32]) -> usize {
         match self.consumer.as_mut() {
@@ -1596,7 +1595,9 @@ mod tests {
     /// `cargo test` no suene (la app sigue arrancando al 100%).
     #[test]
     fn engine_starts_muted_under_test() {
-        let Ok(engine) = AudioEngine::new() else { return };
+        let Ok(engine) = AudioEngine::new() else {
+            return;
+        };
         assert_eq!(engine.volume(), 0.0);
     }
 
@@ -2795,4 +2796,3 @@ mod tests {
         assert!(session.id > before, "stop() debe cerrar la sesión activa");
     }
 }
-

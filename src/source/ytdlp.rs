@@ -348,7 +348,7 @@ pub fn resolve_with_timeout(
 }
 
 /// Lista una URL de playlist con `yt-dlp --flat-playlist`: devuelve títulos y
-/// URL de página de cada entrada, sin resolver audio (S3). Es la operación
+/// URL de página de cada entrada, sin resolver audio. Es la operación
 /// barata que llena la cola; la resolución de audio se hace recién cuando a
 /// cada canción le toca sonar.
 pub fn list_flat(
@@ -404,10 +404,7 @@ pub fn list_flat_with_timeout(
     }
 
     let stdout_str = String::from_utf8_lossy(&output.stdout);
-    let mut lines: Vec<&str> = stdout_str
-        .lines()
-        .map(|l| l.trim())
-        .collect();
+    let mut lines: Vec<&str> = stdout_str.lines().map(|l| l.trim()).collect();
     // yt-dlp cierra cada entrada con un salto de línea: la última línea tras
     // el split queda vacía y se descarta. Las líneas vacías INTERMEDIAS son
     // títulos vacíos reales (video privado/eliminado en flat mode) y se
@@ -816,8 +813,8 @@ mod tests {
             stdout: b"Uno\nhttps://www.youtube.com/watch?v=uno\nDos\nhttps://www.youtube.com/watch?v=dos\n".to_vec(),
             stderr: Vec::new(),
         }));
-        let entries = list_flat("https://www.youtube.com/playlist?list=PL123", &fake)
-            .expect("lista válida");
+        let entries =
+            list_flat("https://www.youtube.com/playlist?list=PL123", &fake).expect("lista válida");
         assert_eq!(
             entries,
             vec![
@@ -833,15 +830,16 @@ mod tests {
         );
     }
 
-    /// S12: una entrada sin título (video privado/eliminado en flat mode) no
+    /// Entrada sin título (video privado/eliminado en flat mode) no
     /// desalinea el pareo título/URL: la línea vacía del medio se conserva
     /// como título vacío y solo se descarta el salto de línea final.
     #[test]
     fn test_list_flat_keeps_empty_title_entries_aligned() {
         let fake = FakeRunner::new(Ok(CommandOutput {
             status_code: Some(0),
-            stdout: b"\nhttps://www.youtube.com/watch?v=uno\nDos\nhttps://www.youtube.com/watch?v=dos\n"
-                .to_vec(),
+            stdout:
+                b"\nhttps://www.youtube.com/watch?v=uno\nDos\nhttps://www.youtube.com/watch?v=dos\n"
+                    .to_vec(),
             stderr: Vec::new(),
         }));
         let entries = list_flat("https://www.youtube.com/playlist?list=PL123", &fake)
@@ -870,7 +868,10 @@ mod tests {
         }));
         let entries = list_flat("https://www.youtube.com/playlist?list=vacia", &fake)
             .expect("lista vacía es válida");
-        assert!(entries.is_empty(), "una salida vacía no tiene entradas: {entries:?}");
+        assert!(
+            entries.is_empty(),
+            "una salida vacía no tiene entradas: {entries:?}"
+        );
     }
 
     #[test]
@@ -885,7 +886,11 @@ mod tests {
             matches!(res, Err(YtDlpError::InvalidUrl(_))),
             "una URL no http debe fallar: {res:?}"
         );
-        assert_eq!(fake.calls().len(), 0, "no se invoca yt-dlp con URL inválida");
+        assert_eq!(
+            fake.calls().len(),
+            0,
+            "no se invoca yt-dlp con URL inválida"
+        );
     }
 
     #[test]

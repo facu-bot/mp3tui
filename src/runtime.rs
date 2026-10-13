@@ -8,12 +8,10 @@
 use std::env;
 use std::sync::{OnceLock, RwLock};
 
-use crate::config::{
-    config, resolve_visualizer_style, Theme, VisualizerMode, VisualizerStyle,
-};
+use crate::config::{Theme, VisualizerMode, VisualizerStyle, config, resolve_visualizer_style};
 
 // ---------------------------------------------------------------------------
-// Tema activo en runtime 
+// Tema activo en runtime
 // ---------------------------------------------------------------------------
 
 /// Estado que cambia en caliente al previsualizar/aplicar temas desde el menú.
@@ -84,14 +82,13 @@ pub fn effective_visualizer_style() -> VisualizerStyle {
 }
 
 // ---------------------------------------------------------------------------
-// Estilo activo en runtime 
+// Estilo activo en runtime
 // ---------------------------------------------------------------------------
 
 /// Estilo configurado que cambia en caliente al previsualizar/aplicar desde
 /// el selector de Bandas: un solo punto de acceso y cero cambios en el
 /// render (que ya lee `effective_visualizer_style()` por frame).
-static ACTIVE_VISUALIZER: OnceLock<RwLock<VisualizerStyle>> =
-    OnceLock::new();
+static ACTIVE_VISUALIZER: OnceLock<RwLock<VisualizerStyle>> = OnceLock::new();
 
 fn visualizer_cell() -> &'static RwLock<VisualizerStyle> {
     ACTIVE_VISUALIZER.get_or_init(|| RwLock::new(config().visualizer_style))
@@ -120,12 +117,10 @@ pub fn activate_visualizer_style(style: VisualizerStyle) {
 /// Modo configurado que cambia en caliente al previsualizar/aplicar desde
 /// el selector de Modo: un solo punto de acceso; el dispatch de render lo
 /// lee por frame.
-static ACTIVE_VISUALIZER_MODE: OnceLock<RwLock<VisualizerMode>> =
-    OnceLock::new();
+static ACTIVE_VISUALIZER_MODE: OnceLock<RwLock<VisualizerMode>> = OnceLock::new();
 
 fn visualizer_mode_cell() -> &'static RwLock<VisualizerMode> {
-    ACTIVE_VISUALIZER_MODE
-        .get_or_init(|| RwLock::new(config().visualizer_mode))
+    ACTIVE_VISUALIZER_MODE.get_or_init(|| RwLock::new(config().visualizer_mode))
 }
 
 /// Modo configurado activo (el aplicado; la previsualización lo cambia en

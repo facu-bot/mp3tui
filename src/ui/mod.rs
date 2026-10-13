@@ -4,13 +4,14 @@
 //! explorador se superpone como panel lateral con Ctrl+Tab/b/Tab; a
 //! pantalla completa solo cuando no hay player (arranque por directorio).
 
-use std::io;
 use std::cell::RefCell;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use ratatui::Frame;
 use ratatui::crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
@@ -19,17 +20,16 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
-use ratatui::Frame;
 
 use crate::audio::{AudioEngine, SPEED_STEP};
-use crate::config::{self, key_labels, Theme};
+use crate::config::{self, Theme, key_labels};
 use crate::playback::{
-    filter_tracks, natural_end_action, next_track, seek_target, shuffle_order, NextAction,
-    QueueItem, RepeatMode, URL_REPLAY_TOO_SOON_MSG,
+    NextAction, QueueItem, RepeatMode, URL_REPLAY_TOO_SOON_MSG, filter_tracks, natural_end_action,
+    next_track, seek_target, shuffle_order,
 };
-use crate::playlist::{move_selection, scroll_offset, Playlist, Track};
+use crate::playlist::{Playlist, Track, move_selection, scroll_offset};
 use crate::runtime;
-use crate::visualizer::{SpectrumAnalyzer, NUM_BANDS};
+use crate::visualizer::{NUM_BANDS, SpectrumAnalyzer};
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const VOLUME_STEP: f32 = 0.05;
@@ -38,8 +38,7 @@ const PAGE_STEP: isize = 10;
 /// Bloques de octavo de celda para el visualizador sub-celda (mejora 1).
 const EIGHTH_BLOCKS: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
 /// Rampa ASCII de 10 niveles para el modo ascii (índice 0 = vacío … 9 = lleno).
-const ASCII_RAMP: [&str; 10] =
-    [" ", ".", ":", "-", "=", ";", "+", "*", "#", "@"];
+const ASCII_RAMP: [&str; 10] = [" ", ".", ":", "-", "=", ";", "+", "*", "#", "@"];
 
 // Paleta compartida por todo el programa: la celda runtime del
 // módulo `runtime`, que cambia en caliente al previsualizar/aplicar temas desde el menú
@@ -56,9 +55,9 @@ const SEARCH_CARET: &str = "\u{258f}"; // ▏ cursor de texto en modo búsqueda
 const SEARCH_BOX_WIDTH: usize = 24;
 /// Texto guía de la caja vacía.
 const SEARCH_PLACEHOLDER: &str = "escribí para buscar";
-/// Aviso cuando una lista de playlist sale vacía (S12).
+/// Aviso cuando una lista de playlist sale vacía.
 const PLAYLIST_EMPTY_MSG: &str = "La playlist no tiene canciones";
-/// Aviso cuando un ítem de la cola no arranca y se saltea (S13).
+/// Aviso cuando un ítem de la cola no arranca y se saltea.
 const QUEUE_ITEM_FAILED_MSG: &str = "No se pudo reproducir el ítem de la cola; se saltea";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -95,7 +94,7 @@ pub enum SubmitAction {
     Local(PathBuf),
     DirectAudio(String),
     Page(String),
-    /// URL de playlist: se lista con `--flat-playlist` y se encola el resto (S12).
+    /// URL de playlist: se lista con `--flat-playlist` y se encola el resto.
     Playlist(String),
     Unknown(String),
     Empty,
@@ -192,7 +191,7 @@ fn handle_ytdlp_result(
     }
 }
 
-/// Resultado del listado `--flat-playlist` de una playlist (S12). La primera
+/// Resultado del listado `--flat-playlist` de una playlist. La primera
 /// entrada se resuelve enseguida (su URL de audio vence) y el resto entra a
 /// la cola **al final** de la existente, sin tocar el cursor. Una lista vacía
 /// o un listado fallido → aviso visible y la cola queda intacta.
@@ -203,7 +202,7 @@ fn handle_playlist_result(
     resolve_page: &mut impl FnMut(String, u64) -> Receiver<YtDlpMessage>,
 ) {
     if request_id != app.ytdlp_request_id {
-        // Resultado tarde de un listado ya cancelado: se descarta (S12).
+        // Resultado tarde de un listado ya cancelado: se descarta.
         return;
     }
     match result {
@@ -214,9 +213,9 @@ fn handle_playlist_result(
             app.pending_history = None;
         }
         Ok(entries) => {
-            // Las siguientes van al final de la cola existente (D7), sin
-            // tocar el cursor de la cola (S12). Cada una se resuelve recién
-            // cuando le toque sonar (S3).
+            // Las siguientes van al final de la cola existente, sin
+            // tocar el cursor de la cola. Cada una se resuelve recién
+            // cuando le toque sonar.
             for entry in entries.iter().skip(1) {
                 // Un título vacío (video privado/eliminado en flat mode) se
                 // muestra como su URL de página, igual que en el historial.
@@ -298,7 +297,7 @@ type YtDlpListMessage = (
 );
 
 /// Disparador que inició el avance por la cola. Al agotarse la cola tras
-/// saltear un ítem fallido (S13), decide por dónde cae el fallback al pool
+/// saltear un ítem fallido, decide por dónde cae el fallback al pool
 /// de la biblioteca/historial: el fin natural o el sentido del salto manual.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QueueAdvance {
@@ -344,11 +343,11 @@ struct App {
     /// ningún ítem de la cola. Las posiciones por debajo se muestran
     /// atenuadas (ya sonaron) y las de arriba, como próximas.
     queue_cursor: Option<usize>,
-    /// Índice de la cola cuya URL se está resolviendo (S13). Si la resolución
+    /// Índice de la cola cuya URL se está resolviendo. Si la resolución
     /// falla, el event loop llama a [`skip_failed_queue_item`]: se saltea con
     /// aviso y se intenta el próximo ítem (o el pool si la cola se agota).
     queue_resolving: Option<usize>,
-    /// Disparador que inició el recorrido de la cola, para el fallback (S13).
+    /// Disparador que inició el recorrido de la cola, para el fallback.
     queue_advance: QueueAdvance,
     /// Solapa activa del panel lateral: `false` = Biblioteca, `true` = Cola.
     /// Solo tiene efecto con el panel abierto.
@@ -356,7 +355,7 @@ struct App {
     /// Selección dentro de la Cola (independiente de `selected`, la de la
     /// Biblioteca): cada lista conserva la suya al alternar.
     queue_selected: usize,
-    /// «Próximo» a tocar para la franja del panel (S3): el ítem que sigue al
+    /// «Próximo» a tocar para la franja del panel: el ítem que sigue al
     /// cursor de la cola, y con la cola agotada el siguiente del pool
     /// (biblioteca/historial con shuffle); `None` la oculta.
     next_up: Option<String>,
@@ -371,7 +370,7 @@ struct App {
     analyzer: SpectrumAnalyzer,
     url_input: Option<String>,
     ytdlp_rx: Option<Receiver<YtDlpMessage>>,
-    /// Receiver del listado `--flat-playlist` en curso (S12).
+    /// Receiver del listado `--flat-playlist` en curso.
     playlist_rx: Option<Receiver<YtDlpListMessage>>,
     ytdlp_request_id: u64,
     is_url: bool,
@@ -541,13 +540,33 @@ fn key_for_chip(keys_text: &str) -> Option<KeyCode> {
     }
     let keys = &config::config().keys;
     [
-        &keys.quit, &keys.play_pause, &keys.volume_up, &keys.volume_down,
-        &keys.seek_back, &keys.seek_fwd, &keys.prev_track, &keys.next_track,
-        &keys.shuffle, &keys.repeat, &keys.search, &keys.speed_up,
-        &keys.speed_down, &keys.explorer, &keys.move_up, &keys.move_down,
-        &keys.page_up, &keys.page_down, &keys.home, &keys.end, &keys.select,
-        &keys.back, &keys.open_url, &keys.enqueue, &keys.queue_panel,
-        &keys.queue_delete, &keys.settings,
+        &keys.quit,
+        &keys.play_pause,
+        &keys.volume_up,
+        &keys.volume_down,
+        &keys.seek_back,
+        &keys.seek_fwd,
+        &keys.prev_track,
+        &keys.next_track,
+        &keys.shuffle,
+        &keys.repeat,
+        &keys.search,
+        &keys.speed_up,
+        &keys.speed_down,
+        &keys.explorer,
+        &keys.move_up,
+        &keys.move_down,
+        &keys.page_up,
+        &keys.page_down,
+        &keys.home,
+        &keys.end,
+        &keys.select,
+        &keys.back,
+        &keys.open_url,
+        &keys.enqueue,
+        &keys.queue_panel,
+        &keys.queue_delete,
+        &keys.settings,
     ]
     .into_iter()
     .flatten()
@@ -566,7 +585,6 @@ fn settings_key_display() -> String {
         label
     }
 }
-
 
 /// Fila de controles clickeables: la línea a dibujar y, por botón, la columna
 /// inicial (relativa a la fila) y su ancho. Los chips se ajustan al ancho
@@ -603,8 +621,18 @@ fn transport_row(
             "  ",
         ),
         (Button::Next, "▶▶".to_string(), transport, "  "),
-        (Button::Shuffle, "aleatorio".to_string(), toggle(shuffle), "     "),
-        (Button::Repeat, repeat_label, toggle(repeat.label().is_some()), "  "),
+        (
+            Button::Shuffle,
+            "aleatorio".to_string(),
+            toggle(shuffle),
+            "     ",
+        ),
+        (
+            Button::Repeat,
+            repeat_label,
+            toggle(repeat.label().is_some()),
+            "  ",
+        ),
     ];
 
     let mut spans = Vec::new();
@@ -644,7 +672,11 @@ fn bar_geometry(label: &str, suffix: &str, total_width: usize) -> Option<(u16, u
 
 /// Traduce un evento de mouse a una acción según las zonas del frame y el
 /// arrastre en curso; devuelve también el nuevo estado de arrastre.
-fn mouse_action(hit: &HitMap, drag: Option<Drag>, event: MouseEvent) -> (MouseAction, Option<Drag>) {
+fn mouse_action(
+    hit: &HitMap,
+    drag: Option<Drag>,
+    event: MouseEvent,
+) -> (MouseAction, Option<Drag>) {
     let (column, row) = (event.column, event.row);
     match event.kind {
         MouseEventKind::Down(MouseButton::Left) => {
@@ -654,9 +686,15 @@ fn mouse_action(hit: &HitMap, drag: Option<Drag>, event: MouseEvent) -> (MouseAc
             } else if let Some((_, key)) = hit.chips.iter().find(|(area, _)| area.contains(point)) {
                 (MouseAction::Key(*key), None)
             } else if let Some(bar) = hit.progress.filter(|bar| bar.contains(column, row)) {
-                (MouseAction::SeekRatio(bar.ratio(column)), Some(Drag::Progress(None)))
+                (
+                    MouseAction::SeekRatio(bar.ratio(column)),
+                    Some(Drag::Progress(None)),
+                )
             } else if let Some(bar) = hit.volume.filter(|bar| bar.contains(column, row)) {
-                (MouseAction::SetVolume(bar.ratio(column)), Some(Drag::Volume))
+                (
+                    MouseAction::SetVolume(bar.ratio(column)),
+                    Some(Drag::Volume),
+                )
             } else {
                 (MouseAction::None, None)
             }
@@ -664,9 +702,10 @@ fn mouse_action(hit: &HitMap, drag: Option<Drag>, event: MouseEvent) -> (MouseAc
         // El progreso solo marca la posición mientras se arrastra (el seek va
         // al soltar); el volumen sí sigue en vivo.
         MouseEventKind::Drag(MouseButton::Left) => match (drag, hit.progress, hit.volume) {
-            (Some(Drag::Progress(_)), Some(bar), _) => {
-                (MouseAction::None, Some(Drag::Progress(Some(bar.ratio(column)))))
-            }
+            (Some(Drag::Progress(_)), Some(bar), _) => (
+                MouseAction::None,
+                Some(Drag::Progress(Some(bar.ratio(column)))),
+            ),
             (Some(Drag::Volume), _, Some(bar)) => (MouseAction::SetVolume(bar.ratio(column)), drag),
             _ => (MouseAction::None, drag),
         },
@@ -675,13 +714,17 @@ fn mouse_action(hit: &HitMap, drag: Option<Drag>, event: MouseEvent) -> (MouseAc
             _ => (MouseAction::None, None),
         },
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-            let over_player = hit.player.is_some_and(|area| {
-                area.contains(ratatui::layout::Position::new(column, row))
-            });
+            let over_player = hit
+                .player
+                .is_some_and(|area| area.contains(ratatui::layout::Position::new(column, row)));
             if !over_player {
                 return (MouseAction::None, drag);
             }
-            let step = if event.kind == MouseEventKind::ScrollUp { 1 } else { -1 };
+            let step = if event.kind == MouseEventKind::ScrollUp {
+                1
+            } else {
+                -1
+            };
             (MouseAction::VolumeStep(step), drag)
         }
         _ => (MouseAction::None, drag),
@@ -713,9 +756,9 @@ fn handle_mouse(event: MouseEvent, app: &mut App, engine: &mut AudioEngine) {
         MouseAction::None => {}
         MouseAction::SeekRatio(ratio) => seek_to_ratio(app, engine, ratio),
         MouseAction::SetVolume(volume) => engine.set_volume((volume as f32).clamp(0.0, 1.0)),
-        MouseAction::VolumeStep(step) => engine.set_volume(
-            (engine.volume() + f32::from(step) * VOLUME_STEP).clamp(0.0, 1.0),
-        ),
+        MouseAction::VolumeStep(step) => {
+            engine.set_volume((engine.volume() + f32::from(step) * VOLUME_STEP).clamp(0.0, 1.0))
+        }
         MouseAction::Press(Button::Prev) => play_step(app, engine, -1),
         MouseAction::Press(Button::PlayPause) => toggle_play(app, engine),
         MouseAction::Press(Button::Next) => play_step(app, engine, 1),
@@ -943,8 +986,8 @@ pub fn run(engine: &mut AudioEngine, start: StartMode) -> io::Result<()> {
     };
 
     let (history, history_warn) = crate::history::load();
-    let mut initial_error = (!config::config().warnings.is_empty())
-        .then(|| config::config().warnings.join(" · "));
+    let mut initial_error =
+        (!config::config().warnings.is_empty()).then(|| config::config().warnings.join(" · "));
     if let Some(warn) = history_warn {
         initial_error = Some(match initial_error {
             Some(prev) => format!("{prev} · {warn}"),
@@ -1039,7 +1082,8 @@ fn event_loop(tui: &mut Tui, app: &mut App, engine: &mut AudioEngine) -> io::Res
         // La transición Playing → Ended es el fin natural de la pista: ahí
         // decide repeat (uno la relanza, todo salta y envuelve).
         let previous_status = app.status;
-        let playback_failed = engine.had_playback_error() || playback_error.is_some() || app.ytdlp_failed;
+        let playback_failed =
+            engine.had_playback_error() || playback_error.is_some() || app.ytdlp_failed;
         let snapshot = EngineSnapshot::from_engine(engine, playback_failed);
         app.status = apply_engine_snapshot(app, snapshot);
         if playback_error.is_none()
@@ -1056,7 +1100,7 @@ fn event_loop(tui: &mut Tui, app: &mut App, engine: &mut AudioEngine) -> io::Res
         poll_scan(app);
 
         // Listado de playlist (`--flat-playlist`): al llegar, encola el resto
-        // de la lista y resuelve la primera canción (S12).
+        // de la lista y resuelve la primera canción.
         if let Some(rx) = &app.playlist_rx {
             match rx.try_recv() {
                 Ok((req_id, _orig_playlist_url, result)) => {
@@ -1076,7 +1120,7 @@ fn event_loop(tui: &mut Tui, app: &mut App, engine: &mut AudioEngine) -> io::Res
                     app.ytdlp_rx = None;
                     // Historia: la URL original que se guarda es la de la
                     // sesión actual (`current_url`), que para la primera de
-                    // una playlist es la URL de la playlist (S12); para un
+                    // una playlist es la URL de la playlist; para un
                     // replay el `current_url` ya quedó reh aplicado. El valor
                     // que devuelve el hilo solo se usa como respaldo si no
                     // hubiera sesión (no debería ocurrir en esta ruta).
@@ -1091,7 +1135,7 @@ fn event_loop(tui: &mut Tui, app: &mut App, engine: &mut AudioEngine) -> io::Res
                         start_url_playback(app, engine, audio_url, original, title);
                     } else if req_id == app.ytdlp_request_id {
                         // Una URL encolada falló al resolver su turno: se
-                        // saltea con aviso y se sigue con el próximo (S13).
+                        // saltea con aviso y se sigue con el próximo.
                         skip_failed_queue_item(app, engine, &mut dispatch_url_replay);
                     }
                 }
@@ -1112,7 +1156,7 @@ fn event_loop(tui: &mut Tui, app: &mut App, engine: &mut AudioEngine) -> io::Res
         // Bailarina (modo `miku`): la pose avanza por frame según la energía
         // de graves (o por timer en pausa).
         app.analyzer.tick_dance(app.status == Status::Playing);
-        // Reloj del render y franja «Próxima canción» (T1): se actualizan por
+        // Reloj del render y franja «Próxima canción»: se actualizan por
         // frame para el marquee y para no calcular el próximo en el draw.
         app.ui_frame = app.ui_frame.wrapping_add(1);
         refresh_next_up(app);
@@ -1507,17 +1551,17 @@ fn refresh_view(app: &mut App) {
 fn refresh_view_with_hint(app: &mut App, preserved_history_url: Option<&str>) {
     let previous_item = app.view.get(app.selected).copied();
     let previous_path = previous_item.and_then(|item| match item {
-        ViewItem::Track(library_index) => library_get(app, library_index).map(|track| track.path.clone()),
+        ViewItem::Track(library_index) => {
+            library_get(app, library_index).map(|track| track.path.clone())
+        }
         ViewItem::History(_) => None,
     });
-    let previous_history_url = preserved_history_url
-        .map(String::from)
-        .or_else(|| {
-            previous_item.and_then(|item| match item {
-                ViewItem::History(hist_idx) => app.history.get(hist_idx).map(|entry| entry.url.clone()),
-                ViewItem::Track(_) => None,
-            })
-        });
+    let previous_history_url = preserved_history_url.map(String::from).or_else(|| {
+        previous_item.and_then(|item| match item {
+            ViewItem::History(hist_idx) => app.history.get(hist_idx).map(|entry| entry.url.clone()),
+            ViewItem::Track(_) => None,
+        })
+    });
 
     let needle = app
         .search
@@ -1557,7 +1601,7 @@ fn refresh_view_with_hint(app: &mut App, preserved_history_url: Option<&str>) {
         // El orden vive sobre el pool MIXTO (pistas + historial), igual que en
         // `toggle_shuffle` y en `pool_positions_in_view`: si el refresco lo
         // dejara con solo las pistas, quedaría a medio armar hasta el próximo
-        // salto (D2/S6).
+        // salto.
         let pool_count = app
             .view
             .iter()
@@ -1645,7 +1689,11 @@ fn handle_menu_key<T: MenuSelection, I>(
             let Some(menu) = slot(app).as_mut() else {
                 return;
             };
-            let delta = if matches!(key.code, KeyCode::Up) { -1 } else { 1 };
+            let delta = if matches!(key.code, KeyCode::Up) {
+                -1
+            } else {
+                1
+            };
             menu.set_selected(move_selection(menu.selected(), delta, len));
             let value = item(menu.selected());
             // Previsualización en vivo: cambia el valor sin persistir.
@@ -1703,7 +1751,7 @@ fn handle_theme_menu_key(
         |id| runtime::preview_theme(config::resolve_theme(id)),
         |id| {
             runtime::activate_theme(id, config::resolve_theme(id));
-            // D1: aplicar el tema Miku también activa la bailarina (el default
+            // aplicar el tema Miku también activa la bailarina (el default
             // de arranque lo cubre parse(); acá el cambio es en vivo).
             if *id == "miku" {
                 runtime::activate_visualizer_mode(config::VisualizerMode::Miku);
@@ -1824,7 +1872,11 @@ fn handle_settings_panel_key(
                 return;
             };
             // Sin envoltura, como el menú de temas (`move_selection` con clamp).
-            let delta = if matches!(key.code, KeyCode::Up) { -1 } else { 1 };
+            let delta = if matches!(key.code, KeyCode::Up) {
+                -1
+            } else {
+                1
+            };
             panel.selected = move_selection(panel.selected, delta, SETTINGS_ROWS.len());
         }
         // Enter en «Temas» abre el
@@ -1861,7 +1913,10 @@ fn handle_settings_panel_key(
 /// activa al abrir y la selección va resaltada. Compartido por los tres
 /// selectores (Temas, Bandas y Modo): cada wrapper resuelve sus filas como
 /// (etiqueta, es-actual).
-fn menu_lines(rows: impl IntoIterator<Item = (String, bool)>, selected: usize) -> Vec<Line<'static>> {
+fn menu_lines(
+    rows: impl IntoIterator<Item = (String, bool)>,
+    selected: usize,
+) -> Vec<Line<'static>> {
     let colors = theme(); // snapshot coherente para todas las filas
     rows.into_iter()
         .enumerate()
@@ -1900,7 +1955,9 @@ fn render_menu(frame: &mut Frame<'_>, title: &'static str, lines: Vec<Line<'stat
         .border_style(Style::default().fg(theme().accent))
         .title(Span::styled(
             title,
-            Style::default().fg(theme().accent).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme().accent)
+                .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
@@ -2052,7 +2109,7 @@ fn submit_url_prompt_with(
 /// Camino único de URL (página y playlist) con ambos seams inyectables: la
 /// resolución de página y el listado de playlist. El boot por argumento y el
 /// prompt `u` pasan por acá para que el flujo de playlist sea idéntico y
-/// hermético a los tests en los dos puntos de entrada (S12).
+/// hermético a los tests en los dos puntos de entrada.
 fn submit_url_prompt_with_seams(
     input: String,
     app: &mut App,
@@ -2068,7 +2125,10 @@ fn submit_url_prompt_with_seams(
                     app.mode = Mode::Player;
                 }
             } else {
-                app.error = Some(format!("'{}' no existe o no es un archivo.", path.display()));
+                app.error = Some(format!(
+                    "'{}' no existe o no es un archivo.",
+                    path.display()
+                ));
             }
         }
         SubmitAction::DirectAudio(url) | SubmitAction::Unknown(url) => {
@@ -2085,7 +2145,7 @@ fn submit_url_prompt_with_seams(
 /// Inicio del flujo de URL de página/playlist (unificado para el boot por
 /// argumento y el prompt `u`): prepara la sesión de URL, valida el `request
 /// id` pendiente y lanza la resolución (página) o el listado `--flat-playlist`
-/// (playlist). En S12 la playlist se lista y la primera canción se resuelve
+/// (playlist). En la playlist se lista y la primera canción se resuelve
 /// enseguida; el resto entra a la cola al final cuando llega el listado.
 fn begin_url_flow(
     app: &mut App,
@@ -2125,8 +2185,20 @@ fn begin_url_flow(
 /// Arranque por argumento de CLI (`mp3tui "<url>"`): URL directa / desconocida
 /// reproduce ya, y página / playlist pasan por el mismo flujo unificado de
 /// [`begin_url_flow`] que el prompt `u`.
-fn start_boot_url(app: &mut App, engine: &mut AudioEngine, url: String, kind: crate::source::UrlKind) {
-    start_boot_url_with(app, engine, url, kind, spawn_ytdlp_resolution, spawn_ytdlp_listing)
+fn start_boot_url(
+    app: &mut App,
+    engine: &mut AudioEngine,
+    url: String,
+    kind: crate::source::UrlKind,
+) {
+    start_boot_url_with(
+        app,
+        engine,
+        url,
+        kind,
+        spawn_ytdlp_resolution,
+        spawn_ytdlp_listing,
+    )
 }
 
 /// Variante testeable de [`start_boot_url`] con los seams inyectables de
@@ -2259,13 +2331,19 @@ fn enqueue_selected(app: &mut App) {
 /// Enter en la Cola: mueve el cursor de reproducción al ítem seleccionado y
 /// lo reproduce ya (resuelve la URL por el camino normal si es una URL
 /// pendiente). El ítem no sale de la cola: queda marcado como actual, para
-/// poder volver con `p` (S9).
+/// poder volver con `p`.
 fn play_selected_queue_item(app: &mut App, engine: &mut AudioEngine) {
     if app.queue.is_empty() {
         return;
     }
     let index = app.queue_selected.min(app.queue.len() - 1);
-    if play_queue_from(app, engine, index, QueueAdvance::Step(1), &mut dispatch_url_replay) {
+    if play_queue_from(
+        app,
+        engine,
+        index,
+        QueueAdvance::Step(1),
+        &mut dispatch_url_replay,
+    ) {
         app.mode = Mode::Player;
     }
 }
@@ -2273,7 +2351,7 @@ fn play_selected_queue_item(app: &mut App, engine: &mut AudioEngine) {
 /// Posición de la cola que sigue al cursor de reproducción: la de abajo
 /// mientras nada de la cola haya sonado todavía. `None` cuando no queda nada
 /// por delante (o la cola está vacía): ahí vale el fallback al pool de la
-/// biblioteca/historial (S5/S6).
+/// biblioteca/historial.
 fn queue_next_position(app: &App) -> Option<usize> {
     let next = match app.queue_cursor {
         Some(cursor) => cursor.checked_add(1)?,
@@ -2289,7 +2367,7 @@ fn queue_prev_position(app: &App) -> Option<usize> {
     app.queue_cursor?.checked_sub(1)
 }
 
-/// El «próximo» de la franja del panel lateral (T1/S3): el ítem que sigue al
+/// El «próximo» de la franja del panel lateral: el ítem que sigue al
 /// cursor de la cola; con la cola agotada (o vacía), el siguiente que sonaría
 /// del pool de la biblioteca/historial con repeat/shuffle como están; sin
 /// nada → `None` (la franja no aparece). Se refresca una vez por frame en el
@@ -2327,26 +2405,24 @@ fn refresh_next_up(app: &mut App) {
         Some(ViewItem::Track(library_index)) => {
             library_get(app, *library_index).map(|track| track.title.clone())
         }
-        Some(ViewItem::History(history_index)) => {
-            app.history.get(*history_index).map(|entry| {
-                if entry.title.is_empty() {
-                    entry.url.clone()
-                } else {
-                    entry.title.clone()
-                }
-            })
-        }
+        Some(ViewItem::History(history_index)) => app.history.get(*history_index).map(|entry| {
+            if entry.title.is_empty() {
+                entry.url.clone()
+            } else {
+                entry.title.clone()
+            }
+        }),
         None => None,
     };
     app.next_up = Some(label.unwrap_or_default());
 }
 
 /// Reproduce desde `start` hacia adelante de la cola saltando los ítems
-/// locales que no abren (S13): aviso visible y se sigue con el próximo. Si el
+/// locales que no abren: aviso visible y se sigue con el próximo. Si el
 /// ítem es una URL se arranca su resolución (asíncrona, esperando su turno,
-/// S3) y se registra `queue_resolving` para saltearla si falla. Mueve el
+/// ) y se registra `queue_resolving` para saltearla si falla. Mueve el
 /// cursor a la posición que quedó en marcha. Devuelve `false` cuando la cola
-/// quedó agotada (entonces vale el fallback de S5/S6).
+/// quedó agotada (entonces vale el fallback de ).
 fn play_queue_from(
     app: &mut App,
     engine: &mut AudioEngine,
@@ -2361,7 +2437,7 @@ fn play_queue_from(
             QueueItem::Url { url, .. } => {
                 // Se resuelve recién ahora: las URLs resueltas vencen. El aviso
                 // de un salto previo se fija DESPUÉS de arrancar, porque los
-                // flujos de reproducción limpian el error al comenzar (S13).
+                // flujos de reproducción limpian el error al comenzar.
                 replay(app, engine, UrlReplayRequest { original_url: url });
                 app.queue_cursor = Some(index);
                 app.queue_resolving = Some(index);
@@ -2381,7 +2457,7 @@ fn play_queue_from(
                     }
                     return true;
                 }
-                // No abrió: se saltea con aviso (S13).
+                // No abrió: se saltea con aviso.
                 skipped = true;
                 index += 1;
             }
@@ -2393,10 +2469,10 @@ fn play_queue_from(
     false
 }
 
-/// Ítem encolado que falló al resolver justo cuando le tocaba el turno (S13):
+/// Ítem encolado que falló al resolver justo cuando le tocaba el turno:
 /// se saltea con aviso visible — el cursor avanza al próximo ítem de la cola y
 /// lo intenta (los locales que tampoco abran se saltean igual, con aviso); si
-/// la cola se agota, vale el fallback de S5/S6. El ítem fallido queda en la
+/// la cola se agota, vale el fallback de. El ítem fallido queda en la
 /// cola y el cursor lo pasa (queda atenuado al sonar lo que sigue).
 fn skip_failed_queue_item(
     app: &mut App,
@@ -2423,11 +2499,11 @@ fn skip_failed_queue_item(
             queue_exhausted_pool_fallback(app, engine, -1, &mut replay);
         }
     }
-    // El aviso queda visible aunque haya arrancado el siguiente (S13).
+    // El aviso queda visible aunque haya arrancado el siguiente.
     app.error = Some(QUEUE_ITEM_FAILED_MSG.to_string());
 }
 
-/// Fallback de S5/S6 cuando la cola se agotó tras saltar ítems fallidos:
+/// Fallback de cuando la cola se agotó tras saltar ítems fallidos:
 /// avanza el pool de la biblioteca/historial en `step` (`1` hacia adelante,
 /// `-1` hacia atrás). Sin hacer nada si el pool está vacío o no hay destino.
 fn queue_exhausted_pool_fallback(
@@ -2441,9 +2517,14 @@ fn queue_exhausted_pool_fallback(
         return;
     }
     let current = finished_item_pool_index(app, &pool);
-    let Some(target_idx) =
-        next_track(pool.len(), current, app.repeat, app.shuffle, &app.shuffle_order, step)
-    else {
+    let Some(target_idx) = next_track(
+        pool.len(),
+        current,
+        app.repeat,
+        app.shuffle,
+        &app.shuffle_order,
+        step,
+    ) else {
         return;
     };
     play_pool_target(app, engine, pool[target_idx], replay);
@@ -2470,7 +2551,7 @@ fn delete_selected_queue_item(app: &mut App) {
 
 /// Posiciones de la vista del pool de navegación (lo que recorren `n`/`p` y
 /// el fin natural): siempre las pistas de la biblioteca, y además las
-/// entradas del historial cuando el shuffle está activo (S6/D2), para que una
+/// entradas del historial cuando el shuffle está activo, para que una
 /// pista local pueda encadenar con un tema de YouTube y viceversa. Con el
 /// shuffle apagado el pool queda como antes (solo pistas locales). Regenera
 /// el orden de shuffle si la lista cambió desde que se armó (filtro/rescann).
@@ -2499,14 +2580,12 @@ fn pool_positions_in_view(app: &mut App) -> Vec<usize> {
 fn finished_item_pool_index(app: &App, pool: &[usize]) -> Option<usize> {
     let view_pos = if app.is_url {
         let original_url = app.current_url.as_ref().map(|(url, _label)| url)?;
-        app.view
-            .iter()
-            .position(|item| match item {
-                ViewItem::History(idx) => {
-                    app.history.get(*idx).map(|entry| &entry.url) == Some(original_url)
-                }
-                ViewItem::Track(_) => false,
-            })?
+        app.view.iter().position(|item| match item {
+            ViewItem::History(idx) => {
+                app.history.get(*idx).map(|entry| &entry.url) == Some(original_url)
+            }
+            ViewItem::Track(_) => false,
+        })?
     } else {
         current_view_position(app)?
     };
@@ -2580,7 +2659,7 @@ fn play_step_with(
     step: isize,
     mut replay: impl FnMut(&mut App, &mut AudioEngine, UrlReplayRequest),
 ) {
-    // La cola manda (D1/S5/S9): `n` y `p` recorren el cursor de la cola en
+    // La cola manda: `n` y `p` recorren el cursor de la cola en
     // ambos sentidos antes de caer al pool de la biblioteca/historial.
     let queue_start = if step > 0 {
         queue_next_position(app)
@@ -2691,7 +2770,7 @@ fn handle_natural_end_with(
 ) {
     // La cola manda: mientras quede algo después del cursor, el fin de pista
     // avanza el cursor a esa posición y la reproduce, sin aplicar `repeat` ni
-    // `shuffle` (S5/S9). Agotada la cola, valen las reglas de siempre.
+    // `shuffle`. Agotada la cola, valen las reglas de siempre.
     if let Some(index) = queue_next_position(app) {
         let local = matches!(app.queue.get(index), Some(QueueItem::Local(_)));
         if play_queue_from(app, engine, index, QueueAdvance::NaturalEnd, &mut replay) {
@@ -2723,11 +2802,7 @@ fn handle_natural_end_with(
                 // resueltas vencen. Sin URL original guardada no hay qué
                 // repetir.
                 if let Some((original_url, _label)) = app.current_url.clone() {
-                    replay(
-                        app,
-                        engine,
-                        UrlReplayRequest { original_url },
-                    );
+                    replay(app, engine, UrlReplayRequest { original_url });
                 }
             } else if let Some(path) = app.current_path.clone() {
                 start_local_playback(app, engine, path);
@@ -2832,13 +2907,18 @@ fn render_url_prompt(frame: &mut Frame<'_>, input: &str) {
         .border_style(Style::default().fg(theme().accent))
         .title(Span::styled(
             " Abrir URL / Archivo ",
-            Style::default().fg(theme().accent).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme().accent)
+                .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(prompt_rect);
     frame.render_widget(block, prompt_rect);
 
     let display_text = format!(" {input}▌");
-    let line = Line::from(Span::styled(display_text, Style::default().fg(theme().text)));
+    let line = Line::from(Span::styled(
+        display_text,
+        Style::default().fg(theme().text),
+    ));
     frame.render_widget(Paragraph::new(vec![line]), inner);
 }
 
@@ -2849,11 +2929,7 @@ fn render_theme_menu(frame: &mut Frame<'_>, menu: &ThemeMenuState) {
 
 /// Modal centrado del panel, con el mismo estilo del modal de temas:
 /// fondo limpio + borde acentuado con título.
-fn render_settings_panel(
-    frame: &mut Frame<'_>,
-    panel: &SettingsPanelState,
-    mouse_enabled: bool,
-) {
+fn render_settings_panel(frame: &mut Frame<'_>, panel: &SettingsPanelState, mouse_enabled: bool) {
     let area = frame.area();
     let width = 44.min(area.width.saturating_sub(4)).max(24);
     let height = (SETTINGS_ROWS.len() as u16 + 2)
@@ -2870,19 +2946,21 @@ fn render_settings_panel(
         .border_style(Style::default().fg(theme().accent))
         .title(Span::styled(
             " Configuración ",
-            Style::default().fg(theme().accent).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme().accent)
+                .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
-    frame.render_widget(Paragraph::new(settings_panel_lines(panel, mouse_enabled)), inner);
+    frame.render_widget(
+        Paragraph::new(settings_panel_lines(panel, mouse_enabled)),
+        inner,
+    );
 }
 
 /// Filas del panel («Mouse» muestra el estado vivo; el resto fijas): la
 /// selección va resaltada como en el menú de temas.
-fn settings_panel_lines(
-    panel: &SettingsPanelState,
-    mouse_enabled: bool,
-) -> Vec<Line<'static>> {
+fn settings_panel_lines(panel: &SettingsPanelState, mouse_enabled: bool) -> Vec<Line<'static>> {
     let colors = theme(); // snapshot coherente para todas las filas
     SETTINGS_ROWS
         .iter()
@@ -2916,7 +2994,9 @@ fn themed_block<'a>(title: Span<'a>) -> Block<'a> {
 fn accent_title(text: &str) -> Span<'static> {
     Span::styled(
         format!(" {text} "),
-        Style::default().fg(theme().accent).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(theme().accent)
+            .add_modifier(Modifier::BOLD),
     )
 }
 
@@ -2924,9 +3004,9 @@ fn accent_title(text: &str) -> Span<'static> {
 fn status_parts(status: Status) -> (&'static str, Color) {
     match status {
         Status::Playing => ("▶  Reproduciendo", theme().ok),
-        Status::Paused  => ("⏸  Pausado",       theme().warn),
-        Status::Ended   => ("⏹  Fin de pista",  theme().dim),
-        Status::Stopped => ("⏹  Detenido",      theme().error),
+        Status::Paused => ("⏸  Pausado", theme().warn),
+        Status::Ended => ("⏹  Fin de pista", theme().dim),
+        Status::Stopped => ("⏹  Detenido", theme().error),
         Status::Resolving => ("⏳  Resolviendo con yt-dlp…", theme().accent),
         Status::Connecting => ("⏳  Conectando…", theme().accent),
     }
@@ -3020,17 +3100,11 @@ fn player_areas(area: Rect, explorer_open: bool) -> (Rect, Rect, Rect, Option<Re
     };
     let columns = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(64),
-            Constraint::Percentage(36),
-        ])
+        .constraints([Constraint::Percentage(64), Constraint::Percentage(36)])
         .split(upper);
     let left = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(9),
-            Constraint::Min(4),
-        ])
+        .constraints([Constraint::Length(9), Constraint::Min(4)])
         .split(columns[0]);
     (left[0], left[1], footer, Some(columns[1]))
 }
@@ -3060,7 +3134,13 @@ fn render_explorer_panel(frame: &mut Frame<'_>, area: Rect, app: &App) {
     render_library(frame, area, app, true);
 }
 
-fn render_player_info(frame: &mut Frame<'_>, area: Rect, app: &App, engine: &AudioEngine, focused: bool) {
+fn render_player_info(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    engine: &AudioEngine,
+    focused: bool,
+) {
     // Borde acentuado cuando el player tiene el foco.
     let border_color = if focused { theme().accent } else { theme().dim };
     let block = Block::bordered()
@@ -3070,11 +3150,16 @@ fn render_player_info(frame: &mut Frame<'_>, area: Rect, app: &App, engine: &Aud
     frame.render_widget(block, area);
 
     // Buscar metadatos del track actual en la biblioteca.
-    let track_meta: Option<(String, Option<String>)> = app.current_path.as_ref()
+    let track_meta: Option<(String, Option<String>)> = app
+        .current_path
+        .as_ref()
         .and_then(|path| app.library.as_ref()?.index_of(path))
         .and_then(|idx| app.library.as_ref()?.get(idx))
         .and_then(|track| {
-            track.artist.as_ref().map(|a| (a.clone(), track.album.clone()))
+            track
+                .artist
+                .as_ref()
+                .map(|a| (a.clone(), track.album.clone()))
         });
 
     // La fila de velocidad aparece solo cuando no es 1.0x: en velocidad
@@ -3082,7 +3167,7 @@ fn render_player_info(frame: &mut Frame<'_>, area: Rect, app: &App, engine: &Aud
     let show_speed = (engine.speed() - 1.0).abs() > f32::EPSILON;
     let show_meta = track_meta.is_some();
     // La cola solo se anuncia cuando queda algo por delante del cursor; si no,
-    // no agrega ruido (S9/S10).
+    // no agrega ruido.
     let show_queue = queue_next_position(app).is_some();
 
     // Bloque inicial: archivo + (meta opcional) + estado + (cola opcional) + error.
@@ -3119,7 +3204,10 @@ fn render_player_info(frame: &mut Frame<'_>, area: Rect, app: &App, engine: &Aud
         ];
         if let Some(album) = album_opt {
             spans.push(Span::styled("  ·  ", Style::default().fg(theme().dim)));
-            spans.push(Span::styled(album.clone(), Style::default().fg(theme().dim)));
+            spans.push(Span::styled(
+                album.clone(),
+                Style::default().fg(theme().dim),
+            ));
         }
         info_lines.push(Line::from(spans));
     }
@@ -3127,7 +3215,7 @@ fn render_player_info(frame: &mut Frame<'_>, area: Rect, app: &App, engine: &Aud
     info_lines.push(status_line(app.status, app.repeat, app.shuffle));
 
     // Lo próximo que suena: el ítem que sigue al cursor de la cola, solo
-    // cuando queda algo por delante (S9/S10). El título usa `QueueItem::label`
+    // cuando queda algo por delante. El título usa `QueueItem::label`
     // (igual que la lista de la Cola) y el (+N) cuenta cuánto falta detrás.
     let next_queued = queue_next_position(app);
     if let Some(index) = next_queued {
@@ -3180,8 +3268,12 @@ fn render_player_info(frame: &mut Frame<'_>, area: Rect, app: &App, engine: &Aud
     }
 
     let controls_area = rows[row + 2];
-    let (controls, buttons) =
-        transport_row(engine.is_playing(), app.shuffle, app.repeat, controls_area.width);
+    let (controls, buttons) = transport_row(
+        engine.is_playing(),
+        app.shuffle,
+        app.repeat,
+        controls_area.width,
+    );
     frame.render_widget(Paragraph::new(controls), controls_area);
     {
         let mut hit = app.hit.borrow_mut();
@@ -3192,7 +3284,8 @@ fn render_player_info(frame: &mut Frame<'_>, area: Rect, app: &App, engine: &Aud
                 continue;
             }
             let width = width.min(right - x);
-            hit.buttons.push((Rect::new(x, controls_area.y, width, 1), button));
+            hit.buttons
+                .push((Rect::new(x, controls_area.y, width, 1), button));
         }
     }
 
@@ -3311,8 +3404,8 @@ fn build_bar(
 ) -> Line<'static> {
     // Ancho de la barra interna: misma geometría que usa el mouse para
     // ubicar el clic (etiqueta + " [" + barra + "] " + sufijo).
-    let bar_chars = bar_geometry(label, suffix, total_width)
-        .map_or(0, |(_, width)| usize::from(width));
+    let bar_chars =
+        bar_geometry(label, suffix, total_width).map_or(0, |(_, width)| usize::from(width));
 
     let label_span = Span::styled(label.to_string(), Style::default().fg(empty_color));
 
@@ -3351,7 +3444,10 @@ fn build_bar(
     }
 
     spans.push(Span::styled("] ", Style::default().fg(empty_color)));
-    spans.push(Span::styled(suffix.to_string(), Style::default().fg(theme().text)));
+    spans.push(Span::styled(
+        suffix.to_string(),
+        Style::default().fg(theme().text),
+    ));
 
     Line::from(spans)
 }
@@ -3360,7 +3456,10 @@ fn build_bar(
 fn speed_line(engine: &AudioEngine) -> Line<'static> {
     Line::from(vec![
         Span::styled("Velocidad: ", Style::default().fg(theme().dim)),
-        Span::styled(speed_label(engine.speed()), Style::default().fg(theme().accent)),
+        Span::styled(
+            speed_label(engine.speed()),
+            Style::default().fg(theme().accent),
+        ),
     ])
 }
 
@@ -3463,7 +3562,7 @@ fn render_library(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
             library_title_line(app, &folder, highlight)
         });
     let inner = block.inner(area);
-    // La sección «Próxima canción» (T1) va DENTRO del rectángulo del panel,
+    // La sección «Próxima canción» va DENTRO del rectángulo del panel,
     // en su último tramo: lista → separador → etiqueta → título (marquee), y
     // el borde de abajo del panel cierra todo el bloque. Solo existe en el
     // PANEL lateral (sesión de audio con Tab abierto): en el explorador a
@@ -3531,15 +3630,10 @@ fn render_library(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
     frame.render_widget(Paragraph::new(lines), list_area);
 }
 
-/// Tramo final del panel lateral (T1): separador fino, etiqueta «Próxima
+/// Tramo final del panel lateral: separador fino, etiqueta «Próxima
 /// canción» (tenue, como `Siguiente:` del reproductor) y el título en marquee,
 /// ocupando TODO el ancho del panel; el borde de abajo del bloque lo cierra.
-fn render_next_up_section(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    title: &str,
-    frame_clock: u64,
-) {
+fn render_next_up_section(frame: &mut Frame<'_>, area: Rect, title: &str, frame_clock: u64) {
     let width = area.width as usize;
     let divider = Line::from(Span::styled(
         "─".repeat(width),
@@ -3568,7 +3662,10 @@ fn item_group<'a>(app: &'a App, item: &ViewItem) -> Option<&'a str> {
 /// así que no se dibujan. Si hay historial, siempre se dibuja "Agregadas por URL"
 /// y el grupo correspondiente a las pistas locales.
 fn view_is_grouped(app: &App) -> bool {
-    let has_history = app.view.iter().any(|item| matches!(item, ViewItem::History(_)));
+    let has_history = app
+        .view
+        .iter()
+        .any(|item| matches!(item, ViewItem::History(_)));
     if has_history {
         return true;
     }
@@ -3596,7 +3693,10 @@ fn rows_between(app: &App, from: usize, to: usize, grouped: bool) -> usize {
     let mut rows = 0;
     let mut previous: Option<&str> = None;
     if grouped && from > 0 {
-        previous = app.view.get(from - 1).and_then(|item| item_group(app, item));
+        previous = app
+            .view
+            .get(from - 1)
+            .and_then(|item| item_group(app, item));
     }
     for position in from..=to {
         let Some(item) = app.view.get(position) else {
@@ -3622,9 +3722,7 @@ fn visible_start(app: &App, height: usize, grouped: bool) -> usize {
         return 0;
     }
     let mut start = scroll_offset(app.selected, len, height);
-    while start < app.selected
-        && rows_between(app, start, app.selected, grouped) > height
-    {
+    while start < app.selected && rows_between(app, start, app.selected, grouped) > height {
         start += 1;
     }
     start
@@ -3660,14 +3758,25 @@ fn history_row_line(
     let (cursor_style, marker_style, badge_style, title_style) = if selected {
         let bg = theme().select_bg;
         (
-            Style::default().bg(bg).fg(theme().accent).add_modifier(Modifier::BOLD),
+            Style::default()
+                .bg(bg)
+                .fg(theme().accent)
+                .add_modifier(Modifier::BOLD),
             Style::default().bg(bg).fg(theme().ok),
-            Style::default().bg(bg).fg(theme().accent).add_modifier(Modifier::BOLD),
-            Style::default().bg(bg).fg(theme().text).add_modifier(Modifier::BOLD),
+            Style::default()
+                .bg(bg)
+                .fg(theme().accent)
+                .add_modifier(Modifier::BOLD),
+            Style::default()
+                .bg(bg)
+                .fg(theme().text)
+                .add_modifier(Modifier::BOLD),
         )
     } else {
         (
-            Style::default().fg(theme().accent).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme().accent)
+                .add_modifier(Modifier::BOLD),
             Style::default().fg(theme().ok),
             Style::default().fg(theme().accent),
             Style::default().fg(theme().text),
@@ -3702,7 +3811,10 @@ fn library_rows(app: &App, width: u16, height: u16) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(height);
     let mut previous: Option<&str> = None;
     if grouped && start > 0 {
-        previous = app.view.get(start - 1).and_then(|item| item_group(app, item));
+        previous = app
+            .view
+            .get(start - 1)
+            .and_then(|item| item_group(app, item));
     }
     for (position, item) in app.view.iter().enumerate().skip(start) {
         if lines.len() >= height {
@@ -3728,12 +3840,7 @@ fn library_rows(app: &App, width: u16, height: u16) -> Vec<Line<'static>> {
                 let is_playing = app.is_url
                     && ((!entry.title.is_empty() && app.track_label == entry.title)
                         || app.track_label == entry.url);
-                lines.push(history_row_line(
-                    entry,
-                    is_selected,
-                    is_playing,
-                    width,
-                ));
+                lines.push(history_row_line(entry, is_selected, is_playing, width));
             }
             ViewItem::Track(library_index) => {
                 let Some(track) = library_get(app, *library_index) else {
@@ -3753,7 +3860,7 @@ fn library_rows(app: &App, width: u16, height: u16) -> Vec<Line<'static>> {
     lines
 }
 
-/// Ventana de marquee para un título de `width` celdas (T1/D2): si entra,
+/// Ventana de marquee para un título de `width` celdas: si entra,
 /// pegado a la izquierda (con padding a `width`); si no, recorre una ventana
 /// de `width` celdas sobre `título + separador + título` en bucle continuo,
 /// avanzando un carácter por frame.
@@ -3769,7 +3876,7 @@ fn marquee_window(text: &str, width: usize, frame: usize) -> String {
     cycle.iter().skip(step).take(width).collect()
 }
 
-/// Estado de una fila de la cola respecto del cursor de reproducción (S9): lo
+/// Estado de una fila de la cola respecto del cursor de reproducción: lo
 /// ya sonado se atenúa, la posición donde está parado se marca y lo que falta
 /// queda normal.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -3847,7 +3954,10 @@ fn queue_row_line(
     let (cursor_style, marker_style, text_style) = if selected {
         let bg = theme().select_bg;
         (
-            Style::default().bg(bg).fg(theme().accent).add_modifier(Modifier::BOLD),
+            Style::default()
+                .bg(bg)
+                .fg(theme().accent)
+                .add_modifier(Modifier::BOLD),
             Style::default().bg(bg).fg(theme().ok),
             Style::default().bg(bg).fg(theme().text),
         )
@@ -3857,7 +3967,9 @@ fn queue_row_line(
             QueueRowState::Current | QueueRowState::Pending => theme().text,
         };
         (
-            Style::default().fg(theme().accent).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme().accent)
+                .add_modifier(Modifier::BOLD),
             Style::default().fg(theme().ok),
             Style::default().fg(text),
         )
@@ -3893,7 +4005,9 @@ fn folder_header_line(folder: &str, width: u16) -> Line<'static> {
     let used = label.chars().count();
     let mut spans = vec![Span::styled(
         label,
-        Style::default().fg(theme().accent).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(theme().accent)
+            .add_modifier(Modifier::BOLD),
     )];
     if width > used {
         spans.push(Span::styled(
@@ -4074,15 +4188,23 @@ fn row_line(
     let (cursor_style, marker_style, title_style, dim_style, duration_style) = if selected {
         let bg = theme().select_bg;
         (
-            Style::default().bg(bg).fg(theme().accent).add_modifier(Modifier::BOLD),
+            Style::default()
+                .bg(bg)
+                .fg(theme().accent)
+                .add_modifier(Modifier::BOLD),
             Style::default().bg(bg).fg(theme().ok),
-            Style::default().bg(bg).fg(theme().text).add_modifier(Modifier::BOLD),
+            Style::default()
+                .bg(bg)
+                .fg(theme().text)
+                .add_modifier(Modifier::BOLD),
             Style::default().bg(bg).fg(theme().dim),
             Style::default().bg(bg).fg(theme().dim),
         )
     } else {
         (
-            Style::default().fg(theme().accent).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme().accent)
+                .add_modifier(Modifier::BOLD),
             Style::default().fg(theme().ok),
             Style::default().fg(theme().text),
             Style::default().fg(theme().dim),
@@ -4140,7 +4262,12 @@ fn format_duration(duration: Duration) -> String {
 }
 
 /// `focused` controla el color del borde del visualizador.
-fn render_visualizer(frame: &mut Frame<'_>, area: Rect, analyzer: &SpectrumAnalyzer, focused: bool) {
+fn render_visualizer(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    analyzer: &SpectrumAnalyzer,
+    focused: bool,
+) {
     let border_color = if focused { theme().accent } else { theme().dim };
     let block = Block::bordered()
         .border_style(Style::default().fg(border_color))
@@ -4175,17 +4302,12 @@ fn render_visualizer(frame: &mut Frame<'_>, area: Rect, analyzer: &SpectrumAnaly
             &theme(),
             ascii,
         ),
-        VisualizerPaint::Circular => paint_circular(
-            frame.buffer_mut(),
-            inner,
-            analyzer.bands(),
-            &theme(),
-            ascii,
-        ),
+        VisualizerPaint::Circular => {
+            paint_circular(frame.buffer_mut(), inner, analyzer.bands(), &theme(), ascii)
+        }
         VisualizerPaint::Miku => paint_miku(frame.buffer_mut(), inner, analyzer),
     }
 }
-
 
 /// Color de paleta del arte animado (`miku_art`): letras a..g generadas del
 /// `.asciimtn` original. `a` = negro: la silueta de Miku se dibuja en oscuro
@@ -4213,11 +4335,7 @@ fn miku_palette_color(letter: char) -> Option<Color> {
 /// beat mueve Miku verticalmente alrededor del centro, sin vaivén lateral
 /// fuera de eje. Los dibujos son ASCII puro, idénticos con estilo ascii o
 /// unicode.
-fn paint_miku(
-    buf: &mut ratatui::buffer::Buffer,
-    inner: Rect,
-    analyzer: &SpectrumAnalyzer,
-) {
+fn paint_miku(buf: &mut ratatui::buffer::Buffer, inner: Rect, analyzer: &SpectrumAnalyzer) {
     // Fondo del lienzo del arte: campo de `@` blancos en todo el área.
     let white = Style::default().fg(Color::Rgb(0xff, 0xff, 0xff));
     for y in inner.y..inner.y + inner.height {
@@ -4225,8 +4343,7 @@ fn paint_miku(
     }
 
     use crate::visualizer::miku_art as art;
-    let frame = (analyzer.dance_clock() / art::ANIM_TICKS as u64) as usize
-        % art::SAMPLED_FRAMES;
+    let frame = (analyzer.dance_clock() / art::ANIM_TICKS as u64) as usize % art::SAMPLED_FRAMES;
     let lines = art::FRAME_CHARS[frame].lines().collect::<Vec<_>>();
     let color_lines = art::FRAME_COLORS[frame].lines().collect::<Vec<_>>();
     let art_w = art::CROP_RIGHT - art::CROP_LEFT + 1;
@@ -4529,7 +4646,11 @@ fn paint_vu(
     }
     let level = level.clamp(0.0, 1.0);
     let peak = peak.clamp(0.0, 1.0);
-    let bar_rows: u16 = if inner.height <= 2 { 1 } else { inner.height - 1 };
+    let bar_rows: u16 = if inner.height <= 2 {
+        1
+    } else {
+        inner.height - 1
+    };
     let denom = f32::from(width.saturating_sub(1).max(1));
     // Barra: celdas llenas + parcial (mismos niveles y glifos que paint_bands).
     let fill_f = level * f32::from(width);
@@ -4700,7 +4821,8 @@ fn paint_wave_ascii(
             };
             let (red, green, blue) = spectrum_color(t, theme);
             if let Some(cell) = buffer.cell_mut((inner.x + dx, inner.y + row)) {
-                cell.set_symbol(ASCII_RAMP[8]).set_fg(Color::Rgb(red, green, blue));
+                cell.set_symbol(ASCII_RAMP[8])
+                    .set_fg(Color::Rgb(red, green, blue));
             }
         }
     }
@@ -4766,12 +4888,7 @@ fn paint_wave_braille(
 /// 2×4: `BRAILLE_DOT_BITS[fila_sub][col_sub]`, fila_sub 0..4 (arriba a
 /// abajo), col_sub 0..2 (izquierda a derecha). Mapeo estándar del bloque
 /// Unicode Braille Patterns (puntos 1..8 → bits 0x01..0x80).
-const BRAILLE_DOT_BITS: [[u8; 2]; 4] = [
-    [0x01, 0x08],
-    [0x02, 0x10],
-    [0x04, 0x20],
-    [0x40, 0x80],
-];
+const BRAILLE_DOT_BITS: [[u8; 2]; 4] = [[0x01, 0x08], [0x02, 0x10], [0x04, 0x20], [0x40, 0x80]];
 
 /// Carácter Braille (U+2800 + `bits`) para una máscara de puntos encendidos
 /// de una celda 2×4. `bits == 0` es el patrón en blanco (U+2800); quien
@@ -4947,11 +5064,7 @@ fn spectrum_color(t: f32, theme: &Theme) -> (u8, u8, u8) {
         let (Color::Rgb(r0, g0, b0), Color::Rgb(r1, g1, b1)) = (from, to) else {
             return (0, 0, 0);
         };
-        (
-            channel(r0, r1, u),
-            channel(g0, g1, u),
-            channel(b0, b1, u),
-        )
+        (channel(r0, r1, u), channel(g0, g1, u), channel(b0, b1, u))
     }
 
     let t = t.clamp(0.0, 1.0);
@@ -5012,9 +5125,7 @@ fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
     if app.search.is_some() {
         return vec![
             Line::from(" Escribí para filtrar por título, artista, álbum o archivo "),
-            Line::from(
-                " Backspace: borrar   Enter: aplicar   Esc: cancelar (lista completa) ",
-            ),
+            Line::from(" Backspace: borrar   Enter: aplicar   Esc: cancelar (lista completa) "),
         ];
     }
 
@@ -5080,7 +5191,7 @@ fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
                     key_labels(&keys.speed_up),
                 )),
             ]
-        },
+        }
         // `Tab: biblio` vuelve; `b` sube a la línea 1 como
         // navegación y `↑/↓: vol` abrevia: es la única forma de que los 12
         // atajos entren en 2×78. Orden: navegación → reproducción → modos →
@@ -5160,28 +5271,39 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App, compact: bool) {
     {
         let mut hit = app.hit.borrow_mut();
         for (index, line) in footer_lines(app, compact).into_iter().enumerate() {
-            let text: String = line.spans.iter().map(|span| span.content.as_ref()).collect();
+            let text: String = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
             let line_width = line.width();
             let (spans, entries) = footer_chip_spans(&text);
             lines.push(Line::from(spans));
-            let Ok(index) = u16::try_from(index) else { continue };
+            let Ok(index) = u16::try_from(index) else {
+                continue;
+            };
             if index >= inner.height {
                 continue;
             }
-            let Ok(line_width) = u16::try_from(line_width) else { continue };
+            let Ok(line_width) = u16::try_from(line_width) else {
+                continue;
+            };
             // Mismo centrado que el Paragraph de abajo (ratatui centra con
             // `(ancho/2) - (línea/2)`, no con `(ancho - línea)/2`: con resto
             // impar difieren en una columna y el chip quedaba corrido).
             let x0 = inner.x + (inner.width / 2).saturating_sub(line_width / 2);
             let right = inner.x + inner.width;
             for (start, width, keys) in entries {
-                let Some(code) = key_for_chip(&keys) else { continue };
+                let Some(code) = key_for_chip(&keys) else {
+                    continue;
+                };
                 let x = x0.saturating_add(start);
                 if x >= right {
                     continue;
                 }
                 let width = width.min(right - x);
-                hit.chips.push((Rect::new(x, inner.y + index, width, 1), code));
+                hit.chips
+                    .push((Rect::new(x, inner.y + index, width, 1), code));
             }
         }
     }
@@ -5215,11 +5337,17 @@ mod tests {
     }
 
     fn line_width(line: &Line<'_>) -> usize {
-        line.spans.iter().map(|span| span.content.chars().count()).sum()
+        line.spans
+            .iter()
+            .map(|span| span.content.chars().count())
+            .sum()
     }
 
     fn line_text(line: &Line<'_>) -> String {
-        line.spans.iter().map(|span| span.content.to_string()).collect()
+        line.spans
+            .iter()
+            .map(|span| span.content.to_string())
+            .collect()
     }
 
     #[test]
@@ -5312,7 +5440,13 @@ mod tests {
     fn paint_bands_zero_leaves_empty_reset_cells() {
         let area = Rect::new(0, 0, 8, 10);
         let mut buffer = Buffer::empty(area);
-        paint_bands(&mut buffer, area, &[0.0f32; NUM_BANDS], &Theme::default(), false);
+        paint_bands(
+            &mut buffer,
+            area,
+            &[0.0f32; NUM_BANDS],
+            &Theme::default(),
+            false,
+        );
 
         let cell = &buffer[(0u16, 9u16)];
         assert_eq!(cell.symbol(), " ");
@@ -5357,7 +5491,11 @@ mod tests {
         // The full cells below the partial cell should be █
         assert_eq!(buffer[(0u16, bottom - 1)].symbol(), "█", "bottom full cell");
         // The cell above the partial cell should be empty
-        assert_eq!(buffer[(0u16, partial_y - 1)].symbol(), " ", "above partial = empty");
+        assert_eq!(
+            buffer[(0u16, partial_y - 1)].symbol(),
+            " ",
+            "above partial = empty"
+        );
     }
 
     #[test]
@@ -5366,7 +5504,13 @@ mod tests {
         let width = 113u16;
         let area = Rect::new(0, 0, width, 3);
         let mut buffer = Buffer::empty(area);
-        paint_bands(&mut buffer, area, &[1.0f32; NUM_BANDS], &Theme::default(), false);
+        paint_bands(
+            &mut buffer,
+            area,
+            &[1.0f32; NUM_BANDS],
+            &Theme::default(),
+            false,
+        );
 
         let rightmost = (0..width)
             .rev()
@@ -5616,7 +5760,10 @@ mod tests {
                 saw_braille = true;
             }
         }
-        assert!(saw_braille, "debe haber al menos una celda con trazo Braille");
+        assert!(
+            saw_braille,
+            "debe haber al menos una celda con trazo Braille"
+        );
     }
 
     #[test]
@@ -5864,7 +6011,10 @@ mod tests {
         for y in 0..4u16 {
             let marker = &buffer[(16u16, y)];
             assert_eq!(marker.symbol(), "█", "marca del pico (y={y})");
-            assert_eq!(marker.fg, theme.spectrum_high, "el pico va en spectrum_high");
+            assert_eq!(
+                marker.fg, theme.spectrum_high,
+                "el pico va en spectrum_high"
+            );
         }
         assert_eq!(
             buffer[(7u16, 0u16)].symbol(),
@@ -5919,7 +6069,11 @@ mod tests {
             }
         }
         assert_eq!(buffer[(0u16, 4u16)].symbol(), "┼", "tics unicode");
-        assert_eq!(buffer[(1u16, 4u16)].symbol(), "─", "línea de escala unicode");
+        assert_eq!(
+            buffer[(1u16, 4u16)].symbol(),
+            "─",
+            "línea de escala unicode"
+        );
         assert_eq!(buffer[(1u16, 4u16)].fg, theme.dim);
     }
 
@@ -5936,11 +6090,7 @@ mod tests {
         paint_vu(&mut buffer, area, -0.5, -1.0, &theme, true);
         for y in 0..3u16 {
             for x in 0..8u16 {
-                assert_eq!(
-                    buffer[(x, y)].symbol(),
-                    ".",
-                    "negativo = vacío ({x},{y})"
-                );
+                assert_eq!(buffer[(x, y)].symbol(), ".", "negativo = vacío ({x},{y})");
             }
         }
     }
@@ -6025,7 +6175,10 @@ mod tests {
                 }
             }
         }
-        assert!(!dim_degrees.is_empty(), "el anillo base no pintó ninguna celda");
+        assert!(
+            !dim_degrees.is_empty(),
+            "el anillo base no pintó ninguna celda"
+        );
         // Tolerancia 15°: a este radio, la grilla entera rasteriza el
         // círculo con algún hueco de 1 celda entre ángulos vecinos — muy
         // lejos de los ~11° COMPLETAMENTE vacíos que dejaban los 32 radios
@@ -6155,8 +6308,7 @@ mod tests {
                     "columna {x} y su espejo {mirror} con mismo símbolo (y={y})"
                 );
                 assert_eq!(
-                    cell.fg,
-                    mirrored.fg,
+                    cell.fg, mirrored.fg,
                     "columna {x} y su espejo {mirror} con mismo color (y={y})"
                 );
             }
@@ -6180,7 +6332,10 @@ mod tests {
         let x = 19u16;
         let north = (0u16..10).filter(|&y| is_energy(x, y)).count();
         let south = (10u16..20).filter(|&y| is_energy(x, y)).count();
-        assert_eq!(north, 0, "agudos en cero: nada relleno arriba, obtenido {north}");
+        assert_eq!(
+            north, 0,
+            "agudos en cero: nada relleno arriba, obtenido {north}"
+        );
         assert!(south > 0, "graves a tope: relleno abajo, obtenido {south}");
     }
 
@@ -6240,7 +6395,11 @@ mod tests {
         });
         assert!(filled, "ascii usa @ para las celdas con energía");
         let hole = &buffer[(20u16, 10u16)];
-        assert_eq!(hole.symbol(), ".", "fondo de puntos en ascii dentro del hueco");
+        assert_eq!(
+            hole.symbol(),
+            ".",
+            "fondo de puntos en ascii dentro del hueco"
+        );
         assert_eq!(hole.fg, theme.dim);
     }
 
@@ -6358,7 +6517,11 @@ mod tests {
 
     fn test_temp_history_path() -> PathBuf {
         let id = TEST_HIST_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        std::env::temp_dir().join(format!("mp3tui_test_hist_{}_{}.toml", std::process::id(), id))
+        std::env::temp_dir().join(format!(
+            "mp3tui_test_hist_{}_{}.toml",
+            std::process::id(),
+            id
+        ))
     }
 
     fn track_named(name: &str) -> Track {
@@ -6432,8 +6595,10 @@ mod tests {
         assert!(!bare.explorer_open, "sin player no hay panel que abrir");
 
         // El escaneo original es el que entrega el resultado.
-        tx.send(crate::playlist::from_tracks_for_test(vec![track_named("alpha")]))
-            .unwrap();
+        tx.send(crate::playlist::from_tracks_for_test(vec![track_named(
+            "alpha",
+        )]))
+        .unwrap();
         poll_scan(&mut app);
         assert_eq!(app.library.as_ref().map(Playlist::len), Some(1));
         assert!(app.scan_rx.is_none());
@@ -6451,12 +6616,12 @@ mod tests {
 
         let (info, visual, footer, panel) = player_areas(area, true);
         let panel = panel.expect("panel abierto");
-        assert_eq!((panel.x, panel.width), (64, 36), "36% derecho para la lista");
         assert_eq!(
-            info.x + info.width,
-            64,
-            "la info se achica antes del panel"
+            (panel.x, panel.width),
+            (64, 36),
+            "36% derecho para la lista"
         );
+        assert_eq!(info.x + info.width, 64, "la info se achica antes del panel");
         assert_eq!(
             visual.x + visual.width,
             64,
@@ -6468,7 +6633,10 @@ mod tests {
             "el visualizador arranca debajo de la info"
         );
         assert_eq!(footer.width, 100, "el pie sigue a todo lo ancho");
-        assert_eq!(footer.height, 5, "pie con 3 líneas para los atajos del panel");
+        assert_eq!(
+            footer.height, 5,
+            "pie con 3 líneas para los atajos del panel"
+        );
         assert_eq!(
             info.y + info.height + visual.height,
             footer.y,
@@ -6558,12 +6726,19 @@ mod tests {
 
         app.filter = Some("no-existe".to_string());
         refresh_view(&mut app);
-        assert!(app.view.is_empty(), "sin coincidencias la lista queda vacia");
+        assert!(
+            app.view.is_empty(),
+            "sin coincidencias la lista queda vacia"
+        );
         assert_eq!(app.selected, 0, "seleccion acotada al rango vacio");
 
         app.filter = None;
         refresh_view(&mut app);
-        assert_eq!(app.view, vec![0, 1, 2], "sin filtro vuelve la lista completa");
+        assert_eq!(
+            app.view,
+            vec![0, 1, 2],
+            "sin filtro vuelve la lista completa"
+        );
     }
 
     #[test]
@@ -6585,7 +6760,10 @@ mod tests {
         open_search(&mut app);
         assert!(app.search.is_some(), "'/' abre la búsqueda");
 
-        handle_search_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE), &mut app);
+        handle_search_key(
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+            &mut app,
+        );
         assert_eq!(app.search.as_deref(), Some("g"));
         assert_eq!(app.view, vec![2], "filtrado en vivo");
 
@@ -6595,16 +6773,33 @@ mod tests {
         );
         assert_eq!(app.view, vec![0, 1, 2], "backspace amplía de vuelta");
 
-        handle_search_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE), &mut app);
-        handle_search_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE), &mut app);
-        handle_search_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE), &mut app);
+        handle_search_key(
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE),
+            &mut app,
+        );
+        handle_search_key(
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+            &mut app,
+        );
+        handle_search_key(
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
+            &mut app,
+        );
         handle_search_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut app);
         assert!(app.search.is_none(), "Enter cierra el modo búsqueda");
-        assert_eq!(app.filter.as_deref(), Some("bet"), "Enter confirma el filtro");
+        assert_eq!(
+            app.filter.as_deref(),
+            Some("bet"),
+            "Enter confirma el filtro"
+        );
         assert_eq!(app.view, vec![1]);
 
         open_search(&mut app);
-        assert_eq!(app.search.as_deref(), Some("bet"), "reabre con el filtro actual");
+        assert_eq!(
+            app.search.as_deref(),
+            Some("bet"),
+            "reabre con el filtro actual"
+        );
         handle_search_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut app);
         assert!(app.search.is_none());
         assert!(app.filter.is_none(), "Esc cancela y limpia el filtro");
@@ -6625,18 +6820,26 @@ mod tests {
         assert!(!app.shuffle, "arranca sin shuffle");
         toggle_shuffle(&mut app);
         assert!(app.shuffle, "'s' activa el shuffle");
-        assert_eq!(app.shuffle_order.len(), 4, "orden mezclado de la lista visible");
+        assert_eq!(
+            app.shuffle_order.len(),
+            4,
+            "orden mezclado de la lista visible"
+        );
 
         app.filter = Some("ta".to_string()); // "ta" matchea beta y delta
         refresh_view(&mut app);
         assert_eq!(app.view, vec![1, 3]);
-        assert_eq!(app.shuffle_order.len(), 2, "orden re-armado al cambiar el filtro");
+        assert_eq!(
+            app.shuffle_order.len(),
+            2,
+            "orden re-armado al cambiar el filtro"
+        );
         let mut sorted = app.shuffle_order.clone();
         sorted.sort_unstable();
         assert_eq!(sorted, vec![0, 1], "sigue siendo una permutación");
     }
 
-    /// D2/S6: con shuffle activo el orden mezclado cubre el **pool mixto** que
+    ///: con shuffle activo el orden mezclado cubre el **pool mixto** que
     /// recorren `n`/`p` y el fin de pista (biblioteca + historial de URLs), no
     /// solo las pistas locales: si un refresco de la vista lo dejara corto, el
     /// orden quedaría a medio armar hasta el próximo salto.
@@ -6678,8 +6881,24 @@ mod tests {
             .join("\n");
         // Pie del player reequilibrado en 2 líneas — restaura
         // `Tab: biblio`; `↑/↓: vol` abrevia para que entre en 78 cols.
-        for hint in ["Tab: biblio", "b: buscar", "espacio: pausa", "↑/↓: vol", "←/→: ±5s", "n/p: pista", "s: shuffle", "r: repeat", "[/]: vel", "u: URL", "Ctrl+P: config", "Esc×2: salir"] {
-            assert!(player.contains(hint), "footer del player falta '{hint}': {player}");
+        for hint in [
+            "Tab: biblio",
+            "b: buscar",
+            "espacio: pausa",
+            "↑/↓: vol",
+            "←/→: ±5s",
+            "n/p: pista",
+            "s: shuffle",
+            "r: repeat",
+            "[/]: vel",
+            "u: URL",
+            "Ctrl+P: config",
+            "Esc×2: salir",
+        ] {
+            assert!(
+                player.contains(hint),
+                "footer del player falta '{hint}': {player}"
+            );
         }
 
         app.mode = Mode::Browser;
@@ -6691,8 +6910,25 @@ mod tests {
         // `sig/ant` expandido (entra en 78 reagrupando), `Inicio/Fin`
         // documentado y fuera el `Esc: volver` inexacto (sin player Esc arma
         // la salida, cubierto por `Esc×2: salir`).
-        for hint in ["PgUp/PgDn: mover", "Enter: reproducir", "n/p: pista siguiente/anterior", "espacio: pausa", "←/→: ±5s", "[/]: vel", "s: shuffle", "r: repeat", "b: buscar", "Inicio/Fin: primera/última", "u: URL", "Ctrl+P: config", "Esc×2: salir"] {
-            assert!(browser.contains(hint), "footer del explorador falta '{hint}': {browser}");
+        for hint in [
+            "PgUp/PgDn: mover",
+            "Enter: reproducir",
+            "n/p: pista siguiente/anterior",
+            "espacio: pausa",
+            "←/→: ±5s",
+            "[/]: vel",
+            "s: shuffle",
+            "r: repeat",
+            "b: buscar",
+            "Inicio/Fin: primera/última",
+            "u: URL",
+            "Ctrl+P: config",
+            "Esc×2: salir",
+        ] {
+            assert!(
+                browser.contains(hint),
+                "footer del explorador falta '{hint}': {browser}"
+            );
         }
         assert!(
             !browser.contains("Esc: volver"),
@@ -6719,7 +6955,10 @@ mod tests {
             "Esc×2: salir",
             "volumen ↑/↓: con el panel cerrado",
         ] {
-            assert!(panel.contains(hint), "footer del panel falta '{hint}': {panel}");
+            assert!(
+                panel.contains(hint),
+                "footer del panel falta '{hint}': {panel}"
+            );
         }
         assert_eq!(
             footer_lines(&app, false).len(),
@@ -6737,7 +6976,10 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         for hint in ["↑/↓: mover", "Enter: abrir/alternar", "Esc: cerrar"] {
-            assert!(settings.contains(hint), "pie del panel falta '{hint}': {settings}");
+            assert!(
+                settings.contains(hint),
+                "pie del panel falta '{hint}': {settings}"
+            );
         }
         app.settings_panel = None;
 
@@ -6800,14 +7042,21 @@ mod tests {
         let lines = library_rows(&app, 40, 10);
         let texts: Vec<String> = lines.iter().map(|line| line_text(line)).collect();
         assert_eq!(texts.len(), 6, "2 encabezados + 4 pistas: {texts:?}");
-        assert!(texts[0].contains("rock"), "encabezado de grupo: {:?}", texts[0]);
+        assert!(
+            texts[0].contains("rock"),
+            "encabezado de grupo: {:?}",
+            texts[0]
+        );
         assert!(
             texts[0].contains('\u{2500}'),
             "relleno de guiones: {:?}",
             texts[0]
         );
         assert_eq!(line_width(&lines[0]), 40, "el encabezado ocupa el ancho");
-        assert!(!texts[0].contains('\u{258c}'), "el encabezado no selecciona");
+        assert!(
+            !texts[0].contains('\u{258c}'),
+            "el encabezado no selecciona"
+        );
         assert!(texts[1].contains("alpha"), "{:?}", texts[1]);
         assert!(texts[3].contains("jazz"), "segundo grupo: {:?}", texts[3]);
 
@@ -6917,10 +7166,7 @@ mod tests {
             url_display_label("https://radio.example.com/"),
             "radio.example.com"
         );
-        assert_eq!(
-            url_display_label("http://localhost:8080"),
-            "localhost:8080"
-        );
+        assert_eq!(url_display_label("http://localhost:8080"), "localhost:8080");
     }
 
     #[test]
@@ -7019,13 +7265,26 @@ mod tests {
     }
 
     fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
-        MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE }
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
     }
 
     fn sample_hit() -> HitMap {
         HitMap {
-            progress: Some(BarHit { x: 20, y: 6, width: 51 }),
-            volume: Some(BarHit { x: 20, y: 5, width: 11 }),
+            progress: Some(BarHit {
+                x: 20,
+                y: 6,
+                width: 51,
+            }),
+            volume: Some(BarHit {
+                x: 20,
+                y: 5,
+                width: 11,
+            }),
             player: Some(Rect::new(0, 0, 100, 20)),
             buttons: Vec::new(),
             chips: Vec::new(),
@@ -7038,12 +7297,19 @@ mod tests {
         let (offset, width) = bar_geometry("Progreso ", "1:00 / 3:00", 80).expect("entra");
         assert_eq!(offset, 11);
         assert_eq!(width as usize, 80 - (9 + 2 + 2 + "1:00 / 3:00".len()));
-        assert!(bar_geometry("Progreso ", "1:00 / 3:00", 10).is_none(), "sin espacio");
+        assert!(
+            bar_geometry("Progreso ", "1:00 / 3:00", 10).is_none(),
+            "sin espacio"
+        );
     }
 
     #[test]
     fn bar_hit_ratio_and_contains() {
-        let bar = BarHit { x: 20, y: 6, width: 51 };
+        let bar = BarHit {
+            x: 20,
+            y: 6,
+            width: 51,
+        };
         assert!(bar.contains(20, 6) && bar.contains(70, 6));
         assert!(!bar.contains(19, 6) && !bar.contains(71, 6) && !bar.contains(30, 7));
         assert_eq!(bar.ratio(20), 0.0);
@@ -7055,8 +7321,11 @@ mod tests {
 
     #[test]
     fn click_on_progress_seeks_and_starts_drag() {
-        let (action, drag) =
-            mouse_action(&sample_hit(), None, mouse(MouseEventKind::Down(MouseButton::Left), 45, 6));
+        let (action, drag) = mouse_action(
+            &sample_hit(),
+            None,
+            mouse(MouseEventKind::Down(MouseButton::Left), 45, 6),
+        );
         assert_eq!(drag, Some(Drag::Progress(None)));
         match action {
             MouseAction::SeekRatio(r) => assert!((r - 0.5).abs() < 1e-9),
@@ -7074,40 +7343,65 @@ mod tests {
             mouse(MouseEventKind::Drag(MouseButton::Left), 70, 12),
         );
         assert_eq!(action, MouseAction::None, "sin seek durante el arrastre");
-        assert_eq!(drag, Some(Drag::Progress(Some(1.0))), "sigue la barra fuera de su fila");
+        assert_eq!(
+            drag,
+            Some(Drag::Progress(Some(1.0))),
+            "sigue la barra fuera de su fila"
+        );
 
         let (action, drag) = mouse_action(
             &sample_hit(),
             drag,
             mouse(MouseEventKind::Up(MouseButton::Left), 70, 12),
         );
-        assert_eq!((action, drag), (MouseAction::SeekRatio(1.0), None), "soltar hace el seek");
+        assert_eq!(
+            (action, drag),
+            (MouseAction::SeekRatio(1.0), None),
+            "soltar hace el seek"
+        );
 
         let (action, _) = mouse_action(
             &sample_hit(),
             Some(Drag::Progress(None)),
             mouse(MouseEventKind::Up(MouseButton::Left), 70, 12),
         );
-        assert_eq!(action, MouseAction::None, "clic sin arrastre no repite el seek");
+        assert_eq!(
+            action,
+            MouseAction::None,
+            "clic sin arrastre no repite el seek"
+        );
     }
 
     #[test]
     fn mouse_is_ignored_while_a_modal_is_open() {
-        let Some(mut engine) = engine_or_skip() else { return };
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
         let mut app = test_app();
         app.mode = Mode::Player;
         app.has_player = true;
         *app.hit.borrow_mut() = sample_hit();
         app.url_input = Some(String::new());
-        handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 30, 5), &mut app, &mut engine);
-        assert_eq!(engine.volume(), 0.0, "el clic no atraviesa el prompt de URL");
+        handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 30, 5),
+            &mut app,
+            &mut engine,
+        );
+        assert_eq!(
+            engine.volume(),
+            0.0,
+            "el clic no atraviesa el prompt de URL"
+        );
         assert_eq!(app.drag, None);
     }
 
     #[test]
     fn click_on_volume_sets_volume() {
-        let (action, drag) =
-            mouse_action(&sample_hit(), None, mouse(MouseEventKind::Down(MouseButton::Left), 30, 5));
+        let (action, drag) = mouse_action(
+            &sample_hit(),
+            None,
+            mouse(MouseEventKind::Down(MouseButton::Left), 30, 5),
+        );
         assert_eq!(drag, Some(Drag::Volume));
         assert_eq!(action, MouseAction::SetVolume(1.0));
     }
@@ -7121,9 +7415,16 @@ mod tests {
         assert_eq!(down, MouseAction::VolumeStep(-1));
         let (outside, _) = mouse_action(&hit, None, mouse(MouseEventKind::ScrollUp, 150, 40));
         assert_eq!(outside, MouseAction::None);
-        let (miss, drag) =
-            mouse_action(&hit, None, mouse(MouseEventKind::Down(MouseButton::Left), 2, 2));
-        assert_eq!((miss, drag), (MouseAction::None, None), "clic fuera de las barras");
+        let (miss, drag) = mouse_action(
+            &hit,
+            None,
+            mouse(MouseEventKind::Down(MouseButton::Left), 2, 2),
+        );
+        assert_eq!(
+            (miss, drag),
+            (MouseAction::None, None),
+            "clic fuera de las barras"
+        );
     }
 
     fn render_player_frame(app: &App, engine: &AudioEngine) -> ratatui::buffer::Buffer {
@@ -7150,7 +7451,9 @@ mod tests {
     /// aparece solo cuando hay ítems encolados, con el título del próximo.
     #[test]
     fn player_info_shows_the_next_queued_item_while_playing() {
-        let Some(engine) = engine_or_skip() else { return };
+        let Some(engine) = engine_or_skip() else {
+            return;
+        };
         let mut app = library_with_three();
         app.mode = Mode::Player;
         app.has_player = true;
@@ -7172,7 +7475,9 @@ mod tests {
     /// ningún placeholder de «0».
     #[test]
     fn player_info_hides_the_queue_line_when_queue_is_empty() {
-        let Some(engine) = engine_or_skip() else { return };
+        let Some(engine) = engine_or_skip() else {
+            return;
+        };
         let mut app = library_with_three();
         app.mode = Mode::Player;
         app.has_player = true;
@@ -7187,11 +7492,13 @@ mod tests {
         );
     }
 
-    /// S9: con el cursor parado en el primer ítem, lo «siguiente» es el segundo
+    /// con el cursor parado en el primer ítem, lo «siguiente» es el segundo
     /// de la cola (y no queda nada detrás, así que no hay «(+N)»).
     #[test]
     fn player_info_shows_the_item_after_the_queue_cursor() {
-        let Some(engine) = engine_or_skip() else { return };
+        let Some(engine) = engine_or_skip() else {
+            return;
+        };
         let mut app = library_with_three();
         app.mode = Mode::Player;
         app.has_player = true;
@@ -7213,11 +7520,13 @@ mod tests {
         );
     }
 
-    /// S9: con el cursor en el último ítem no hay nada siguiente, así que la
+    /// con el cursor en el último ítem no hay nada siguiente, así que la
     /// fila desaparece igual que con la cola vacía.
     #[test]
     fn player_info_hides_the_queue_line_when_the_cursor_is_at_the_last_item() {
-        let Some(engine) = engine_or_skip() else { return };
+        let Some(engine) = engine_or_skip() else {
+            return;
+        };
         let mut app = library_with_three();
         app.mode = Mode::Player;
         app.has_player = true;
@@ -7237,24 +7546,42 @@ mod tests {
 
     #[test]
     fn render_registers_the_volume_bar_where_it_is_drawn() {
-        let Some(engine) = engine_or_skip() else { return };
+        let Some(engine) = engine_or_skip() else {
+            return;
+        };
         let mut app = test_app();
         app.mode = Mode::Player;
         app.has_player = true;
         let buffer = render_player_frame(&app, &engine);
 
-        let bar = app.hit.borrow().volume.expect("barra de volumen registrada");
+        let bar = app
+            .hit
+            .borrow()
+            .volume
+            .expect("barra de volumen registrada");
         let row: String = (0..buffer.area.width)
             .map(|x| buffer[(x, bar.y)].symbol().to_string())
             .collect();
-        assert!(row.contains("Volumen"), "la fila registrada es la del volumen: {row}");
-        assert_eq!(buffer[(bar.x - 1, bar.y)].symbol(), "[", "empieza justo después de «[»");
-        assert!(app.hit.borrow().player.is_some(), "área del reproductor registrada");
+        assert!(
+            row.contains("Volumen"),
+            "la fila registrada es la del volumen: {row}"
+        );
+        assert_eq!(
+            buffer[(bar.x - 1, bar.y)].symbol(),
+            "[",
+            "empieza justo después de «[»"
+        );
+        assert!(
+            app.hit.borrow().player.is_some(),
+            "área del reproductor registrada"
+        );
     }
 
     #[test]
     fn clicking_the_end_of_the_volume_bar_sets_full_volume() {
-        let Some(mut engine) = engine_or_skip() else { return };
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
         let mut app = test_app();
         app.mode = Mode::Player;
         app.has_player = true;
@@ -7274,7 +7601,10 @@ mod tests {
     }
 
     fn row_text(line: &Line<'_>) -> String {
-        line.spans.iter().map(|span| span.content.as_ref()).collect()
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
     }
 
     #[test]
@@ -7283,7 +7613,13 @@ mod tests {
         let kinds: Vec<Button> = buttons.iter().map(|(b, _, _)| *b).collect();
         assert_eq!(
             kinds,
-            vec![Button::Prev, Button::PlayPause, Button::Next, Button::Shuffle, Button::Repeat]
+            vec![
+                Button::Prev,
+                Button::PlayPause,
+                Button::Next,
+                Button::Shuffle,
+                Button::Repeat
+            ]
         );
         assert!(row_text(&paused).contains('▶'), "pausado muestra play");
         let (playing, _) = transport_row(true, false, RepeatMode::Off, 200);
@@ -7298,12 +7634,20 @@ mod tests {
         for (button, start, width) in &buttons {
             assert!(*width > 0, "{button:?} tiene ancho");
             assert!(*start >= previous_end, "{button:?} no se solapa");
-            let label: String = text[*start as usize..(*start + *width) as usize].iter().collect();
-            assert!(!label.trim().is_empty(), "{button:?} cubre texto visible: {label:?}");
+            let label: String = text[*start as usize..(*start + *width) as usize]
+                .iter()
+                .collect();
+            assert!(
+                !label.trim().is_empty(),
+                "{button:?} cubre texto visible: {label:?}"
+            );
             previous_end = start + width;
         }
         let row = row_text(&line);
-        assert!(row.contains("aleatorio") && row.contains("repetir: todo"), "{row}");
+        assert!(
+            row.contains("aleatorio") && row.contains("repetir: todo"),
+            "{row}"
+        );
     }
 
     #[test]
@@ -7325,14 +7669,19 @@ mod tests {
     fn click_on_a_button_presses_it() {
         let mut hit = sample_hit();
         hit.buttons = vec![(Rect::new(10, 8, 4, 1), Button::Next)];
-        let (action, drag) =
-            mouse_action(&hit, None, mouse(MouseEventKind::Down(MouseButton::Left), 12, 8));
+        let (action, drag) = mouse_action(
+            &hit,
+            None,
+            mouse(MouseEventKind::Down(MouseButton::Left), 12, 8),
+        );
         assert_eq!((action, drag), (MouseAction::Press(Button::Next), None));
     }
 
     #[test]
     fn clicking_the_shuffle_button_toggles_shuffle() {
-        let Some(mut engine) = engine_or_skip() else { return };
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
         let mut app = library_with_three();
         app.mode = Mode::Player;
         app.has_player = true;
@@ -7346,7 +7695,11 @@ mod tests {
             .map(|(rect, _)| *rect)
             .expect("botón aleatorio registrado");
         handle_mouse(
-            mouse(MouseEventKind::Down(MouseButton::Left), shuffle.x, shuffle.y),
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                shuffle.x,
+                shuffle.y,
+            ),
             &mut app,
             &mut engine,
         );
@@ -7376,28 +7729,45 @@ mod tests {
         assert_eq!(key_for_chip("←/→"), Some(KeyCode::Left));
         assert_eq!(key_for_chip("Esc×2"), Some(KeyCode::Esc));
         assert_eq!(key_for_chip("espacio"), Some(KeyCode::Char(' ')));
-        assert_eq!(key_for_chip("volumen ↑/↓"), None, "texto suelto, no es un atajo");
+        assert_eq!(
+            key_for_chip("volumen ↑/↓"),
+            None,
+            "texto suelto, no es un atajo"
+        );
     }
 
     #[test]
     fn new_queue_chips_resolve_to_their_shortcuts() {
         assert_eq!(key_for_chip("a"), Some(KeyCode::Char('a')), "encolar");
-        assert_eq!(key_for_chip("c"), Some(KeyCode::Char('c')), "Biblioteca/Cola");
-        assert_eq!(key_for_chip("d"), Some(KeyCode::Char('d')), "borrar de la cola");
+        assert_eq!(
+            key_for_chip("c"),
+            Some(KeyCode::Char('c')),
+            "Biblioteca/Cola"
+        );
+        assert_eq!(
+            key_for_chip("d"),
+            Some(KeyCode::Char('d')),
+            "borrar de la cola"
+        );
     }
 
     #[test]
     fn click_on_a_footer_chip_sends_its_key() {
         let mut hit = sample_hit();
         hit.chips = vec![(Rect::new(40, 25, 10, 1), KeyCode::Char('s'))];
-        let (action, drag) =
-            mouse_action(&hit, None, mouse(MouseEventKind::Down(MouseButton::Left), 42, 25));
+        let (action, drag) = mouse_action(
+            &hit,
+            None,
+            mouse(MouseEventKind::Down(MouseButton::Left), 42, 25),
+        );
         assert_eq!((action, drag), (MouseAction::Key(KeyCode::Char('s')), None));
     }
 
     #[test]
     fn clicking_the_shuffle_chip_in_the_footer_toggles_shuffle() {
-        let Some(mut engine) = engine_or_skip() else { return };
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
         let mut app = library_with_three();
         app.mode = Mode::Player;
         app.has_player = true;
@@ -7413,7 +7783,10 @@ mod tests {
         let row: String = (chip.x..chip.x + chip.width)
             .map(|x| buffer[(x, chip.y)].symbol().to_string())
             .collect();
-        assert!(row.starts_with("s: shuffle"), "el área es la del chip dibujado: {row:?}");
+        assert!(
+            row.starts_with("s: shuffle"),
+            "el área es la del chip dibujado: {row:?}"
+        );
         handle_mouse(
             mouse(MouseEventKind::Down(MouseButton::Left), chip.x, chip.y),
             &mut app,
@@ -7424,19 +7797,26 @@ mod tests {
 
     #[test]
     fn registered_buttons_are_actually_drawn_on_small_terminals() {
-        let Some(engine) = engine_or_skip() else { return };
+        let Some(engine) = engine_or_skip() else {
+            return;
+        };
         let mut app = library_with_three();
         app.mode = Mode::Player;
         app.has_player = true;
         for height in [8u16, 10, 12, 14] {
             let backend = ratatui::backend::TestBackend::new(100, height);
             let mut terminal = ratatui::Terminal::new(backend).expect("terminal de prueba");
-            terminal.draw(|frame| render(frame, &app, &engine)).expect("dibuja");
+            terminal
+                .draw(|frame| render(frame, &app, &engine))
+                .expect("dibuja");
             let buffer = terminal.backend().buffer().clone();
             for (rect, button) in app.hit.borrow().buttons.iter() {
                 assert!(rect.y < height, "{height}: {button:?} fuera del frame");
                 let cell = buffer[(rect.x + 1, rect.y)].symbol().to_string();
-                assert!(!cell.trim().is_empty(), "{height}: {button:?} registrado pero no dibujado");
+                assert!(
+                    !cell.trim().is_empty(),
+                    "{height}: {button:?} registrado pero no dibujado"
+                );
             }
         }
     }
@@ -7458,7 +7838,11 @@ mod tests {
         assert!(text.contains("coincidencias"), "{text}");
 
         let boxed = find_search_box(&line).expect("la caja usa el fondo select_bg");
-        assert_eq!(boxed.content.chars().count(), SEARCH_BOX_WIDTH, "ancho fijo");
+        assert_eq!(
+            boxed.content.chars().count(),
+            SEARCH_BOX_WIDTH,
+            "ancho fijo"
+        );
         assert!(
             boxed.content.starts_with(&format!("ab{SEARCH_CARET}")),
             "{:?}",
@@ -7487,7 +7871,11 @@ mod tests {
         app.search = Some(String::new());
         let line = library_title_line(&app, "Music", theme().warn);
         let boxed = find_search_box(&line).expect("caja");
-        assert!(boxed.content.contains(SEARCH_PLACEHOLDER), "{:?}", boxed.content);
+        assert!(
+            boxed.content.contains(SEARCH_PLACEHOLDER),
+            "{:?}",
+            boxed.content
+        );
         assert_eq!(boxed.style.fg, Some(theme().dim), "placeholder tenue");
         assert_eq!(boxed.content.chars().count(), SEARCH_BOX_WIDTH);
     }
@@ -7502,7 +7890,10 @@ mod tests {
 
         app.search = None;
         let plain = library_title_line(&app, "Music", theme().accent);
-        assert!(find_search_box(&plain).is_none(), "sin búsqueda no hay caja");
+        assert!(
+            find_search_box(&plain).is_none(),
+            "sin búsqueda no hay caja"
+        );
         assert_eq!(line_text(&plain), library_title(&app, "Music"));
     }
 
@@ -7528,7 +7919,10 @@ mod tests {
         let mut guard = QuitGuard::default();
         guard.on_quit_key(t0);
         let late = t0 + QUIT_CONFIRM_WINDOW + Duration::from_millis(1);
-        assert!(!guard.is_armed(late), "vencida la ventana ya no está armado");
+        assert!(
+            !guard.is_armed(late),
+            "vencida la ventana ya no está armado"
+        );
         assert_eq!(
             guard.on_quit_key(late),
             QuitDecision::Arm,
@@ -7552,14 +7946,19 @@ mod tests {
 
     #[test]
     fn esc_in_player_arms_then_second_esc_quits() {
-        let Some(mut engine) = engine_or_skip() else { return };
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
         let mut app = test_app();
         app.mode = Mode::Player;
         app.explorer_open = false;
 
         handle_key(theme_menu_key(KeyCode::Esc), &mut app, &mut engine);
         assert!(!app.should_quit, "un solo Esc no sale");
-        assert!(app.quit_guard.is_armed(Instant::now()), "queda armado con aviso");
+        assert!(
+            app.quit_guard.is_armed(Instant::now()),
+            "queda armado con aviso"
+        );
         assert!(
             line_text(&error_line(&app)).contains("Esc de nuevo"),
             "muestra el aviso: {}",
@@ -7572,21 +7971,31 @@ mod tests {
 
     #[test]
     fn other_key_between_escs_cancels_the_exit() {
-        let Some(mut engine) = engine_or_skip() else { return };
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
         let mut app = test_app();
         app.mode = Mode::Player;
         app.explorer_open = false;
 
         handle_key(theme_menu_key(KeyCode::Esc), &mut app, &mut engine);
         handle_key(theme_menu_key(KeyCode::Char('s')), &mut app, &mut engine);
-        assert!(!app.quit_guard.is_armed(Instant::now()), "otra tecla desarma");
+        assert!(
+            !app.quit_guard.is_armed(Instant::now()),
+            "otra tecla desarma"
+        );
         handle_key(theme_menu_key(KeyCode::Esc), &mut app, &mut engine);
-        assert!(!app.should_quit, "tras desarmar, un Esc solo vuelve a armar");
+        assert!(
+            !app.should_quit,
+            "tras desarmar, un Esc solo vuelve a armar"
+        );
     }
 
     #[test]
     fn q_no_longer_quits() {
-        let Some(mut engine) = engine_or_skip() else { return };
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
         let mut app = test_app();
         app.mode = Mode::Player;
         app.explorer_open = false;
@@ -7597,7 +8006,9 @@ mod tests {
 
     #[test]
     fn esc_with_explorer_panel_open_closes_it_without_arming() {
-        let Some(mut engine) = engine_or_skip() else { return };
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
         let mut app = test_app();
         app.mode = Mode::Player;
         app.has_player = true;
@@ -7605,13 +8016,18 @@ mod tests {
 
         handle_key(theme_menu_key(KeyCode::Esc), &mut app, &mut engine);
         assert!(!app.explorer_open, "Esc cierra el panel");
-        assert!(!app.quit_guard.is_armed(Instant::now()), "y no arma la salida");
+        assert!(
+            !app.quit_guard.is_armed(Instant::now()),
+            "y no arma la salida"
+        );
         assert!(!app.should_quit);
     }
 
     #[test]
     fn esc_in_fullscreen_browser_without_player_needs_two_presses() {
-        let Some(mut engine) = engine_or_skip() else { return };
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
         let mut app = test_app();
         app.mode = Mode::Browser;
         app.has_player = false;
@@ -7625,7 +8041,9 @@ mod tests {
 
     #[test]
     fn b_opens_search_and_tab_toggles_explorer_from_player() {
-        let Some(mut engine) = engine_or_skip() else { return };
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
         let mut app = test_app();
         app.mode = Mode::Player;
         app.has_player = true;
@@ -7664,7 +8082,11 @@ mod tests {
             "guarda los colores originales para Esc"
         );
         // Abrir no cambia el tema.
-        assert_eq!(runtime::active_theme_name(), current, "solo previsualiza al mover");
+        assert_eq!(
+            runtime::active_theme_name(),
+            current,
+            "solo previsualiza al mover"
+        );
     }
 
     #[test]
@@ -7724,8 +8146,8 @@ mod tests {
     #[test]
     fn theme_menu_enter_applies_and_persists_injected_path() {
         let _setup = theme_menu_test_setup();
-        let path = std::env::temp_dir()
-            .join(format!("mp3tui_theme_menu_{}.toml", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("mp3tui_theme_menu_{}.toml", std::process::id()));
         let _ = std::fs::remove_file(&path);
 
         let mut app = test_app();
@@ -7762,7 +8184,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// D1: aplicar el tema Miku desde el menú activa en vivo la bailarina
+    /// aplicar el tema Miku desde el menú activa en vivo la bailarina
     /// (además del default de arranque que cubre `parse()`).
     #[test]
     fn applying_the_miku_theme_activates_the_dancer_mode_live() {
@@ -7831,9 +8253,7 @@ mod tests {
             original_theme: before_theme.clone(),
         });
 
-        handle_theme_menu_key(theme_menu_key(KeyCode::Down), &mut app, |_| {
-            Ok(())
-        });
+        handle_theme_menu_key(theme_menu_key(KeyCode::Down), &mut app, |_| Ok(()));
         handle_theme_menu_key(theme_menu_key(KeyCode::Esc), &mut app, |_| {
             panic!("Esc no debe persistir")
         });
@@ -7887,8 +8307,7 @@ mod tests {
         };
 
         let lines = theme_menu_lines(&menu);
-        let texts: Vec<String> =
-            lines.iter().map(line_text).collect::<Vec<_>>();
+        let texts: Vec<String> = lines.iter().map(line_text).collect::<Vec<_>>();
         assert_eq!(texts.len(), 8, "una fila por tema: {texts:?}");
         for (id, _) in config::builtin_themes() {
             assert!(
@@ -7924,7 +8343,9 @@ mod tests {
 
     #[test]
     fn settings_opens_with_ctrl_p_from_player_and_list() {
-        let Some(mut engine) = engine_or_skip() else { return };
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
         let ctrl_p = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL);
 
         let mut app = test_app();
@@ -7951,16 +8372,17 @@ mod tests {
         let mut app = test_app();
         app.mode = Mode::Player;
         handle_player_key(theme_menu_key(KeyCode::Char('p')), &mut app, &mut engine);
-        assert!(app.settings_panel.is_none(), "la 'p' suelta no abre el panel");
+        assert!(
+            app.settings_panel.is_none(),
+            "la 'p' suelta no abre el panel"
+        );
     }
 
     #[test]
     fn settings_panel_navigation_clamps_without_wrapping() {
         let mut app = test_app();
         open_settings_panel(&mut app);
-        let selected = |app: &App| {
-            app.settings_panel.as_ref().expect("panel abierto").selected
-        };
+        let selected = |app: &App| app.settings_panel.as_ref().expect("panel abierto").selected;
 
         // Como el menú de temas (move_selection con clamp): no envuelve.
         handle_settings_panel_key(theme_menu_key(KeyCode::Up), &mut app, |_| Ok(()));
@@ -7978,14 +8400,19 @@ mod tests {
     // la selección intacta, como antes).
     #[test]
     fn settings_esc_closes_panel_without_arming_quit() {
-        let Some(mut engine) = engine_or_skip() else { return };
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
         let mut app = test_app();
         app.mode = Mode::Player;
         open_settings_panel(&mut app);
 
         handle_key(theme_menu_key(KeyCode::Esc), &mut app, &mut engine);
         assert!(app.settings_panel.is_none(), "un solo Esc cierra el panel");
-        assert!(!app.quit_guard.is_armed(Instant::now()), "y no arma la salida");
+        assert!(
+            !app.quit_guard.is_armed(Instant::now()),
+            "y no arma la salida"
+        );
         assert!(!app.should_quit);
 
         // El doble-Esc de salida solo aplica sin modal: hacen falta dos más.
@@ -8074,7 +8501,9 @@ mod tests {
 
     #[test]
     fn mouse_is_inert_under_settings_panel() {
-        let Some(mut engine) = engine_or_skip() else { return };
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
         let mut app = test_app();
         app.mode = Mode::Player;
         app.has_player = true;
@@ -8091,7 +8520,9 @@ mod tests {
 
     #[test]
     fn settings_chip_click_opens_the_panel() {
-        let Some(mut engine) = engine_or_skip() else { return };
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
         assert_eq!(
             key_for_chip("Ctrl+P"),
             Some(KeyCode::Char('p')),
@@ -8112,18 +8543,26 @@ mod tests {
         let row: String = (chip.x..chip.x + chip.width)
             .map(|x| buffer[(x, chip.y)].symbol().to_string())
             .collect();
-        assert!(row.starts_with("Ctrl+P"), "el área es la del chip dibujado: {row:?}");
+        assert!(
+            row.starts_with("Ctrl+P"),
+            "el área es la del chip dibujado: {row:?}"
+        );
         handle_mouse(
             mouse(MouseEventKind::Down(MouseButton::Left), chip.x, chip.y),
             &mut app,
             &mut engine,
         );
-        assert!(app.settings_panel.is_some(), "clickear el chip abre el panel");
+        assert!(
+            app.settings_panel.is_some(),
+            "clickear el chip abre el panel"
+        );
     }
 
     #[test]
     fn handle_key_routes_to_settings_panel_when_open() {
-        let Some(mut engine) = engine_or_skip() else { return };
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
         let mut app = library_with_three();
         app.mode = Mode::Player;
         app.has_player = true;
@@ -8174,8 +8613,10 @@ mod tests {
     fn settings_enter_on_mouse_toggles_state_and_persists() {
         // Enter en «Mouse» alterna el estado en el momento, deja el panel
         // abierto y persiste `[ui] mouse` (ruta temporal inyectada).
-        let path = std::env::temp_dir()
-            .join(format!("mp3tui_t4_mouse_toggle_{}.toml", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "mp3tui_t4_mouse_toggle_{}.toml",
+            std::process::id()
+        ));
         let _ = std::fs::remove_file(&path);
         std::fs::write(&path, "[ui]\nmouse = true\n").unwrap();
 
@@ -8187,10 +8628,7 @@ mod tests {
             config::persist_mouse_enabled_at(&path, enabled)
         });
         assert!(!app.mouse_enabled, "Enter apaga el mouse en el momento");
-        assert!(
-            app.settings_panel.is_some(),
-            "el toggle no cierra el panel"
-        );
+        assert!(app.settings_panel.is_some(), "el toggle no cierra el panel");
         let text = std::fs::read_to_string(&path).expect("mouse persistido");
         assert!(
             text.contains("mouse = false"),
@@ -8220,11 +8658,11 @@ mod tests {
         handle_settings_panel_key(theme_menu_key(KeyCode::Enter), &mut app, |_| {
             Err("sin disco".to_string())
         });
-        assert!(!app.mouse_enabled, "el toggle aplica aunque falle el guardado");
         assert!(
-            app.settings_panel.is_some(),
-            "y el panel sigue abierto"
+            !app.mouse_enabled,
+            "el toggle aplica aunque falle el guardado"
         );
+        assert!(app.settings_panel.is_some(), "y el panel sigue abierto");
         assert_eq!(
             app.error.as_deref(),
             Some("sin disco"),
@@ -8259,7 +8697,9 @@ mod tests {
     fn mouse_toggle_off_stays_off_after_closing_panel() {
         // El toggle manda sobre el estado previo: apagar con el panel abierto
         // y cerrarlo no reactiva la captura.
-        let Some(mut engine) = engine_or_skip() else { return };
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
         let mut app = test_app();
         app.mode = Mode::Player;
         app.has_player = true;
@@ -8270,10 +8710,7 @@ mod tests {
 
         handle_key(theme_menu_key(KeyCode::Esc), &mut app, &mut engine);
         assert!(app.settings_panel.is_none(), "Esc cierra el panel");
-        assert!(
-            !app.mouse_enabled,
-            "cerrar el panel no reactiva la captura"
-        );
+        assert!(!app.mouse_enabled, "cerrar el panel no reactiva la captura");
 
         // Y el handler lo respeta: el clic ya no actúa.
         *app.hit.borrow_mut() = sample_hit();
@@ -8290,7 +8727,9 @@ mod tests {
     fn mouse_disabled_globally_ignores_events_even_without_modals() {
         // El estado vivo está ENCIMA del chequeo de modales: apagado, el
         // mouse se ignora aunque no haya ningún modal abierto.
-        let Some(mut engine) = engine_or_skip() else { return };
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
         let mut app = test_app();
         app.mode = Mode::Player;
         app.has_player = true;
@@ -8315,7 +8754,9 @@ mod tests {
 
     #[test]
     fn t_key_is_free_does_nothing_in_player_and_list() {
-        let Some(mut engine) = engine_or_skip() else { return };
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
         let mut app = test_app();
         app.mode = Mode::Player;
         handle_player_key(theme_menu_key(KeyCode::Char('t')), &mut app, &mut engine);
@@ -8334,8 +8775,10 @@ mod tests {
     #[test]
     fn theme_submodal_enter_saves_and_returns_to_panel() {
         let _setup = theme_menu_test_setup();
-        let path = std::env::temp_dir()
-            .join(format!("mp3tui_t2_submodal_enter_{}.toml", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "mp3tui_t2_submodal_enter_{}.toml",
+            std::process::id()
+        ));
         let _ = std::fs::remove_file(&path);
         let mut app = test_app();
         open_settings_panel(&mut app);
@@ -8350,7 +8793,11 @@ mod tests {
             app.settings_panel.is_some(),
             "pero VUELVE al panel, no lo cierra"
         );
-        assert_eq!(runtime::active_theme_name(), expected, "el tema queda aplicado");
+        assert_eq!(
+            runtime::active_theme_name(),
+            expected,
+            "el tema queda aplicado"
+        );
         let text = std::fs::read_to_string(&path).expect("tema persistido");
         assert!(
             text.contains(expected),
@@ -8362,7 +8809,9 @@ mod tests {
     #[test]
     fn theme_submodal_esc_restores_and_returns_to_panel() {
         let _setup = theme_menu_test_setup();
-        let Some(mut engine) = engine_or_skip() else { return };
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
         let mut app = test_app();
         open_settings_panel(&mut app);
         handle_settings_panel_key(theme_menu_key(KeyCode::Enter), &mut app, |_| Ok(()));
@@ -8376,15 +8825,25 @@ mod tests {
             app.settings_panel.is_some(),
             "y VUELVE al panel, no lo cierra"
         );
-        assert_eq!(runtime::active_theme_name(), before_name, "Esc restaura el id");
-        assert_eq!(runtime::active_theme(), before_theme, "Esc restaura los colores");
+        assert_eq!(
+            runtime::active_theme_name(),
+            before_name,
+            "Esc restaura el id"
+        );
+        assert_eq!(
+            runtime::active_theme(),
+            before_theme,
+            "Esc restaura los colores"
+        );
     }
 
     #[test]
     fn mouse_is_inert_under_theme_submodal() {
         // El guard inerte ya cubre el panel  y el sub-modal (existente):
         // se verifica, no se duplica.
-        let Some(mut engine) = engine_or_skip() else { return };
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
         let mut app = test_app();
         app.mode = Mode::Player;
         app.has_player = true;
@@ -8438,8 +8897,7 @@ mod tests {
     // Selector de Bandas dentro del panel + persistencia del estilo
     // -------------------------------------------------------------------------
 
-    static BANDS_MENU_TEST_LOCK: std::sync::Mutex<()> =
-        std::sync::Mutex::new(());
+    static BANDS_MENU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     struct BandsMenuTestGuard {
         _lock: std::sync::MutexGuard<'static, ()>,
@@ -8488,9 +8946,7 @@ mod tests {
         let mut app = test_app();
         open_settings_panel(&mut app);
         open_bands_menu(&mut app);
-        let selected = |app: &App| {
-            app.bands_menu.as_ref().expect("sub-modal abierto").selected
-        };
+        let selected = |app: &App| app.bands_menu.as_ref().expect("sub-modal abierto").selected;
         assert_eq!(selected(&app), 1, "arranca en el estilo activo (ascii)");
 
         // Sin envoltura, como el menú de temas.
@@ -8519,7 +8975,9 @@ mod tests {
     #[test]
     fn dispatch_routes_to_bands_submodal_when_open() {
         let _setup = bands_menu_test_setup();
-        let Some(mut engine) = engine_or_skip() else { return };
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
         runtime::activate_visualizer_style(config::VisualizerStyle::Auto);
         let mut app = test_app();
         app.mode = Mode::Player;
@@ -8544,8 +9002,8 @@ mod tests {
     #[test]
     fn bands_submodal_enter_saves_and_returns_to_panel() {
         let _setup = bands_menu_test_setup();
-        let path = std::env::temp_dir()
-            .join(format!("mp3tui_t3_bands_enter_{}.toml", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("mp3tui_t3_bands_enter_{}.toml", std::process::id()));
         let _ = std::fs::remove_file(&path);
         runtime::activate_visualizer_style(config::VisualizerStyle::Auto);
         let mut app = test_app();
@@ -8604,7 +9062,9 @@ mod tests {
     fn mouse_is_inert_under_bands_submodal() {
         // El guard inerte cubre el panel y el sub-modal: se verifica.
         let _setup = bands_menu_test_setup();
-        let Some(mut engine) = engine_or_skip() else { return };
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
         let mut app = test_app();
         app.mode = Mode::Player;
         app.has_player = true;
@@ -8646,8 +9106,7 @@ mod tests {
     // barras
     // -------------------------------------------------------------------------
 
-    static MODE_MENU_TEST_LOCK: std::sync::Mutex<()> =
-        std::sync::Mutex::new(());
+    static MODE_MENU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     struct ModeMenuTestGuard {
         _lock: std::sync::MutexGuard<'static, ()>,
@@ -8696,9 +9155,7 @@ mod tests {
         let mut app = test_app();
         open_settings_panel(&mut app);
         open_mode_menu(&mut app);
-        let selected = |app: &App| {
-            app.mode_menu.as_ref().expect("sub-modal abierto").selected
-        };
+        let selected = |app: &App| app.mode_menu.as_ref().expect("sub-modal abierto").selected;
         assert_eq!(selected(&app), 0, "arranca en el modo activo (barras)");
 
         // Sin envoltura, como los otros selectores.
@@ -8719,7 +9176,9 @@ mod tests {
     #[test]
     fn dispatch_routes_to_mode_submodal_when_open() {
         let _setup = mode_menu_test_setup();
-        let Some(mut engine) = engine_or_skip() else { return };
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
         runtime::activate_visualizer_mode(config::VisualizerMode::Barras);
         let mut app = test_app();
         app.mode = Mode::Player;
@@ -8744,8 +9203,8 @@ mod tests {
     #[test]
     fn mode_submodal_enter_saves_and_returns_to_panel() {
         let _setup = mode_menu_test_setup();
-        let path = std::env::temp_dir()
-            .join(format!("mp3tui_t1_mode_enter_{}.toml", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("mp3tui_t1_mode_enter_{}.toml", std::process::id()));
         let _ = std::fs::remove_file(&path);
         runtime::activate_visualizer_mode(config::VisualizerMode::Barras);
         let mut app = test_app();
@@ -8804,7 +9263,9 @@ mod tests {
     fn mouse_is_inert_under_mode_submodal() {
         // El guard inerte cubre el panel y el sub-modal: se verifica.
         let _setup = mode_menu_test_setup();
-        let Some(mut engine) = engine_or_skip() else { return };
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
         let mut app = test_app();
         app.mode = Mode::Player;
         app.has_player = true;
@@ -8885,7 +9346,9 @@ mod tests {
     /// el panel abierto a ancho chico.
     #[test]
     fn visualizer_miku_mode_paints_the_dancer_in_all_poses() {
-        let Some(engine) = engine_or_skip() else { return };
+        let Some(engine) = engine_or_skip() else {
+            return;
+        };
         runtime::preview_visualizer_mode(config::VisualizerMode::Miku);
         let mut analyzer = SpectrumAnalyzer::new();
         // Silencio: el timer de respiración mueve la pose sola (arco de salto).
@@ -8927,7 +9390,9 @@ mod tests {
     /// y se recorta sin paniquear con el panel abierto.
     #[test]
     fn visualizer_miku_unicode_paints_the_real_art_animated() {
-        let Some(engine) = engine_or_skip() else { return };
+        let Some(engine) = engine_or_skip() else {
+            return;
+        };
         let previous = runtime::active_visualizer_style();
         runtime::preview_visualizer_style(config::VisualizerStyle::Unicode);
         runtime::preview_visualizer_mode(config::VisualizerMode::Miku);
@@ -9016,7 +9481,10 @@ mod tests {
         let action = handle_ytdlp_result(&mut app, 42, matching_result);
         assert_eq!(
             action,
-            Some(("https://example.com/fresh.m4a".to_string(), "Fresh Song".to_string()))
+            Some((
+                "https://example.com/fresh.m4a".to_string(),
+                "Fresh Song".to_string()
+            ))
         );
         assert_eq!(app.status, Status::Connecting);
         assert_eq!(app.track_label, "Fresh Song");
@@ -9366,10 +9834,7 @@ mod tests {
         // Sesión URL con posición por encima del mínimo: wav local de 6 s y
         // seek instantáneo (los archivos son seekables y el seek guarda
         // played_frames sincrónicamente, sin esperar reproducción real).
-        let t6 = std::env::temp_dir().join(format!(
-            "mp3tui_t11_urlok_{}.wav",
-            std::process::id()
-        ));
+        let t6 = std::env::temp_dir().join(format!("mp3tui_t11_urlok_{}.wav", std::process::id()));
         let _ = std::fs::write(&t6, make_test_wav(44100 * 6));
         if engine.play(&t6).is_err() {
             let _ = std::fs::remove_file(&t6);
@@ -9407,10 +9872,7 @@ mod tests {
             "el test no debe lanzar yt-dlp: la orden va por el dispatcher"
         );
         assert_ne!(app.status, Status::Resolving, "sin resolución pendiente");
-        assert!(
-            app.is_url,
-            "la sesión sigue siendo de URL"
-        );
+        assert!(app.is_url, "la sesión sigue siendo de URL");
         assert_eq!(
             app.current_url.as_ref().map(|(u, _)| u.as_str()),
             Some(original.as_str()),
@@ -9505,7 +9967,7 @@ mod tests {
     }
 
     /// La cola conserva el orden de encolado también con shuffle activo, y el
-    /// cursor avanza en vez de consumir la lista (S9).
+    /// cursor avanza en vez de consumir la lista.
     #[test]
     fn test_natural_end_with_queue_respects_enqueue_order_even_with_shuffle() {
         let mut app = test_app();
@@ -9577,11 +10039,15 @@ mod tests {
             Some("https://www.youtube.com/watch?v=encolada".to_string()),
             "la URL encolada se resuelve cuando se termina la actual"
         );
-        assert_eq!(app.queue_cursor, Some(0), "el cursor queda en la URL encolada");
+        assert_eq!(
+            app.queue_cursor,
+            Some(0),
+            "el cursor queda en la URL encolada"
+        );
         assert_eq!(app.queue.len(), 1, "la URL sigue en la cola");
     }
 
-    /// D2/S6 con el shuffle activo: una pista local que termina encadena con
+    /// con el shuffle activo: una pista local que termina encadena con
     /// la URL del historial que le sigue en el pool, pasando por el seam
     /// inyectado `replay` (no se lanza yt-dlp en el test). Con un pool de
     /// exactamente dos elementos el «siguiente» está forzado, así que no
@@ -9589,9 +10055,9 @@ mod tests {
     #[test]
     fn test_shuffle_natural_end_local_chains_to_history_url_via_replay() {
         let mut app = test_app();
-        app.library = Some(crate::playlist::from_tracks_for_test(vec![
-            track_named("alpha"),
-        ]));
+        app.library = Some(crate::playlist::from_tracks_for_test(vec![track_named(
+            "alpha",
+        )]));
         app.history.add(
             "Video de YouTube".to_string(),
             "https://www.youtube.com/watch?v=urlA".to_string(),
@@ -9619,7 +10085,7 @@ mod tests {
         );
     }
 
-    /// D2/S6 con el shuffle activo: una URL que termina encadena a la OTRA
+    /// con el shuffle activo: una URL que termina encadena a la OTRA
     /// URL del historial, nunca a la misma. Pool de dos URLs → el siguiente
     /// está forzado.
     #[test]
@@ -9665,7 +10131,7 @@ mod tests {
         );
     }
 
-    /// D2/S6: el shuffle no repite la pista que acaba de terminar. Con el
+    ///: el shuffle no repite la pista que acaba de terminar. Con el
     /// orden forzado `[2, 0, 1]` y una pista local en el pool 0, el siguiente
     /// es determinista (el pool 1) y nunca vuelve a ser la pista que terminó.
     #[test]
@@ -9721,7 +10187,7 @@ mod tests {
         }
     }
 
-    /// Preservación (S4): con el shuffle APAGADO el fin natural avanza a la
+    /// Preservación: con el shuffle APAGADO el fin natural avanza a la
     /// siguiente pista local en orden, nunca a una URL del historial, y
     /// `n`/`p` se comportan igual que antes.
     #[test]
@@ -9766,7 +10232,10 @@ mod tests {
             dispatched = Some(request);
         });
 
-        assert_eq!(dispatched, None, "sin shuffle el fin natural nunca dispara una URL");
+        assert_eq!(
+            dispatched, None,
+            "sin shuffle el fin natural nunca dispara una URL"
+        );
         assert_eq!(
             app.current_path.as_ref(),
             Some(&p2),
@@ -9775,25 +10244,35 @@ mod tests {
 
         app.current_path = Some(p2.clone());
         play_step(&mut app, &mut engine, 1);
-        assert_eq!(app.current_path.as_ref(), Some(&p3), "'n' avanza a la siguiente local");
+        assert_eq!(
+            app.current_path.as_ref(),
+            Some(&p3),
+            "'n' avanza a la siguiente local"
+        );
 
         app.current_path = Some(p3.clone());
         play_step(&mut app, &mut engine, -1);
-        assert_eq!(app.current_path.as_ref(), Some(&p2), "'p' retrocede a la anterior local");
+        assert_eq!(
+            app.current_path.as_ref(),
+            Some(&p2),
+            "'p' retrocede a la anterior local"
+        );
 
         for p in [&p1, &p2, &p3] {
             let _ = std::fs::remove_file(p);
         }
     }
 
-    /// D2/S6 con shuffle activo: `n`/`p` deben recorrer el mismo pool mixto
+    /// con shuffle activo: `n`/`p` deben recorrer el mismo pool mixto
     /// que el fin de pista. Con un pool de exactamente dos elementos (una
     /// pista local + una URL del historial) el «siguiente» está forzado; el
     /// paso tiene que despachar la URL por el seam inyectado `replay` en vez
     /// de quedar en silencio.
     #[test]
     fn test_shuffle_step_dispatches_history_url_through_replay() {
-        let Some(mut engine) = engine_or_skip() else { return };
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
         let mut app = test_app();
         let dir = std::env::temp_dir();
         let wav_path = dir.join(format!("mp3tui_step_url_{}.wav", std::process::id()));
@@ -9831,7 +10310,9 @@ mod tests {
     /// `QueueItem::Local`, sin mover la selección ni la lista.
     #[test]
     fn enqueue_key_appends_the_selected_library_track_to_the_queue() {
-        let Some(mut engine) = engine_or_skip() else { return };
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
         let mut app = library_with_three();
         app.selected = 1;
 
@@ -9847,7 +10328,9 @@ mod tests {
     /// sonar), no como pista local.
     #[test]
     fn enqueue_key_adds_a_history_url_as_a_queue_url_item() {
-        let Some(mut engine) = engine_or_skip() else { return };
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
         let mut app = test_app();
         app.history.add(
             "Video de YouTube".to_string(),
@@ -9871,7 +10354,9 @@ mod tests {
     /// propia selección.
     #[test]
     fn queue_panel_key_toggles_lists_and_keeps_two_selections() {
-        let Some(mut engine) = engine_or_skip() else { return };
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
         let mut app = library_with_three();
         app.mode = Mode::Player;
         app.has_player = true;
@@ -9895,7 +10380,7 @@ mod tests {
 
     /// Lista de la Cola: el resaltado (selección) es el mismo que el de la
     /// Biblioteca, el ítem parado en el cursor de reproducción se marca con
-    /// `▶`, lo ya sonado queda atenuado y el estado vacío es explícito (S9).
+    /// `▶`, lo ya sonado queda atenuado y el estado vacío es explícito.
     #[test]
     fn queue_rows_mark_the_cursor_position_and_dim_the_played_items() {
         let mut app = test_app();
@@ -9911,7 +10396,10 @@ mod tests {
         let lines = queue_rows(&app, 40, 10);
         let texts: Vec<String> = lines.iter().map(|line| line_text(line)).collect();
         assert_eq!(texts.len(), 3, "una fila por ítem: {texts:?}");
-        assert!(texts[1].starts_with('\u{258c}'), "cursor de selección en el seleccionado");
+        assert!(
+            texts[1].starts_with('\u{258c}'),
+            "cursor de selección en el seleccionado"
+        );
         assert!(texts[0].contains("primera"), "{:?}", texts[0]);
         assert!(texts[2].contains("tercera"), "{:?}", texts[2]);
 
@@ -9945,11 +10433,13 @@ mod tests {
         assert!(empty_text.contains("vacía"), "estado vacío: {empty_text}");
     }
 
-    /// S9: borrar un ítem que está antes del cursor lo corre para que siga
+    /// borrar un ítem que está antes del cursor lo corre para que siga
     /// apuntando al mismo ítem.
     #[test]
     fn queue_delete_before_the_cursor_keeps_it_on_the_same_item() {
-        let Some(mut engine) = engine_or_skip() else { return };
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
         let mut app = test_app();
         app.explorer_open = true;
         app.queue_panel = true;
@@ -9970,11 +10460,13 @@ mod tests {
         );
     }
 
-    /// S9: borrar el ítem que está sonando desde la cola apaga el cursor,
+    /// borrar el ítem que está sonando desde la cola apaga el cursor,
     /// porque ya no hay nada de la cola en reproducción.
     #[test]
     fn queue_delete_of_the_playing_item_clears_the_cursor() {
-        let Some(mut engine) = engine_or_skip() else { return };
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
         let mut app = test_app();
         app.explorer_open = true;
         app.queue_panel = true;
@@ -9990,12 +10482,14 @@ mod tests {
         assert_eq!(app.queue_cursor, None, "nada de la cola está sonando");
     }
 
-    /// S9: el cursor de la cola nunca queda fuera de rango ni apuntando a un
+    /// el cursor de la cola nunca queda fuera de rango ni apuntando a un
     /// ítem inexistente, ni siquiera mezclando encolado, borrado, Enter, `n`,
     /// `p` y fin de pista en cualquier orden.
     #[test]
     fn queue_cursor_stays_in_range_through_mixed_operations() {
-        let Some(mut engine) = engine_or_skip() else { return };
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
         let dir = std::env::temp_dir();
         let wav = make_test_wav(4410);
         let mut paths = Vec::new();
@@ -10060,11 +10554,13 @@ mod tests {
         }
     }
 
-    /// S9: `n` recorre la cola —avanza el cursor una posición y reproduce ese
+    /// `n` recorre la cola —avanza el cursor una posición y reproduce ese
     /// ítem— antes de caer al pool de la biblioteca.
     #[test]
     fn queue_step_next_advances_the_cursor_and_plays_that_item() {
-        let Some(mut engine) = engine_or_skip() else { return };
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
         let mut app = library_with_three();
         app.mode = Mode::Player;
         app.queue.push(queue_url("uno"));
@@ -10080,7 +10576,11 @@ mod tests {
             vec!["https://x/uno".to_string()],
             "n arranca por el primero de la cola"
         );
-        assert_eq!(app.queue_cursor, Some(0), "el cursor queda en el ítem que sonó");
+        assert_eq!(
+            app.queue_cursor,
+            Some(0),
+            "el cursor queda en el ítem que sonó"
+        );
         assert_eq!(app.queue.len(), 2, "la cola conserva los ítems");
 
         play_step_with(&mut app, &mut engine, 1, |_app, _engine, request| {
@@ -10095,10 +10595,12 @@ mod tests {
         assert_eq!(app.queue.len(), 2, "y la cola sigue entera");
     }
 
-    /// S9: `p` retrocede una posición del cursor y reproduce la anterior.
+    /// `p` retrocede una posición del cursor y reproduce la anterior.
     #[test]
     fn queue_step_prev_goes_back_to_the_previous_queue_item() {
-        let Some(mut engine) = engine_or_skip() else { return };
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
         let mut app = library_with_three();
         app.mode = Mode::Player;
         app.queue.push(queue_url("uno"));
@@ -10120,11 +10622,13 @@ mod tests {
         assert_eq!(app.queue.len(), 3, "la cola no se consume");
     }
 
-    /// S9: sin nada por delante del cursor, `n` cae al pool de la biblioteca
+    /// sin nada por delante del cursor, `n` cae al pool de la biblioteca
     /// como hoy (repeat Off avanza a la siguiente) y no mueve el cursor.
     #[test]
     fn queue_step_next_at_the_end_of_the_cursor_falls_back_to_the_pool() {
-        let Some(mut engine) = engine_or_skip() else { return };
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
         let (mut app, t1, t2) = queue_fallback_app();
         app.current_path = Some(t1);
         app.queue.push(queue_url("uno"));
@@ -10151,8 +10655,8 @@ mod tests {
         let _ = std::fs::remove_file(&t2);
     }
 
-    /// S9: el fin natural con el cursor ya en el final de la cola vuelve al
-    /// fallback de S5/S6 (la biblioteca avanza como hoy).
+    /// el fin natural con el cursor ya en el final de la cola vuelve al
+    /// fallback de (la biblioteca avanza como hoy).
     #[test]
     fn queue_natural_end_with_the_cursor_at_the_end_falls_back_to_the_pool() {
         let (mut app, t1, t2) = queue_fallback_app();
@@ -10176,13 +10680,17 @@ mod tests {
             Some(&t2),
             "el fin natural sigue avanzando la biblioteca"
         );
-        assert_eq!(app.queue_cursor, Some(0), "el cursor de la cola no se mueve");
+        assert_eq!(
+            app.queue_cursor,
+            Some(0),
+            "el cursor de la cola no se mueve"
+        );
         assert_eq!(app.queue.len(), 1, "la cola queda intacta");
 
         let _ = std::fs::remove_file(&t2);
     }
 
-    /// S13 extendido al fin natural: un ítem local de la cola que no abre en
+    /// extendido al fin natural: un ítem local de la cola que no abre en
     /// el fin de pista se saltea con aviso visible y se sigue con el próximo.
     #[test]
     fn queue_natural_end_skips_a_broken_local_with_a_visible_warning() {
@@ -10199,8 +10707,10 @@ mod tests {
             PathBuf::from("/nonexistent/mp3tui_no_existe.wav")
         };
         // Un ítem roto (path inexistente) y detrás una pista real.
-        app.queue.push(QueueItem::Local(track_with_path(roto, "roto")));
-        app.queue.push(QueueItem::Local(track_with_path(t2.clone(), "buena")));
+        app.queue
+            .push(QueueItem::Local(track_with_path(roto, "roto")));
+        app.queue
+            .push(QueueItem::Local(track_with_path(t2.clone(), "buena")));
 
         handle_natural_end_with(&mut app, &mut engine, |_app, _engine, _request| {});
 
@@ -10211,7 +10721,9 @@ mod tests {
         );
         assert_eq!(app.queue_cursor, Some(1), "el cursor pasa el ítem roto");
         assert!(
-            app.error.as_deref().is_some_and(|msg| msg.contains("se saltea")),
+            app.error
+                .as_deref()
+                .is_some_and(|msg| msg.contains("se saltea")),
             "el salto deja un aviso visible: {:?}",
             app.error
         );
@@ -10219,11 +10731,13 @@ mod tests {
         let _ = std::fs::remove_file(&t2);
     }
 
-    /// S9: sin cursor de cola todavía, `p` sigue retrocediendo el pool como
+    /// sin cursor de cola todavía, `p` sigue retrocediendo el pool como
     /// hoy (la cola no tiene «anterior» desde donde está parado).
     #[test]
     fn queue_step_prev_without_a_cursor_falls_back_to_the_pool() {
-        let Some(mut engine) = engine_or_skip() else { return };
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
         let (mut app, t1, t2) = queue_fallback_app();
         app.current_path = Some(t2.clone());
         app.queue.push(queue_url("uno"));
@@ -10246,7 +10760,7 @@ mod tests {
     }
 
     /// Enter en la Cola salta y reproduce ya el ítem seleccionado, sin sacarlo
-    /// de la cola: queda marcado como el actual para poder volver con `p` (S9).
+    /// de la cola: queda marcado como el actual para poder volver con `p`.
     #[test]
     fn queue_enter_plays_the_selected_item_and_moves_the_cursor() {
         let mut app = test_app();
@@ -10260,7 +10774,8 @@ mod tests {
 
         app.explorer_open = true;
         app.queue_panel = true;
-        app.queue.push(QueueItem::Local(track_with_path(path.clone(), "elegida")));
+        app.queue
+            .push(QueueItem::Local(track_with_path(path.clone(), "elegida")));
         app.queue.push(QueueItem::Local(track_named("queda")));
 
         handle_list_key(theme_menu_key(KeyCode::Enter), &mut app, &mut engine);
@@ -10281,7 +10796,9 @@ mod tests {
     /// siguiente.
     #[test]
     fn queue_delete_key_removes_the_selected_item() {
-        let Some(mut engine) = engine_or_skip() else { return };
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
         let mut app = test_app();
         app.explorer_open = true;
         app.queue_panel = true;
@@ -10301,7 +10818,9 @@ mod tests {
     /// `selected` (no la selección de la Cola).
     #[test]
     fn library_list_keys_keep_moving_the_library_selection() {
-        let Some(mut engine) = engine_or_skip() else { return };
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
         let mut app = library_with_three();
         app.explorer_open = true;
         app.selected = 0;
@@ -10344,7 +10863,7 @@ mod tests {
         play_selected(&mut app, &mut engine);
         assert_eq!(app.current_path.as_ref(), Some(&t1));
 
-        // ...y un filtro la deja FUERA de la vista visible.
+        //...y un filtro la deja FUERA de la vista visible.
         app.filter = Some("track_2".to_string());
         refresh_view(&mut app);
         assert_eq!(app.view.len(), 1, "setup: solo track_2 visible");
@@ -10470,8 +10989,15 @@ mod tests {
 
         // La resolución pendiente se descarta y el request se renueva.
         assert!(app.ytdlp_rx.is_none(), "pending resolution must be cleared");
-        assert_ne!(app.ytdlp_request_id, initial_req_id, "request id must be bumped");
-        assert_ne!(app.status, Status::Resolving, "status must not stay Resolving");
+        assert_ne!(
+            app.ytdlp_request_id, initial_req_id,
+            "request id must be bumped"
+        );
+        assert_ne!(
+            app.status,
+            Status::Resolving,
+            "status must not stay Resolving"
+        );
 
         // 3. Late arrival of old resolution result must be ignored
         let stale_result = Ok(crate::source::ytdlp::Resolved {
@@ -10487,7 +11013,10 @@ mod tests {
     #[test]
     fn test_row_building_with_history_and_local_groups() {
         let mut app = library_with_three();
-        app.history.add("Historial Cancion 1".to_string(), "https://example.com/song1.mp3".to_string());
+        app.history.add(
+            "Historial Cancion 1".to_string(),
+            "https://example.com/song1.mp3".to_string(),
+        );
         refresh_view(&mut app);
 
         assert_eq!(app.view.len(), 4);
@@ -10496,25 +11025,41 @@ mod tests {
 
         let lines = library_rows(&app, 60, 10);
         let has_history_header = lines.iter().any(|l| {
-            l.spans.iter().any(|s| s.content.contains("Agregadas por URL"))
+            l.spans
+                .iter()
+                .any(|s| s.content.contains("Agregadas por URL"))
         });
-        assert!(has_history_header, "debe contener encabezado 'Agregadas por URL'");
+        assert!(
+            has_history_header,
+            "debe contener encabezado 'Agregadas por URL'"
+        );
 
-        let has_history_badge = lines.iter().any(|l| {
-            l.spans.iter().any(|s| s.content.contains("[URL] "))
-        });
-        assert!(has_history_badge, "fila de historial debe tener badge '[URL] '");
+        let has_history_badge = lines
+            .iter()
+            .any(|l| l.spans.iter().any(|s| s.content.contains("[URL] ")));
+        assert!(
+            has_history_badge,
+            "fila de historial debe tener badge '[URL] '"
+        );
 
         let has_history_title = lines.iter().any(|l| {
-            l.spans.iter().any(|s| s.content.contains("Historial Cancion 1"))
+            l.spans
+                .iter()
+                .any(|s| s.content.contains("Historial Cancion 1"))
         });
-        assert!(has_history_title, "fila de historial debe mostrar el título");
+        assert!(
+            has_history_title,
+            "fila de historial debe mostrar el título"
+        );
     }
 
     #[test]
     fn test_navigation_crossing_boundary_between_history_and_local() {
         let mut app = library_with_three();
-        app.history.add("Historial Cancion 1".to_string(), "https://example.com/song1.mp3".to_string());
+        app.history.add(
+            "Historial Cancion 1".to_string(),
+            "https://example.com/song1.mp3".to_string(),
+        );
         refresh_view(&mut app);
 
         assert_eq!(app.view[0], ViewItem::History(0));
@@ -10533,8 +11078,14 @@ mod tests {
     #[test]
     fn test_search_filters_history_by_title_and_local_tracks() {
         let mut app = library_with_three();
-        app.history.add("Bohemian Rhapsody".to_string(), "https://example.com/queen.mp3".to_string());
-        app.history.add("Yesterday".to_string(), "https://example.com/beatles.mp3".to_string());
+        app.history.add(
+            "Bohemian Rhapsody".to_string(),
+            "https://example.com/queen.mp3".to_string(),
+        );
+        app.history.add(
+            "Yesterday".to_string(),
+            "https://example.com/beatles.mp3".to_string(),
+        );
         refresh_view(&mut app);
 
         assert_eq!(app.view.len(), 5);
@@ -10619,7 +11170,11 @@ mod tests {
     #[test]
     fn test_url_playback_error_keeps_history_empty() {
         let mut app = test_app();
-        init_url_playback(&mut app, "https://youtube.com/watch?v=123".to_string(), "My Song".to_string());
+        init_url_playback(
+            &mut app,
+            "https://youtube.com/watch?v=123".to_string(),
+            "My Song".to_string(),
+        );
         assert_eq!(app.status, Status::Connecting);
 
         let snapshot_error = EngineSnapshot {
@@ -10630,14 +11185,21 @@ mod tests {
         };
         apply_engine_snapshot(&mut app, snapshot_error);
         assert_eq!(app.status, Status::Stopped);
-        assert!(app.history.is_empty(), "history must stay empty on playback error");
+        assert!(
+            app.history.is_empty(),
+            "history must stay empty on playback error"
+        );
         assert!(app.pending_history.is_none());
     }
 
     #[test]
     fn test_url_playback_connecting_keeps_history_empty_until_playing() {
         let mut app = test_app();
-        init_url_playback(&mut app, "https://youtube.com/watch?v=123".to_string(), "My Song".to_string());
+        init_url_playback(
+            &mut app,
+            "https://youtube.com/watch?v=123".to_string(),
+            "My Song".to_string(),
+        );
 
         let snapshot_connecting = EngineSnapshot {
             is_connecting: true,
@@ -10647,7 +11209,10 @@ mod tests {
         };
         apply_engine_snapshot(&mut app, snapshot_connecting);
         assert_eq!(app.status, Status::Connecting);
-        assert!(app.history.is_empty(), "history must be empty while connecting");
+        assert!(
+            app.history.is_empty(),
+            "history must be empty while connecting"
+        );
 
         let snapshot_playing = EngineSnapshot {
             is_connecting: false,
@@ -10657,8 +11222,15 @@ mod tests {
         };
         apply_engine_snapshot(&mut app, snapshot_playing);
         assert_eq!(app.status, Status::Playing);
-        assert_eq!(app.history.len(), 1, "exactly one history entry recorded on playing");
-        assert_eq!(app.history.get(0).unwrap().url, "https://youtube.com/watch?v=123");
+        assert_eq!(
+            app.history.len(),
+            1,
+            "exactly one history entry recorded on playing"
+        );
+        assert_eq!(
+            app.history.get(0).unwrap().url,
+            "https://youtube.com/watch?v=123"
+        );
         assert_eq!(app.history.get(0).unwrap().title, "My Song");
         assert!(app.pending_history.is_none());
     }
@@ -10666,8 +11238,16 @@ mod tests {
     #[test]
     fn test_superseded_url_playback_is_never_recorded() {
         let mut app = test_app();
-        init_url_playback(&mut app, "https://example.com/A.mp3".to_string(), "Track A".to_string());
-        init_url_playback(&mut app, "https://example.com/B.mp3".to_string(), "Track B".to_string());
+        init_url_playback(
+            &mut app,
+            "https://example.com/A.mp3".to_string(),
+            "Track A".to_string(),
+        );
+        init_url_playback(
+            &mut app,
+            "https://example.com/B.mp3".to_string(),
+            "Track B".to_string(),
+        );
 
         let snapshot_playing = EngineSnapshot {
             is_connecting: false,
@@ -10680,7 +11260,10 @@ mod tests {
         assert_eq!(app.history.len(), 1);
         assert_eq!(app.history.get(0).unwrap().url, "https://example.com/B.mp3");
         assert!(
-            !app.history.entries().iter().any(|e| e.url == "https://example.com/A.mp3"),
+            !app.history
+                .entries()
+                .iter()
+                .any(|e| e.url == "https://example.com/A.mp3"),
             "URL A must never be recorded"
         );
     }
@@ -10704,8 +11287,14 @@ mod tests {
     #[test]
     fn test_record_history_preserves_selected_history_item() {
         let mut app = library_with_three();
-        app.history.add("Song 1".to_string(), "https://example.com/1.mp3".to_string());
-        app.history.add("Song 2".to_string(), "https://example.com/2.mp3".to_string());
+        app.history.add(
+            "Song 1".to_string(),
+            "https://example.com/1.mp3".to_string(),
+        );
+        app.history.add(
+            "Song 2".to_string(),
+            "https://example.com/2.mp3".to_string(),
+        );
         refresh_view(&mut app);
 
         // View has History(0) ("Song 2") and History(1) ("Song 1")
@@ -10724,9 +11313,16 @@ mod tests {
     #[test]
     fn test_record_history_strips_userinfo() {
         let mut app = test_app();
-        record_history_entry(&mut app, "http://user:pass@example.com/secret.mp3", "Secret");
+        record_history_entry(
+            &mut app,
+            "http://user:pass@example.com/secret.mp3",
+            "Secret",
+        );
         assert_eq!(app.history.len(), 1);
-        assert_eq!(app.history.get(0).unwrap().url, "http://example.com/secret.mp3");
+        assert_eq!(
+            app.history.get(0).unwrap().url,
+            "http://example.com/secret.mp3"
+        );
     }
 
     #[test]
@@ -10833,7 +11429,9 @@ mod tests {
     }
 
     // Seams de test para resolución y listado (no lanzan yt-dlp ni red).
-    fn empty_resolve_rx(urls: &std::cell::RefCell<Vec<String>>) -> impl FnMut(String, u64) -> Receiver<YtDlpMessage> + '_ {
+    fn empty_resolve_rx(
+        urls: &std::cell::RefCell<Vec<String>>,
+    ) -> impl FnMut(String, u64) -> Receiver<YtDlpMessage> + '_ {
         move |url: String, _req_id: u64| {
             urls.borrow_mut().push(url);
             let (_tx, rx) = mpsc::channel();
@@ -10841,7 +11439,9 @@ mod tests {
         }
     }
 
-    fn empty_list_rx(urls: &std::cell::RefCell<Vec<String>>) -> impl FnMut(String, u64) -> Receiver<YtDlpListMessage> + '_ {
+    fn empty_list_rx(
+        urls: &std::cell::RefCell<Vec<String>>,
+    ) -> impl FnMut(String, u64) -> Receiver<YtDlpListMessage> + '_ {
         move |url: String, _req_id: u64| {
             urls.borrow_mut().push(url);
             let (_tx, rx) = mpsc::channel();
@@ -10856,11 +11456,13 @@ mod tests {
         }
     }
 
-    /// S12: al listar una playlist, la primera canción se resuelve enseguida y
+    /// al listar una playlist, la primera canción se resuelve enseguida y
     /// el resto entra a la cola AL FINAL de la existente, sin tocar el cursor.
     #[test]
     fn playlist_submit_enqueues_rest_at_end_and_resolves_first() {
-        let Some(mut engine) = engine_or_skip() else { return };
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
         let mut app = test_app();
         app.queue.push(QueueItem::Local(track_named("previa")));
 
@@ -10898,7 +11500,7 @@ mod tests {
             &mut resolve_seam,
         );
 
-        // El resto va al final de la cola existente (D7), sin tocar el cursor.
+        // El resto va al final de la cola existente, sin tocar el cursor.
         let labels: Vec<&str> = app.queue.iter().map(QueueItem::label).collect();
         assert_eq!(labels, vec!["previa", "Segunda", "Tercera"]);
         assert_eq!(app.queue_cursor, None, "el cursor de la cola no cambia");
@@ -10911,11 +11513,13 @@ mod tests {
         assert_eq!(app.status, Status::Resolving);
     }
 
-    /// S12: una entrada del listado sin título (video privado/eliminado)
+    /// una entrada del listado sin título (video privado/eliminado)
     /// entra a la cola mostrando su URL de página como etiqueta.
     #[test]
     fn playlist_submit_uses_the_page_url_as_label_for_untitled_entries() {
-        let Some(mut engine) = engine_or_skip() else { return };
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
         let mut app = test_app();
         let resolve_calls = std::cell::RefCell::new(Vec::<String>::new());
         let list_calls = std::cell::RefCell::new(Vec::<String>::new());
@@ -10947,11 +11551,13 @@ mod tests {
         );
     }
 
-    /// S12: una lista vacía avisa visiblemente y NO toca la cola ni arranca la
+    /// una lista vacía avisa visiblemente y NO toca la cola ni arranca la
     /// primera.
     #[test]
     fn playlist_submit_empty_list_warns_and_leaves_queue_untouched() {
-        let Some(mut engine) = engine_or_skip() else { return };
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
         let mut app = test_app();
         app.queue.push(QueueItem::Local(track_named("previa")));
 
@@ -10980,10 +11586,12 @@ mod tests {
         assert_eq!(resolve_calls.borrow().len(), 0);
     }
 
-    /// S12: un listado que falla avisa visiblemente y NO toca la cola.
+    /// un listado que falla avisa visiblemente y NO toca la cola.
     #[test]
     fn playlist_submit_listing_failure_warns_and_leaves_queue_untouched() {
-        let Some(mut engine) = engine_or_skip() else { return };
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
         let mut app = test_app();
         app.queue.push(QueueItem::Local(track_named("previa")));
 
@@ -11002,7 +11610,9 @@ mod tests {
         handle_playlist_result(
             &mut app,
             req_id,
-            Err(crate::source::ytdlp::YtDlpError::Failed("ERROR: boom".to_string())),
+            Err(crate::source::ytdlp::YtDlpError::Failed(
+                "ERROR: boom".to_string(),
+            )),
             &mut resolve_seam,
         );
 
@@ -11011,15 +11621,20 @@ mod tests {
             vec!["previa"],
             "la cola queda intacta"
         );
-        assert_eq!(app.error.as_deref(), Some("error al ejecutar yt-dlp: ERROR: boom"));
+        assert_eq!(
+            app.error.as_deref(),
+            Some("error al ejecutar yt-dlp: ERROR: boom")
+        );
         assert!(app.ytdlp_rx.is_none());
     }
 
-    /// S12: la resolución de la primera que falla es el error normal de URL
+    /// la resolución de la primera que falla es el error normal de URL
     /// (aviso visible) y la cola queda con lo encolado.
     #[test]
     fn playlist_first_entry_resolution_failure_keeps_queued_rest() {
-        let Some(mut engine) = engine_or_skip() else { return };
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
         let mut app = test_app();
         app.queue.push(QueueItem::Local(track_named("previa")));
 
@@ -11037,7 +11652,10 @@ mod tests {
         handle_playlist_result(
             &mut app,
             req_id,
-            Ok(vec![playlist_entry("Primera", "a"), playlist_entry("Segunda", "b")]),
+            Ok(vec![
+                playlist_entry("Primera", "a"),
+                playlist_entry("Segunda", "b"),
+            ]),
             &mut resolve_seam,
         );
 
@@ -11045,7 +11663,9 @@ mod tests {
         let outcome = handle_ytdlp_result(
             &mut app,
             req_id,
-            Err(crate::source::ytdlp::YtDlpError::Failed("ERROR: nope".to_string())),
+            Err(crate::source::ytdlp::YtDlpError::Failed(
+                "ERROR: nope".to_string(),
+            )),
         );
         assert_eq!(outcome, None);
         assert!(app.error.is_some());
@@ -11054,14 +11674,19 @@ mod tests {
             vec!["previa", "Segunda"],
             "la cola queda con lo encolado"
         );
-        assert_eq!(app.queue_resolving, None, "no es una URL encolada: sin salto");
+        assert_eq!(
+            app.queue_resolving, None,
+            "no es una URL encolada: sin salto"
+        );
     }
 
-    /// S12: el arranque por argumento de CLI (boot) pasa por el mismo flujo
+    /// el arranque por argumento de CLI (boot) pasa por el mismo flujo
     /// unificado y clasifica la playlist como tal.
     #[test]
     fn cli_boot_path_unifies_playlist_flow() {
-        let Some(mut engine) = engine_or_skip() else { return };
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
         let mut app = test_app();
         let list_calls = std::cell::RefCell::new(Vec::<String>::new());
         let resolve_calls = std::cell::RefCell::new(Vec::<String>::new());
@@ -11102,7 +11727,7 @@ mod tests {
         assert!(page_list.borrow().is_empty(), "un Page no lista");
     }
 
-    /// S12: un listado que llega fuera de pedido (request id viejo) se
+    /// un listado que llega fuera de pedido (request id viejo) se
     /// descarta sin tocar la cola ni arrancar la primera.
     #[test]
     fn stale_playlist_listing_result_is_dropped() {
@@ -11134,13 +11759,20 @@ mod tests {
     /// de siempre, sin tocar la cola ni el listado.
     #[test]
     fn preserve_single_url_submit_resolves_without_queue_changes() {
-        let Some(mut engine) = engine_or_skip() else { return };
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
         let mut app = test_app();
         app.queue.push(QueueItem::Local(track_named("unica")));
         let page_url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string();
 
         let resolve_calls = std::cell::RefCell::new(Vec::<String>::new());
-        submit_url_prompt_with(page_url.clone(), &mut app, &mut engine, empty_resolve_rx(&resolve_calls));
+        submit_url_prompt_with(
+            page_url.clone(),
+            &mut app,
+            &mut engine,
+            empty_resolve_rx(&resolve_calls),
+        );
 
         assert!(app.ytdlp_rx.is_some(), "la página se resuelve");
         assert!(app.playlist_rx.is_none(), "no lista");
@@ -11161,7 +11793,9 @@ mod tests {
     /// lista).
     #[test]
     fn list_mode_step_keys_change_tracks_with_the_panel_open() {
-        let Some(mut engine) = engine_or_skip() else { return };
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
         let (mut app, t1, t2) = queue_fallback_app();
         app.mode = Mode::Player;
         app.has_player = true;
@@ -11200,14 +11834,17 @@ mod tests {
     /// está parado, igual que sin panel.
     #[test]
     fn queue_panel_step_key_advances_the_queue_cursor() {
-        let Some(mut engine) = engine_or_skip() else { return };
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
         let (mut app, t1, t2) = queue_fallback_app();
         app.mode = Mode::Player;
         app.has_player = true;
         app.explorer_open = true;
         app.queue_panel = true;
         app.current_path = Some(t1);
-        app.queue.push(QueueItem::Local(track_with_path(t2.clone(), "encolada")));
+        app.queue
+            .push(QueueItem::Local(track_with_path(t2.clone(), "encolada")));
 
         handle_list_key(theme_menu_key(KeyCode::Char('n')), &mut app, &mut engine);
 
@@ -11238,16 +11875,24 @@ mod tests {
 
         let (wide, buttons_wide) = transport_row(true, true, RepeatMode::All, 60);
         let wide_text: String = wide.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(buttons_wide.len(), 5, "con ancho 60 entran los cinco botones");
+        assert_eq!(
+            buttons_wide.len(),
+            5,
+            "con ancho 60 entran los cinco botones"
+        );
         assert!(wide_text.contains("repetir: todo"), "{wide_text:?}");
     }
 
-    /// T1/D2: el marquee de un título que entra lo deja pegado a la izquierda
+    ///: el marquee de un título que entra lo deja pegado a la izquierda
     /// con padding; el que no entra recorre una ventana en bucle, avanzando
     /// un carácter por frame.
     #[test]
     fn marquee_window_fits_short_titles_and_cycles_long_ones() {
-        assert_eq!(marquee_window("corto", 10, 0), "corto     ", "entra y va a la izquierda");
+        assert_eq!(
+            marquee_window("corto", 10, 0),
+            "corto     ",
+            "entra y va a la izquierda"
+        );
         assert_eq!(
             marquee_window("corto", 10, 42),
             "corto     ",
@@ -11259,10 +11904,7 @@ mod tests {
         let zero = marquee_window(title, width, 0);
         assert_eq!(zero.chars().count(), width, "ventana de ancho exacto");
         let one = marquee_window(title, width, 1);
-        assert_ne!(
-            one, zero,
-            "el frame avanza la ventana un carácter"
-        );
+        assert_ne!(one, zero, "el frame avanza la ventana un carácter");
         let cycle = title.chars().count() + 3; // título + separador
         assert_eq!(
             marquee_window(title, width, cycle),
@@ -11276,11 +11918,13 @@ mod tests {
         );
     }
 
-    /// T1/S3: con un próximo (cola o pool), el panel muestra la franja
+    ///: con un próximo (cola o pool), el panel muestra la franja
     /// «próxima canción» con el título; sin próximo, no aparece.
     #[test]
     fn next_up_panel_section_shows_the_marquee_and_hides_without_a_next() {
-        let Some(engine) = engine_or_skip() else { return };
+        let Some(engine) = engine_or_skip() else {
+            return;
+        };
 
         // Con la cola cargada: la franja muestra el próximo de la cola.
         let mut app = library_with_three();
@@ -11327,13 +11971,15 @@ mod tests {
         );
     }
 
-    /// Fix de T1: la franja NO desaparece mientras suena algo con pool cargado
+    /// Fix de la franja NO desaparece mientras suena algo con pool cargado
     /// —en el borde del recorrido (repeat Off, última pista) muestra el
     /// primero del pool— y en el explorador a pantalla completa sin player no
     /// se dibuja: la sección vive sólo en el panel de Tab.
     #[test]
     fn next_up_wraps_at_the_list_end_and_is_absent_in_browser_mode() {
-        let Some(engine) = engine_or_skip() else { return };
+        let Some(engine) = engine_or_skip() else {
+            return;
+        };
 
         // Última pista sonando con repeat Off: el próximo del panel = el
         // primero del pool (el avance real de `n` sigue respetando repeat).
@@ -11369,11 +12015,13 @@ mod tests {
         );
     }
 
-    /// S13: una URL encolada que falla al resolver se saltea — el cursor
+    /// una URL encolada que falla al resolver se saltea — el cursor
     /// avanza al próximo ítem de la cola y lo intenta (erst la URL siguiente).
     #[test]
     fn queue_url_failure_skips_to_next_queue_item() {
-        let Some(mut engine) = engine_or_skip() else { return };
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
         let mut app = test_app();
         app.queue.push(queue_url("uno"));
         app.queue.push(queue_url("dos"));
@@ -11384,15 +12032,26 @@ mod tests {
         });
         assert_eq!(captured, vec!["https://x/uno".to_string()]);
         assert_eq!(app.queue_cursor, Some(0));
-        assert_eq!(app.queue_resolving, Some(0), "la primera está en resolución");
+        assert_eq!(
+            app.queue_resolving,
+            Some(0),
+            "la primera está en resolución"
+        );
 
         // La resolución de "uno" falla: se saltea, se intenta "dos" y el
         // cursor avanza a "dos" (el ítem fallido queda detrás, atenuado).
         skip_failed_queue_item(&mut app, &mut engine, |_app, _engine, request| {
             captured.push(request.original_url);
         });
-        assert_eq!(captured, vec!["https://x/uno".to_string(), "https://x/dos".to_string()]);
-        assert_eq!(app.queue_cursor, Some(1), "el cursor avanza al próximo ítem");
+        assert_eq!(
+            captured,
+            vec!["https://x/uno".to_string(), "https://x/dos".to_string()]
+        );
+        assert_eq!(
+            app.queue_cursor,
+            Some(1),
+            "el cursor avanza al próximo ítem"
+        );
         assert_eq!(app.queue_resolving, Some(1), "'dos' queda en resolución");
         assert_eq!(app.queue.len(), 2, "el ítem fallido sigue en la cola");
         assert_eq!(
@@ -11402,11 +12061,13 @@ mod tests {
         );
     }
 
-    /// S13: cuando la cola se agota tras saltar un ítem fallido, vuelve al
-    /// fallback de S5/S6 (el pool de la biblioteca avanza como hoy).
+    /// cuando la cola se agota tras saltar un ítem fallido, vuelve al
+    /// fallback de (el pool de la biblioteca avanza como hoy).
     #[test]
     fn queue_url_failure_exhausted_falls_back_to_pool() {
-        let Some(mut engine) = engine_or_skip() else { return };
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
         let (mut app, t1, t2) = queue_fallback_app();
         app.current_path = Some(t1.clone());
         app.queue.push(queue_url("unica"));
@@ -11429,18 +12090,24 @@ mod tests {
             Some(&t2),
             "la cola agotada cae al pool y avanza la biblioteca (S5/S6)"
         );
-        assert_eq!(app.queue_cursor, Some(0), "el cursor queda en el ítem fallido");
+        assert_eq!(
+            app.queue_cursor,
+            Some(0),
+            "el cursor queda en el ítem fallido"
+        );
         assert_eq!(app.queue.len(), 1);
 
         let _ = std::fs::remove_file(&t1);
         let _ = std::fs::remove_file(&t2);
     }
 
-    /// S13: un ítem LOCAL de la cola que no arranca se saltea igual, con
+    /// un ítem LOCAL de la cola que no arranca se saltea igual, con
     /// aviso, y se intenta el próximo.
     #[test]
     fn queue_local_failure_is_skipped_and_next_attempted() {
-        let Some(mut engine) = engine_or_skip() else { return };
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
         let mut app = test_app();
         // Ruta local inexistente: start_local_playback falla y se saltea.
         let mut missing = track_named("no-existe");
@@ -11460,5 +12127,4 @@ mod tests {
         );
         assert_eq!(app.queue_cursor, Some(1), "el cursor pasa el ítem fallido");
     }
-
 }

@@ -143,11 +143,7 @@ impl StreamProducer {
         content_length: Option<u64>,
         is_seekable: bool,
     ) -> (Self, HttpStream) {
-        Self::new_sequential_with_stall(
-            content_length,
-            is_seekable,
-            HttpTimeouts::default().stall,
-        )
+        Self::new_sequential_with_stall(content_length, is_seekable, HttpTimeouts::default().stall)
     }
 
     /// Igual que [`Self::new_sequential`] pero con un presupuesto de
@@ -295,7 +291,11 @@ impl fmt::Debug for HttpStream {
 }
 
 /// Combina estados contiguos de fragmentos descargados en rangos de bytes [inicio, fin).
-pub fn merge_chunk_ranges(chunks_done: &[bool], chunk_size: usize, total_len: u64) -> Vec<(u64, u64)> {
+pub fn merge_chunk_ranges(
+    chunks_done: &[bool],
+    chunk_size: usize,
+    total_len: u64,
+) -> Vec<(u64, u64)> {
     if chunks_done.is_empty() || chunk_size == 0 || total_len == 0 {
         return Vec::new();
     }
@@ -371,11 +371,7 @@ impl Drop for HttpStream {
     }
 }
 
-fn read_sequential(
-    shared: &SequentialShared,
-    pos: &mut u64,
-    buf: &mut [u8],
-) -> io::Result<usize> {
+fn read_sequential(shared: &SequentialShared, pos: &mut u64, buf: &mut [u8]) -> io::Result<usize> {
     let mut state = shared
         .state
         .lock()
@@ -470,12 +466,15 @@ fn read_ranged(shared: &RangedShared, pos: &mut u64, buf: &mut [u8]) -> io::Resu
             return Err(io::Error::other(err.clone()));
         }
 
-        if chunk_idx < state.chunks.len() && let ChunkSlot::Done(chunk_data) = &state.chunks[chunk_idx] {
+        if chunk_idx < state.chunks.len()
+            && let ChunkSlot::Done(chunk_data) = &state.chunks[chunk_idx]
+        {
             let offset_in_chunk = (*pos - chunk_idx as u64 * shared.chunk_size as u64) as usize;
             if offset_in_chunk < chunk_data.len() {
                 let avail = chunk_data.len() - offset_in_chunk;
                 let to_copy = avail.min(buf.len());
-                buf[..to_copy].copy_from_slice(&chunk_data[offset_in_chunk..offset_in_chunk + to_copy]);
+                buf[..to_copy]
+                    .copy_from_slice(&chunk_data[offset_in_chunk..offset_in_chunk + to_copy]);
                 *pos += to_copy as u64;
 
                 if *pos < shared.total_len {
@@ -509,9 +508,7 @@ impl Read for HttpStream {
         }
         match &self.storage {
             StreamStorage::Ranged { shared } => read_ranged(shared, &mut self.pos, buf),
-            StreamStorage::Sequential { shared, .. } => {
-                read_sequential(shared, &mut self.pos, buf)
-            }
+            StreamStorage::Sequential { shared, .. } => read_sequential(shared, &mut self.pos, buf),
         }
     }
 }
@@ -741,7 +738,9 @@ fn fetch_range(
     let mut body_reader = response.into_body().into_reader();
     let mut buf = Vec::new();
     if buf.try_reserve(expected_len).is_err() {
-        return Err(RangeFetchError::Transient("fallo de asignación".to_string()));
+        return Err(RangeFetchError::Transient(
+            "fallo de asignación".to_string(),
+        ));
     }
     let mut chunk = [0u8; 16384];
 
@@ -819,14 +818,17 @@ fn run_ranged_downloader(
                     None
                 };
 
-                let next_chunk = candidate
-                    .or_else(|| state.chunks.iter().position(|c| matches!(c, ChunkSlot::Missing)));
+                let next_chunk = candidate.or_else(|| {
+                    state
+                        .chunks
+                        .iter()
+                        .position(|c| matches!(c, ChunkSlot::Missing))
+                });
 
                 if let Some(idx) = next_chunk {
                     state.chunks[idx] = ChunkSlot::Downloading;
                     let start = idx as u64 * shared.chunk_size as u64;
-                    let end =
-                        ((idx as u64 + 1) * shared.chunk_size as u64).min(shared.total_len);
+                    let end = ((idx as u64 + 1) * shared.chunk_size as u64).min(shared.total_len);
                     break (idx, start, end);
                 }
 
@@ -993,7 +995,9 @@ pub(crate) fn open_with_params(
         let expected_first_chunk = (chunk_size as u64).min(total_len) as usize;
         let mut initial_chunk = Vec::new();
         if initial_chunk.try_reserve(expected_first_chunk).is_err() {
-            return Err(StreamError::Io("fallo de asignación para fragmento inicial".to_string()));
+            return Err(StreamError::Io(
+                "fallo de asignación para fragmento inicial".to_string(),
+            ));
         }
         let mut body_reader = response.into_body().into_reader();
         while initial_chunk.len() < expected_first_chunk {
@@ -1007,7 +1011,9 @@ pub(crate) fn open_with_params(
         }
 
         if initial_chunk.len() < expected_first_chunk {
-            return Err(StreamError::Io("primer fragmento HTTP incompleto".to_string()));
+            return Err(StreamError::Io(
+                "primer fragmento HTTP incompleto".to_string(),
+            ));
         }
 
         let num_chunks = if chunk_size > 0 {
@@ -1727,8 +1733,7 @@ mod tests {
 
         let total_len = 8192usize;
         let chunk_size = 4096usize;
-        let payload: Arc<Vec<u8>> =
-            Arc::new((0..total_len).map(|i| (i % 251) as u8).collect());
+        let payload: Arc<Vec<u8>> = Arc::new((0..total_len).map(|i| (i % 251) as u8).collect());
         let payload_server = Arc::clone(&payload);
 
         thread::spawn(move || {
@@ -1773,8 +1778,7 @@ mod tests {
             stall: Duration::from_millis(200),
             ..HttpTimeouts::default()
         };
-        let (mut stream, _) =
-            open_with_params(&url, timeouts, chunk_size).expect("open stream");
+        let (mut stream, _) = open_with_params(&url, timeouts, chunk_size).expect("open stream");
 
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
@@ -1852,15 +1856,17 @@ mod tests {
 
         let url = format!("http://127.0.0.1:{port}/track.m4a");
         let chunk_size = 64 * 1024;
-        let (mut stream, info) = open_with_params(&url, HttpTimeouts::default(), chunk_size)
-            .expect("open stream");
+        let (mut stream, info) =
+            open_with_params(&url, HttpTimeouts::default(), chunk_size).expect("open stream");
 
         assert_eq!(info.content_length, Some(total_len as u64));
         assert!(stream.is_seekable());
 
         let t0 = std::time::Instant::now();
         // Seek to trailing 160 bytes (probe tag read)
-        stream.seek(SeekFrom::Start((total_len - 160) as u64)).unwrap();
+        stream
+            .seek(SeekFrom::Start((total_len - 160) as u64))
+            .unwrap();
         let mut buf = [0u8; 160];
         stream.read_exact(&mut buf).unwrap();
         let elapsed = t0.elapsed();
@@ -1922,8 +1928,8 @@ mod tests {
 
         let url = format!("http://127.0.0.1:{port}/audio.m4a");
         let chunk_size = 64 * 1024;
-        let (mut stream, info) = open_with_params(&url, HttpTimeouts::default(), chunk_size)
-            .expect("open stream");
+        let (mut stream, info) =
+            open_with_params(&url, HttpTimeouts::default(), chunk_size).expect("open stream");
 
         assert_eq!(info.content_length, Some(total_len as u64));
         let mut read_data = Vec::new();
@@ -2023,8 +2029,8 @@ mod tests {
 
         let url = format!("http://127.0.0.1:{port}/audio.m4a");
         let chunk_size = 64 * 1024;
-        let (mut stream, _) = open_with_params(&url, HttpTimeouts::default(), chunk_size)
-            .expect("open stream");
+        let (mut stream, _) =
+            open_with_params(&url, HttpTimeouts::default(), chunk_size).expect("open stream");
 
         // Forward seek to the middle (offset 150_000)
         stream.seek(SeekFrom::Start(150_000)).unwrap();
@@ -2044,8 +2050,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let total_len = 3 * 4096;
-        let payload: Arc<Vec<u8>> =
-            Arc::new((0..total_len).map(|i| (i % 251) as u8).collect());
+        let payload: Arc<Vec<u8>> = Arc::new((0..total_len).map(|i| (i % 251) as u8).collect());
         let payload_server = Arc::clone(&payload);
         let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
@@ -2071,8 +2076,7 @@ mod tests {
                     let end: usize = parts[1].trim().parse().unwrap_or(total_len - 1);
 
                     // Solo el primer pedido (el probe) respeta el rango pedido.
-                    let is_probe =
-                        requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+                    let is_probe = requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
                     if is_probe {
                         let chunk_data = &payload[start..=end];
                         let resp = format!(
@@ -2138,8 +2142,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let total_len = 3 * 4096;
-        let payload: Arc<Vec<u8>> =
-            Arc::new((0..total_len).map(|i| (i % 251) as u8).collect());
+        let payload: Arc<Vec<u8>> = Arc::new((0..total_len).map(|i| (i % 251) as u8).collect());
         let payload_server = Arc::clone(&payload);
 
         thread::spawn(move || {
@@ -2226,7 +2229,13 @@ mod tests {
 
                 if let Some(rh) = range_header {
                     let after = rh.split('=').nth(1).unwrap_or("0-0");
-                    let start: usize = after.split('-').next().unwrap_or("0").trim().parse().unwrap_or(0);
+                    let start: usize = after
+                        .split('-')
+                        .next()
+                        .unwrap_or("0")
+                        .trim()
+                        .parse()
+                        .unwrap_or(0);
                     if start == 0 {
                         let resp = format!(
                             "HTTP/1.1 206 Partial Content\r\nContent-Type: audio/mp4\r\nContent-Range: bytes 0-65535/{total_len}\r\nContent-Length: 65536\r\nConnection: close\r\n\r\n"
@@ -2243,8 +2252,8 @@ mod tests {
         });
 
         let url = format!("http://127.0.0.1:{port}/audio.m4a");
-        let (mut stream, _) = open_with_params(&url, HttpTimeouts::default(), 64 * 1024)
-            .expect("open stream");
+        let (mut stream, _) =
+            open_with_params(&url, HttpTimeouts::default(), 64 * 1024).expect("open stream");
 
         stream.seek(SeekFrom::Start(70_000)).unwrap();
         let mut buf = [0u8; 100];
@@ -2278,7 +2287,13 @@ mod tests {
 
                 if let Some(rh) = range_header {
                     let after = rh.split('=').nth(1).unwrap_or("0-0");
-                    let start: usize = after.split('-').next().unwrap_or("0").trim().parse().unwrap_or(0);
+                    let start: usize = after
+                        .split('-')
+                        .next()
+                        .unwrap_or("0")
+                        .trim()
+                        .parse()
+                        .unwrap_or(0);
                     if start == 0 {
                         let resp = format!(
                             "HTTP/1.1 206 Partial Content\r\nContent-Type: audio/mp4\r\nContent-Range: bytes 0-65535/{total_len}\r\nContent-Length: 65536\r\nConnection: close\r\n\r\n"
@@ -2294,8 +2309,8 @@ mod tests {
         });
 
         let url = format!("http://127.0.0.1:{port}/audio.m4a");
-        let (mut stream, _) = open_with_params(&url, HttpTimeouts::default(), 64 * 1024)
-            .expect("open stream");
+        let (mut stream, _) =
+            open_with_params(&url, HttpTimeouts::default(), 64 * 1024).expect("open stream");
 
         let cancel = stream.cancel_handle();
         let (tx, rx) = std::sync::mpsc::channel();
@@ -2506,4 +2521,3 @@ mod tests {
         assert_eq!(ranges, vec![(0, 100), (200, 250)]);
     }
 }
-
