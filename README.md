@@ -59,8 +59,34 @@ Para dejar el comando `mp3tui` disponible en la terminal:
 cargo install --path .
 ```
 
-En Windows el ejecutable queda en `%USERPROFILE%\.cargo\bin` (ya incluido en
-el `PATH`), así que después podés ejecutar:
+### Linux / macOS — PATH
+
+El binario queda en `~/.cargo/bin/mp3tui`. Comprobá que esa carpeta esté en
+tu PATH:
+
+```sh
+which mp3tui        # o: command -v mp3tui
+```
+
+Si no aparece, agregá la carpeta de cargo al PATH en tu `~/.bashrc` (bash) o
+`~/.zshrc` (zsh):
+
+```sh
+export PATH="$HOME/.cargo/bin:$PATH"
+```
+
+Recargá la shell (`source ~/.bashrc`) o abrí una terminal nueva, y ya podés
+abrir la app desde cualquier carpeta:
+
+```sh
+mp3tui "cancion.mp3"
+mp3tui "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+```
+
+### Windows
+
+El ejecutable queda en `%USERPROFILE%\.cargo\bin` (ya incluido en el `PATH`),
+así que después podés ejecutar:
 
 ```sh
 mp3tui "cancion.mp3"
