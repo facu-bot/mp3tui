@@ -3446,6 +3446,31 @@ fn render_library(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
     } else {
         theme().dim
     };
+    // La franja «Próxima canción» (T1) va FUERA del bloque, ocupando todo el
+    // ancho del panel en sus últimas filas: el bloque (con su borde) queda
+    // arriba y la franja se apoya abajo, a lo ancho. Sin próximo no agrega
+    // ruido, igual que la línea del reproductor.
+    let has_next = matches!(
+        &app.next_up,
+        Some(title) if !title.is_empty()
+    );
+    let panel_area = if has_next {
+        let split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(2)])
+            .split(area);
+        let (block_area, strip_area) = (split[0], split[1]);
+        render_next_up_strip(
+            frame,
+            strip_area,
+            app.next_up.as_deref().unwrap_or_default(),
+            app.ui_frame,
+        );
+        block_area
+    } else {
+        area
+    };
+
     let block = Block::bordered()
         .border_style(Style::default().fg(border_color))
         .title(if queue_view {
@@ -3453,35 +3478,9 @@ fn render_library(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
         } else {
             library_title_line(app, &folder, highlight)
         });
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    // Franja «Próxima canción» (T1/S3): reserva las últimas 3 filas del panel
-    // cuando hay próximo y deja el resto a la lista. Sin próximo no agrega
-    // ruido, igual que la línea del reproductor.
-    let marquee_budget = match &app.next_up {
-        Some(title) if !title.is_empty() => 3u16,
-        _ => 0,
-    };
-    let list_area = if marquee_budget > 0 {
-        let split = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(1),
-                Constraint::Length(marquee_budget),
-            ])
-            .split(inner);
-        let (list_area, marquee_area) = (split[0], split[1]);
-        render_next_up_marquee(
-            frame,
-            marquee_area,
-            app.next_up.as_deref().unwrap_or_default(),
-            app.ui_frame,
-        );
-        list_area
-    } else {
-        inner
-    };
+    let inner = block.inner(panel_area);
+    frame.render_widget(block, panel_area);
+    let list_area = inner;
 
     if queue_view {
         let lines = queue_rows(app, list_area.width, list_area.height);
@@ -3522,32 +3521,25 @@ fn render_library(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
     frame.render_widget(Paragraph::new(lines), list_area);
 }
 
-/// Franja del pie del panel lateral: `--- próxima canción ---`, el título en
-/// marquee y el cierre (T1/S1). Ocupa `area` (3 filas) y recorta las líneas
-/// fijas al ancho disponible.
-fn render_next_up_marquee(
+/// Franja del pie del panel lateral (T1): la etiqueta «Próxima canción» (tenue,
+/// como la línea `Siguiente:` del reproductor) y el título en marquee, a todo
+/// el ancho del panel, debajo del borde del bloque.
+fn render_next_up_strip(
     frame: &mut Frame<'_>,
     area: Rect,
     title: &str,
     frame_clock: u64,
 ) {
     let width = area.width as usize;
-    let fixed = |text: &str| {
-        let value: String = text.chars().take(width).collect();
-        Line::from(Span::styled(value, Style::default().fg(theme().dim)))
-    };
-    let title_line = Line::from(Span::styled(
+    let label = Line::from(Span::styled(
+        "Próxima canción",
+        Style::default().fg(theme().dim),
+    ));
+    let song = Line::from(Span::styled(
         marquee_window(title, width, frame_clock as usize),
         Style::default().fg(theme().text),
     ));
-    frame.render_widget(
-        Paragraph::new(vec![
-            fixed("--- próxima canción ---"),
-            title_line,
-            fixed("------------------------"),
-        ]),
-        area,
-    );
+    frame.render_widget(Paragraph::new(vec![label, song]), area);
 }
 
 fn item_group<'a>(app: &'a App, item: &ViewItem) -> Option<&'a str> {
