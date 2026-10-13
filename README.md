@@ -7,17 +7,23 @@ Se maneja por teclado.
 
 [ratatui]: https://github.com/ratatui/ratatui
 
-## Capturas
+## Demo
+
+<p align="center">
+  <video src="assets/demo-mp3tui.mp4" controls width="820" alt="Demo de mp3tui"></video>
+</p>
 
 <p align="center">
   <img src="assets/mp3tui-1.png" width="820" alt="Captura de mp3tui">
   <img src="assets/mp3tui-2.png" width="820" alt="Captura de mp3tui">
+  <img src="assets/mp3tui-3.png" width="820" alt="Captura de mp3tui">
 </p>
 
 ## Requisitos
 
-- [Rust](https://rustup.rs) (toolchain estable).
+- [Rust](https://rustup.rs) (toolchain estable) instalado.
 - Un dispositivo de audio disponible.
+- `yt-dlp` si querés reproducir links de YouTube.
 
 ## Clonar y correr
 
@@ -56,6 +62,12 @@ el `PATH`), así que después podés ejecutar:
 mp3tui "cancion.mp3"
 mp3tui "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 ```
+
+## Información
+
+Proyecto open source: el código completo vive en este repositorio. Si
+encontrás un bug o te falta una función, abrí un issue o mandá un pull
+request — las contribuciones son bienvenidas.
 
 ## Atajos
 
