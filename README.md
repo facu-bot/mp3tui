@@ -51,6 +51,30 @@ sistema:
 
 Si no está instalado, la app avisa al intentar reproducir una URL de YouTube.
 
+## Limitaciones y errores comunes
+
+- **Límites de solicitudes a YouTube.** Cada canción se resuelve con una
+  llamada a yt-dlp, y YouTube aplica límites de velocidad: si saltás muchas
+  canciones en poco tiempo (o usás demasiado el pool con URLs), puede bloquear
+  tus solicitudes temporalmente. Esperá unos minutos entre tandas de mala
+  suerte.
+- **Playlists: un máximo de ~50 canciones es lo recomendable.** El listado es
+  barato, pero cada canción se resuelve recién cuando suena (las URLs de audio
+  directo vencen), así que una playlist enorme tarda mucho en consumirse y
+  sube el riesgo de golpear los límites de arriba. Si te gustan listas muy
+  largas, andan, pero no esperes que los 400 primeros temas suenen sin
+  saltos.
+- **Errores de cookies.** Los videos con restricción de edad (o los que piden
+  sesión) pueden fallar porque yt-dlp no pasa cookies de tu navegador. Probá
+  primero con yt-dlp manual: `yt-dlp --cookies cookies.txt <url>` (y exportá
+  tus cookies con una extensión del navegador). La app no configura cookies
+  por sí sola todavía.
+- **Error HTTP 403 de yt-dlp.** Es la señal típica de detección de bot o IP
+  compartida: YouTube te bloquea por unos minutos. Esperá un rato y volvé a
+  intentar; si persiste, probá con cookies (`yt-dlp --cookies cookies.txt`)
+  o desde otra red. En la app el error se muestra en la línea de estado del
+  reproductor.
+
 ## Instalar el ejecutable
 
 Para dejar el comando `mp3tui` disponible en la terminal:
