@@ -7329,8 +7329,72 @@ mod tests {
         );
     }
 
+    /// Bug: con shuffle apagado, `n`/`p` salteaban las filas de URL del
+    /// listado y caían en la primera pista local. El pool navegable ahora
+    /// incluye siempre las entradas del historial en orden de lista.
+    #[test]
+    fn step_keys_follow_url_rows_in_the_list_even_without_shuffle() {
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
+        let mut app = test_app();
+        let dir = std::env::temp_dir();
+        let p1 = dir.join(format!("mp3tui_stepurl_{}.wav", std::process::id()));
+        std::fs::write(&p1, make_test_wav(4410)).unwrap();
+        app.library = Some(crate::playlist::from_tracks_for_test(vec![
+            track_with_path(p1.clone(), "local"),
+        ]));
+        app.history.add(
+            "Uno".to_string(),
+            "https://www.youtube.com/watch?v=uno".to_string(),
+        );
+        app.history.add(
+            "Dos".to_string(),
+            "https://www.youtube.com/watch?v=dos".to_string(),
+        );
+        // El historial guarda el más reciente primero: la vista queda
+        // [Dos, Uno, local]. Parado en la URL del frente (Dos), 'n' debe
+        // reproducir la siguiente URL de la lista, no saltar a la pista local.
+        refresh_view(&mut app);
+        app.is_url = true;
+        app.current_url = Some((
+            "https://www.youtube.com/watch?v=dos".to_string(),
+            "Dos".to_string(),
+        ));
+        app.status = Status::Playing;
+
+        let mut captured: Vec<String> = Vec::new();
+        play_step_with(&mut app, &mut engine, 1, |_a, _e, request| {
+            captured.push(request.original_url);
+        });
+        assert_eq!(
+            captured,
+            vec!["https://www.youtube.com/watch?v=uno".to_string()],
+            "'n' desde una URL de la lista reproduce la SIGUIENTE URL del listado, no la pista local"
+        );
+
+        // Desde la segunda URL de la lista, 'p' vuelve a la primera.
+        app.current_url = Some((
+            "https://www.youtube.com/watch?v=uno".to_string(),
+            "Uno".to_string(),
+        ));
+        play_step_with(&mut app, &mut engine, -1, |_a, _e, request| {
+            captured.push(request.original_url);
+        });
+        assert_eq!(
+            captured,
+            vec![
+                "https://www.youtube.com/watch?v=uno".to_string(),
+                "https://www.youtube.com/watch?v=dos".to_string(),
+            ],
+            "'p' retrocede a la URL anterior de la lista"
+        );
+
+        let _ = std::fs::remove_file(&p1);
+    }
+
     /// una URL encolada que falla al resolver se saltea — el cursor
-    /// avanza al próximo ítem de la cola y lo intenta (erst la URL siguiente).
+    /// avanza al próximo ítem de la cola y lo intenta (es la URL siguiente).
     #[test]
     fn queue_url_failure_skips_to_next_queue_item() {
         let Some(mut engine) = engine_or_skip() else {

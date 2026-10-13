@@ -598,6 +598,11 @@ pub(super) fn delete_selected_queue_item(app: &mut App) {
 /// pista local pueda encadenar con un tema de YouTube y viceversa. Con el
 /// shuffle apagado el pool queda como antes (solo pistas locales). Regenera
 /// el orden de shuffle si la lista cambió desde que se armó (filtro/rescann).
+/// Posiciones de la vista que recorren `n`/`p` y el fin natural: SIEMPRE las
+/// pistas locales Y las filas de URL del historial en orden de lista (antes
+/// las URLs solo entraban al pool con shuffle activo, y desde una URL el
+/// siguiente caía en la primera pista local: bug reportado). Con shuffle, el
+/// orden de recorrido es `shuffle_order` sobre este pool mixto.
 pub(super) fn pool_positions_in_view(app: &mut App) -> Vec<usize> {
     let pool: Vec<usize> = app
         .view
@@ -605,8 +610,7 @@ pub(super) fn pool_positions_in_view(app: &mut App) -> Vec<usize> {
         .enumerate()
         .filter_map(|(pos, item)| match item {
             ViewItem::Track(_) => Some(pos),
-            ViewItem::History(_) if app.shuffle => Some(pos),
-            ViewItem::History(_) => None,
+            ViewItem::History(_) => Some(pos),
         })
         .collect();
     if app.shuffle && !pool.is_empty() && app.shuffle_order.len() != pool.len() {
