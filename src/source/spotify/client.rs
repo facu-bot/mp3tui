@@ -185,8 +185,11 @@ impl SpotifyClient {
     }
 
     /// Canciones de una playlist, siguiendo la paginación de `next`.
+    ///
+    /// Usa `GET /v1/playlists/{id}/items`: Spotify deprecó `/tracks` y para
+    /// apps nuevas responde 403 Forbidden aunque la playlist sea tuya.
     pub fn playlist_tracks(&self, id: &str) -> Result<Vec<SpotifyTrack>, SpotifyError> {
-        let path = format!("/v1/playlists/{id}/tracks");
+        let path = format!("/v1/playlists/{id}/items");
         let items: Vec<ApiPlaylistTrack> = self.collect_pages(&path, &[])?;
         Ok(items
             .into_iter()
@@ -738,16 +741,16 @@ mod tests {
         let path = temp_path("playlist_pages");
         write_tokens(&path, "TOKEN-1");
         let stub = Stub::spawn(|base| {
-            let next = format!("{base}/v1/playlists/PL/tracks?offset=1&limit=1");
+            let next = format!("{base}/v1/playlists/PL/items?offset=1&limit=1");
             vec![
                 json_response(
                     200,
-                    r#"{"items":[{"track":{"id":"t1","name":"Uno","artists":[{"name":"A"}],"duration_ms":1000}}],"next":"__NEXT__"}"#
+                    r#"{"items":[{"item":{"id":"t1","name":"Uno","artists":[{"name":"A"}],"duration_ms":1000}}],"next":"__NEXT__"}"#
                         .replace("__NEXT__", &next),
                 ),
                 json_response(
                     200,
-                    r#"{"items":[{"track":{"id":"t2","name":"Dos","artists":[{"name":"B"}],"duration_ms":2000}}],"next":null}"#,
+                    r#"{"items":[{"item":{"id":"t2","name":"Dos","artists":[{"name":"B"}],"duration_ms":2000}}],"next":null}"#,
                 ),
             ]
         });
@@ -760,7 +763,7 @@ mod tests {
             vec!["t1", "t2"]
         );
         assert_eq!(seen.len(), 2);
-        assert!(seen[0].target.starts_with("/v1/playlists/PL/tracks"));
+        assert!(seen[0].target.starts_with("/v1/playlists/PL/items"));
         assert!(seen[1].target.contains("offset=1"), "{}", seen[1].target);
     }
 
