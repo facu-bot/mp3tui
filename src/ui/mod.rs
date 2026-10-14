@@ -6962,7 +6962,7 @@ mod tests {
     /// shuffle, repeat, velocidad, pausa y seek; en la vista Reproductor,
     /// shuffle y repeat sí.
     #[test]
-    fn list_view_ignores_every_player_control() {
+    fn list_view_gates_the_transport_but_keeps_shuffle_and_repeat() {
         let Some(mut engine) = engine_or_skip() else {
             return;
         };
@@ -6975,22 +6975,30 @@ mod tests {
         for focus in [ListPanel::Local, ListPanel::Playlists, ListPanel::Queue] {
             app.tree_focus = focus == ListPanel::Playlists;
             app.queue_panel = focus == ListPanel::Queue;
-            for code in ['s', 'r', ']', '[', ' '] {
+            // Transporte: con la lista enfocada no debe cambiar nada.
+            for code in [']', '[', ' '] {
                 handle_list_key(theme_menu_key(KeyCode::Char(code)), &mut app, &mut engine);
             }
-            assert!(!app.shuffle, "{focus:?}: shuffle");
-            assert_eq!(app.repeat, RepeatMode::Off, "{focus:?}: repeat");
             assert_eq!(engine.speed(), speed, "{focus:?}: velocidad");
             assert!(!engine.is_playing() && !engine.is_paused(), "{focus:?}: pausa");
+            // Modos de reproducción: sí cambian (no son transporte).
+            let shuffle_before = app.shuffle;
+            handle_list_key(theme_menu_key(KeyCode::Char('s')), &mut app, &mut engine);
+            assert_ne!(app.shuffle, shuffle_before, "{focus:?}: shuffle");
+            let repeat_before = app.repeat;
+            handle_list_key(theme_menu_key(KeyCode::Char('r')), &mut app, &mut engine);
+            assert_ne!(app.repeat, repeat_before, "{focus:?}: repeat");
         }
 
         app.explorer_open = false;
         app.tree_focus = false;
         app.queue_panel = false;
+        let shuffle_before = app.shuffle;
         handle_player_key(theme_menu_key(KeyCode::Char('s')), &mut app, &mut engine);
+        assert_ne!(app.shuffle, shuffle_before, "shuffle en la vista Reproductor");
+        let repeat_before = app.repeat;
         handle_player_key(theme_menu_key(KeyCode::Char('r')), &mut app, &mut engine);
-        assert!(app.shuffle, "shuffle sí funciona en la vista Reproductor");
-        assert_ne!(app.repeat, RepeatMode::Off, "repeat también");
+        assert_ne!(app.repeat, repeat_before, "repeat en la vista Reproductor");
     }
 
     /// ←/→ mueven el foco entre columnas sin dar la vuelta; ↑/↓ siguen

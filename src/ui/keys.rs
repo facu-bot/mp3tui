@@ -150,11 +150,16 @@ pub(super) fn handle_list_key(key: KeyEvent, app: &mut App, engine: &mut AudioEn
         }
     } else if config::pressed(&keys.clear_queue, code) {
         clear_queue(app);
-    // Gating del reproductor: con la lista enfocada ningún control de
-    // reproducción (pausa, seek, n/p, velocidad, shuffle, repeat) hace nada;
-    // viven solo en la vista Reproductor. Acá la tecla de pausa (espacio) es
-    // la acción de la fila: encolar la pista de Locales (el árbol y la Cola
-    // resuelven la suya).
+    // Shuffle y repeat son modos de reproducción, no transporte: siguen
+    // andando con la lista enfocada (es parte de recorrer la biblioteca).
+    } else if config::pressed(&keys.shuffle, code) {
+        toggle_shuffle(app);
+    } else if config::pressed(&keys.repeat, code) {
+        app.repeat = app.repeat.cycle();
+    // Gating del transporte: con la lista enfocada no hacen nada pausa, seek,
+    // n/p ni velocidad; viven solo en la vista Reproductor. Acá la tecla de
+    // pausa (espacio) es la acción de la fila: encolar la pista de Locales
+    // (el árbol y la Cola resuelven la suya).
     } else if config::pressed(&keys.play_pause, code) {
         if !app.queue_panel && !app.tree_focus {
             enqueue_selected(app);
