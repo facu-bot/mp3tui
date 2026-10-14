@@ -143,21 +143,10 @@ reproducción y te dice qué hacer.
   sube el riesgo de golpear los límites de arriba. Si te gustan listas muy
   largas, andan, pero no esperes que los 400 primeros temas suenen sin
   saltos.
-- **Errores de cookies.** Los videos con restricción de edad (o los que piden
-  sesión) pueden fallar porque yt-dlp no pasa cookies de tu navegador. Probá
-  primero con yt-dlp manual: `yt-dlp --cookies cookies.txt <url>` (y exportá
-  tus cookies con una extensión del navegador). La app no configura cookies
-  por sí sola todavía.
-
-  ⚠️ **Las cookies son tu sesión de YouTube: tratá el archivo como una
-  contraseña.** No lo subas a un repositorio, no lo compartas y no lo pegues
-  en foros. Si se filtra, cerrá la sesión de YouTube en todos los dispositivos
-  desde tu cuenta para invalidarlo.
 - **Error HTTP 403 de yt-dlp.** Es la señal típica de detección de bot o IP
   compartida: YouTube te bloquea por unos minutos. Esperá un rato y volvé a
-  intentar; si persiste, probá con cookies (`yt-dlp --cookies cookies.txt`)
-  o desde otra red. En la app el error se muestra en la línea de estado del
-  reproductor.
+  intentar, o probá desde otra red. En la app el error se muestra en la línea
+  de estado del reproductor.
 
 ## Instalar el ejecutable
 
