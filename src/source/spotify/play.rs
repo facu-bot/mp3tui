@@ -8,7 +8,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use super::auth::{self, AuthError, TokenClient, Tokens};
-use super::client::{SearchResults, SpotifyClient, SpotifyError, SpotifyTrack};
+use super::client::{SearchResults, SpotifyClient, SpotifyError, SpotifyPlaylist, SpotifyTrack};
 use super::resolve::{ResolveError, resolve_track};
 use super::{MissingClientId, client_id};
 use crate::config::Config;
@@ -45,6 +45,23 @@ pub trait SearchSource {
 impl SearchSource for SpotifyClient {
     fn search(&self, query: &str) -> Result<SearchResults, SpotifyError> {
         SpotifyClient::search(self, query)
+    }
+}
+
+/// Lo mínimo del cliente que necesita el panel de "mis playlists" (seam para
+/// tests).
+pub trait LibrarySource {
+    fn my_playlists(&self) -> Result<Vec<SpotifyPlaylist>, SpotifyError>;
+    fn playlist_tracks(&self, id: &str) -> Result<Vec<SpotifyTrack>, SpotifyError>;
+}
+
+impl LibrarySource for SpotifyClient {
+    fn my_playlists(&self) -> Result<Vec<SpotifyPlaylist>, SpotifyError> {
+        SpotifyClient::my_playlists(self)
+    }
+
+    fn playlist_tracks(&self, id: &str) -> Result<Vec<SpotifyTrack>, SpotifyError> {
+        SpotifyClient::playlist_tracks(self, id)
     }
 }
 
@@ -166,6 +183,25 @@ pub fn search_catalog(
 ) -> Result<SearchResults, String> {
     let client = connect().map_err(|e| e.to_string())?;
     client.search(query).map_err(failure_text)
+}
+
+/// Playlists del usuario (incluye las privadas). El error ya viene como
+/// mensaje para pantalla: sin `client_id`, sin sesión, sesión vencida o 429.
+pub fn user_playlists(
+    connect: &dyn Fn() -> Result<Box<dyn LibrarySource>, ConnectError>,
+) -> Result<Vec<SpotifyPlaylist>, String> {
+    let client = connect().map_err(|e| e.to_string())?;
+    client.my_playlists().map_err(failure_text)
+}
+
+/// Canciones de una playlist del usuario, con el mismo manejo de errores que
+/// [`user_playlists`].
+pub fn user_playlist_tracks(
+    id: &str,
+    connect: &dyn Fn() -> Result<Box<dyn LibrarySource>, ConnectError>,
+) -> Result<Vec<SpotifyTrack>, String> {
+    let client = connect().map_err(|e| e.to_string())?;
+    client.playlist_tracks(id).map_err(failure_text)
 }
 
 /// Resuelve una página a audio: una canción de Spotify pasa por
@@ -377,6 +413,84 @@ mod tests {
         let msg = search_catalog("x", &connect).unwrap_err();
         assert!(msg.contains("limitó la tasa"), "{msg}");
         assert!(msg.contains("30"), "{msg}");
+    }
+
+    struct FakeLibrary {
+        playlists: Result<Vec<SpotifyPlaylist>, SpotifyError>,
+        tracks: Result<Vec<SpotifyTrack>, SpotifyError>,
+        seen: std::sync::Arc<Mutex<Vec<String>>>,
+    }
+
+    impl LibrarySource for FakeLibrary {
+        fn my_playlists(&self) -> Result<Vec<SpotifyPlaylist>, SpotifyError> {
+            self.seen.lock().unwrap().push("my_playlists".to_string());
+            self.playlists.clone()
+        }
+
+        fn playlist_tracks(&self, id: &str) -> Result<Vec<SpotifyTrack>, SpotifyError> {
+            self.seen.lock().unwrap().push(format!("tracks:{id}"));
+            self.tracks.clone()
+        }
+    }
+
+    fn library_connect(
+        playlists: Result<Vec<SpotifyPlaylist>, SpotifyError>,
+        tracks: Result<Vec<SpotifyTrack>, SpotifyError>,
+        seen: std::sync::Arc<Mutex<Vec<String>>>,
+    ) -> impl Fn() -> Result<Box<dyn LibrarySource>, ConnectError> {
+        move || {
+            Ok(Box::new(FakeLibrary {
+                playlists: playlists.clone(),
+                tracks: tracks.clone(),
+                seen: std::sync::Arc::clone(&seen),
+            }) as Box<dyn LibrarySource>)
+        }
+    }
+
+    #[test]
+    fn test_user_playlists_and_tracks_use_the_client() {
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let playlist = SpotifyPlaylist {
+            id: "p1".into(),
+            name: "Mix".into(),
+            owner: Some("yo".into()),
+            tracks_total: Some(2),
+        };
+        let connect = library_connect(
+            Ok(vec![playlist.clone()]),
+            Ok(vec![track("t1", "One", &["A"])]),
+            std::sync::Arc::clone(&seen),
+        );
+        assert_eq!(user_playlists(&connect).unwrap(), vec![playlist]);
+        assert_eq!(user_playlist_tracks("p1", &connect).unwrap()[0].id, "t1");
+        assert_eq!(seen.lock().unwrap().as_slice(), &["my_playlists", "tracks:p1"]);
+    }
+
+    #[test]
+    fn test_user_library_errors_are_clear_for_screen() {
+        let no_session = || Err(ConnectError::NotLoggedIn);
+        assert!(user_playlists(&no_session).unwrap_err().contains("--spotify-login"));
+        assert!(user_playlist_tracks("p", &no_session).unwrap_err().contains("--spotify-login"));
+
+        let no_id = || Err(ConnectError::ClientId(MissingClientId));
+        assert!(user_playlists(&no_id).unwrap_err().contains(super::super::CLIENT_ID_ENV));
+
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let limited = library_connect(
+            Err(SpotifyError::RateLimited { retry_after_secs: Some(7) }),
+            Err(SpotifyError::RateLimited { retry_after_secs: None }),
+            std::sync::Arc::clone(&seen),
+        );
+        let msg = user_playlists(&limited).unwrap_err();
+        assert!(msg.contains("limitó la tasa") && msg.contains('7'), "{msg}");
+        assert!(user_playlist_tracks("p", &limited).unwrap_err().contains("limitó la tasa"));
+
+        let expired = library_connect(
+            Err(SpotifyError::Auth(AuthError::ReauthorizationRequired)),
+            Ok(vec![]),
+            seen,
+        );
+        assert!(user_playlists(&expired).unwrap_err().contains("--spotify-login"));
     }
 
     /// Responde según el primer argumento: `ytsearch` → candidatos, `--print`

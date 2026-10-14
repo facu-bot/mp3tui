@@ -112,7 +112,7 @@ pub(super) fn hits_from(results: SearchResults) -> Vec<SearchHit> {
 }
 
 /// «Dueño · N canciones», con lo que haya.
-fn playlist_detail(owner: Option<&str>, total: Option<u64>) -> Option<String> {
+pub(super) fn playlist_detail(owner: Option<&str>, total: Option<u64>) -> Option<String> {
     let count = total.map(|n| match n {
         1 => "1 canción".to_string(),
         n => format!("{n} canciones"),
@@ -347,11 +347,21 @@ fn play_search_hit(
     list_playlist: impl FnOnce(String, u64) -> Receiver<YtDlpListMessage>,
 ) {
     close_spotify_search(app);
-    let marker = hit.marker();
+    play_spotify_marker(app, hit.marker(), hit.label(), resolve_page, list_playlist);
+}
+
+/// Arranca por el flujo de URLs el marcador de Spotify elegido.
+pub(super) fn play_spotify_marker(
+    app: &mut App,
+    marker: String,
+    label: &str,
+    resolve_page: impl FnOnce(String, u64) -> Receiver<YtDlpMessage>,
+    list_playlist: impl FnOnce(String, u64) -> Receiver<YtDlpListMessage>,
+) {
     begin_url_flow(app, marker.clone(), resolve_page, list_playlist);
     // Mientras resuelve se muestra el nombre, no el marcador.
-    app.track_label = hit.label().to_string();
-    app.current_url = Some((marker, hit.label().to_string()));
+    app.track_label = label.to_string();
+    app.current_url = Some((marker, label.to_string()));
 }
 
 pub(super) fn handle_spotify_search_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine) {

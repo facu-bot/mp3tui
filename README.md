@@ -62,6 +62,10 @@ reproduce. **El audio no sale de Spotify**: la Web API solo entrega metadatos
 igual que cualquier link de YouTube. Por eso **no hace falta Spotify Premium ni
 cookies de Spotify**; sí necesitás `yt-dlp` instalado.
 
+Con `l` abrís un panel con **tus playlists** (incluye las privadas, requiere haber
+hecho `mp3tui --spotify-login`): al elegir una ves sus temas y podés reproducir
+toda la playlist o un tema suelto, sin volcar nada a la cola.
+
 ### Registrar una app propia
 
 mp3tui no trae un `client_id` de fábrica: registrás tu propia app en el
@@ -240,6 +244,7 @@ request — las contribuciones son bienvenidas.
 | `c` | Alternar el panel lateral entre Biblioteca y Cola |
 | `d` | Borrar el ítem seleccionado de la Cola |
 | `x` | Vaciar toda la Cola (lo que suena sigue sonando) |
+| `l` | Mis playlists de Spotify: elegí una para ver sus temas (`espacio` reproduce toda la playlist, `Enter` un tema suelto) |
 | `Ctrl+P` | Configuración (temas, bandas, modo) |
 | `Esc` `Esc` | Salir |
 

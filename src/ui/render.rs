@@ -211,6 +211,10 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &App, engine: &AudioEngine) {
         render_spotify_search(frame, search);
     }
 
+    if let Some(library) = &app.spotify_library {
+        render_spotify_library(frame, library);
+    }
+
     if let Some(panel) = &app.settings_panel {
         render_settings_panel(frame, panel, app.mouse_enabled);
     }
@@ -1764,7 +1768,7 @@ pub(super) fn row_line(
     Line::from(spans)
 }
 
-fn truncate_chars(text: &str, max: usize) -> String {
+pub(super) fn truncate_chars(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
         return text.to_string();
     }
@@ -2625,6 +2629,10 @@ pub(super) fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
         return spotify_search_footer(search);
     }
 
+    if let Some(library) = &app.spotify_library {
+        return spotify_library_footer(library);
+    }
+
     if app.theme_menu.is_some() {
         return vec![Line::from(
             " ↑/↓: previsualizar tema   ·   Enter: guardar   ·   Esc: cancelar ",
@@ -2848,8 +2856,9 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App, compact: bool) {
     if !modal_open(app) {
         block = block.title_top(
             Line::from(format!(
-                " {}: Spotify ",
-                key_labels(&config::config().keys.spotify_search)
+                " {}: Spotify · {}: playlists ",
+                key_labels(&config::config().keys.spotify_search),
+                key_labels(&config::config().keys.spotify_library)
             ))
             .right_aligned(),
         );
@@ -2867,6 +2876,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App, compact: bool) {
 fn modal_open(app: &App) -> bool {
     app.url_input.is_some()
         || app.spotify_search.is_some()
+        || app.spotify_library.is_some()
         || app.search.is_some()
         || app.theme_menu.is_some()
         || app.bands_menu.is_some()

@@ -320,6 +320,12 @@ struct App {
     /// descarta. Independiente de `ytdlp_request_id` para que buscar no corte
     /// la reproducción en curso.
     spotify_search_id: u64,
+    /// Panel «Mis playlists» de Spotify: `Some` mientras está abierto.
+    spotify_library: Option<SpotifyLibrary>,
+    /// Receiver de la carga (playlists o temas) en curso, en un hilo aparte.
+    spotify_library_rx: Option<Receiver<SpotifyLibraryMessage>>,
+    /// Id de la carga vigente: un resultado con otro id llegó tarde.
+    spotify_library_id: u64,
     is_url: bool,
     /// URL original (nunca la resuelta) + etiqueta de la pista cuando la
     /// reproducción actual viene de una URL; `None` en reproducción local.
@@ -543,6 +549,9 @@ pub fn run(engine: &mut AudioEngine, start: StartMode) -> io::Result<()> {
         spotify_search: None,
         spotify_search_rx: None,
         spotify_search_id: 0,
+        spotify_library: None,
+        spotify_library_rx: None,
+        spotify_library_id: 0,
         is_url: is_url_start,
         current_url: None,
         ytdlp_failed: false,
@@ -628,6 +637,7 @@ fn event_loop(tui: &mut Tui, app: &mut App, engine: &mut AudioEngine) -> io::Res
 
         // Búsqueda de Spotify en su hilo: el resultado llena el modal.
         poll_spotify_search(app);
+        poll_spotify_library(app);
 
         if let Some(rx) = &app.ytdlp_rx {
             match rx.try_recv() {
@@ -788,6 +798,12 @@ fn dispatch_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine) {
     // que el prompt de URL (todo lo que se teclea va al campo).
     if app.spotify_search.is_some() {
         handle_spotify_search_key(key, app, engine);
+        return;
+    }
+
+    // Panel de playlists de Spotify: modal sin campo de texto.
+    if app.spotify_library.is_some() {
+        handle_spotify_library_key(key, app);
         return;
     }
 
@@ -1029,6 +1045,7 @@ mod keys;
 mod mouse;
 mod queue;
 mod render;
+mod spotify_library;
 mod spotify_search;
 #[cfg(test)]
 mod tests_common;
@@ -1037,6 +1054,7 @@ use self::keys::*;
 use self::mouse::*;
 use self::queue::*;
 use self::render::*;
+use self::spotify_library::*;
 use self::spotify_search::*;
 
 #[cfg(test)]

@@ -91,6 +91,8 @@ pub(super) fn handle_player_key(key: KeyEvent, app: &mut App, engine: &mut Audio
         open_search(app);
     } else if config::pressed(&keys.spotify_search, code) {
         open_spotify_search(app);
+    } else if config::pressed(&keys.spotify_library, code) {
+        open_spotify_library(app);
     }
 }
 
@@ -153,6 +155,8 @@ pub(super) fn handle_list_key(key: KeyEvent, app: &mut App, engine: &mut AudioEn
         open_search(app);
     } else if config::pressed(&keys.spotify_search, code) {
         open_spotify_search(app);
+    } else if config::pressed(&keys.spotify_library, code) {
+        open_spotify_library(app);
     } else if config::pressed(&keys.move_up, code) {
         if app.queue_panel {
             app.queue_selected = move_selection(app.queue_selected, -1, queue_len);

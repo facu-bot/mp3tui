@@ -163,6 +163,7 @@ pub(super) fn key_for_chip(keys_text: &str) -> Option<KeyCode> {
         &keys.queue_delete,
         &keys.clear_queue,
         &keys.spotify_search,
+        &keys.spotify_library,
         &keys.settings,
     ]
     .into_iter()
@@ -244,6 +245,7 @@ pub(super) fn handle_mouse(event: MouseEvent, app: &mut App, engine: &mut AudioE
     // hacia lo que quedó tapado.
     if app.url_input.is_some()
         || app.spotify_search.is_some()
+        || app.spotify_library.is_some()
         || app.theme_menu.is_some()
         || app.bands_menu.is_some()
         || app.mode_menu.is_some()
