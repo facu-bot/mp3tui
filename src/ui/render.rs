@@ -207,6 +207,10 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &App, engine: &AudioEngine) {
         render_url_prompt(frame, buf);
     }
 
+    if let Some(search) = &app.spotify_search {
+        render_spotify_search(frame, search);
+    }
+
     if let Some(panel) = &app.settings_panel {
         render_settings_panel(frame, panel, app.mouse_enabled);
     }
@@ -225,6 +229,188 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &App, engine: &AudioEngine) {
     // El sub-modal de temas  va encima del panel: se dibuja último.
     if let Some(menu) = &app.theme_menu {
         render_theme_menu(frame, menu);
+    }
+}
+
+/// Filas visibles de resultados en el modal de búsqueda de Spotify.
+const SPOTIFY_MODAL_MAX_ROWS: usize = 10;
+
+/// Columna fija con el tipo de resultado (mismo ancho para alinear).
+fn hit_kind_tag(hit: &SearchHit) -> &'static str {
+    match hit {
+        SearchHit::Track { .. } => "Canción ",
+        SearchHit::Playlist { .. } => "Playlist",
+    }
+}
+
+/// Últimos `max` caracteres: el campo de texto muestra el final de lo escrito.
+fn tail_chars(text: &str, max: usize) -> String {
+    let count = text.chars().count();
+    text.chars().skip(count.saturating_sub(max)).collect()
+}
+
+/// Filas del modal de búsqueda de Spotify: campo de texto, línea de estado y,
+/// con resultados, la lista (con ventana que sigue a la selección). `width` es
+/// el ancho útil; ninguna fila de la lista lo excede.
+pub(super) fn spotify_search_lines(
+    search: &SpotifySearch,
+    width: usize,
+    max_rows: usize,
+) -> Vec<Line<'static>> {
+    let colors = theme(); // snapshot coherente para todas las filas
+    let dim = Style::default().fg(colors.dim);
+    let text = Style::default().fg(colors.text);
+    let editing = search.phase == SearchPhase::Input;
+
+    let field = if editing {
+        format!(
+            " {}{CURSOR}",
+            tail_chars(&search.query, width.saturating_sub(3))
+        )
+    } else {
+        format!(" {}", tail_chars(&search.query, width.saturating_sub(2)))
+    };
+    let mut lines = vec![Line::from(Span::styled(
+        field,
+        if editing { text } else { dim },
+    ))];
+
+    match &search.phase {
+        SearchPhase::Input => lines.push(Line::from(Span::styled(
+            truncate_chars(
+                " Canciones y playlists de Spotify · o una URL / ruta",
+                width,
+            ),
+            dim,
+        ))),
+        SearchPhase::Searching => lines.push(Line::from(Span::styled(
+            " Buscando en Spotify…",
+            Style::default().fg(colors.warn),
+        ))),
+        SearchPhase::Failed(message) => lines.push(Line::from(Span::styled(
+            format!(" {message}"),
+            Style::default().fg(colors.error),
+        ))),
+        SearchPhase::Results { hits, selected } => {
+            let summary = match hits.len() {
+                0 => format!(" Sin resultados para «{}»", search.query),
+                1 => " 1 resultado".to_string(),
+                n => format!(" {n} resultados"),
+            };
+            lines.push(Line::from(Span::styled(
+                truncate_chars(&summary, width),
+                dim,
+            )));
+
+            let offset = scroll_offset(*selected, hits.len(), max_rows);
+            for (index, hit) in hits.iter().enumerate().skip(offset).take(max_rows) {
+                let is_selected = index == *selected;
+                let row_style = if is_selected {
+                    Style::default()
+                        .bg(colors.select_bg)
+                        .fg(colors.accent)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    text
+                };
+                let cursor = if is_selected { CURSOR } else { " " };
+                let prefix = format!("{cursor}{}  ", hit_kind_tag(hit));
+                let available = width.saturating_sub(prefix.chars().count());
+                let label = truncate_chars(hit.label(), available);
+                let remaining = available.saturating_sub(label.chars().count());
+                let mut spans = vec![
+                    Span::styled(prefix, if is_selected { row_style } else { dim }),
+                    Span::styled(label, row_style),
+                ];
+                if let SearchHit::Playlist {
+                    detail: Some(detail),
+                    ..
+                } = hit
+                    && remaining > 3
+                {
+                    spans.push(Span::styled(
+                        truncate_chars(&format!("  {detail}"), remaining),
+                        if is_selected { row_style } else { dim },
+                    ));
+                }
+                lines.push(Line::from(spans));
+            }
+        }
+    }
+    lines
+}
+
+/// Modal centrado de la búsqueda de Spotify, al estilo del prompt de URL.
+pub(super) fn render_spotify_search(frame: &mut Frame<'_>, search: &SpotifySearch) {
+    let area = frame.area();
+    let width = 72.min(area.width.saturating_sub(4)).max(20);
+    let inner_width = usize::from(width.saturating_sub(2)).max(1);
+    let max_rows = SPOTIFY_MODAL_MAX_ROWS
+        .min(usize::from(area.height).saturating_sub(6))
+        .max(1);
+    let lines = spotify_search_lines(search, inner_width, max_rows);
+    // El mensaje de error puede ocupar varias filas al ajustarse al ancho.
+    let rows: usize = lines
+        .iter()
+        .map(|line| {
+            let chars: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+            chars.max(1).div_ceil(inner_width)
+        })
+        .sum();
+    let height = u16::try_from(rows + 3)
+        .unwrap_or(u16::MAX)
+        .min(area.height.saturating_sub(2))
+        .max(3);
+
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let rect = Rect::new(x, y, width, height).intersection(area);
+
+    frame.render_widget(Clear, rect);
+    let block = Block::bordered()
+        .border_style(Style::default().fg(theme().accent))
+        .title(Span::styled(
+            " Buscar en Spotify ",
+            Style::default()
+                .fg(theme().accent)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    frame.render_widget(
+        Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }),
+        inner,
+    );
+}
+
+/// Pie de atajos del modal, según la etapa: siempre dice qué tecla hace qué.
+fn spotify_search_footer(search: &SpotifySearch) -> Vec<Line<'static>> {
+    let keys = &config::config().keys;
+    match &search.phase {
+        SearchPhase::Input => vec![
+            Line::from(" Escribí una canción, artista o playlist (o pegá una URL / ruta local) "),
+            Line::from(" Enter: buscar   Esc: cancelar "),
+        ],
+        SearchPhase::Searching => vec![
+            Line::from(" Buscando en Spotify… "),
+            Line::from(" Esc: cancelar "),
+        ],
+        SearchPhase::Results { .. } => vec![Line::from(format!(
+            " {}/{}: mover   {}: reproducir   {}: nueva búsqueda   {}: cerrar ",
+            key_labels(&keys.move_up),
+            key_labels(&keys.move_down),
+            key_labels(&keys.select),
+            key_labels(&keys.spotify_search),
+            key_labels(&keys.back),
+        ))],
+        SearchPhase::Failed(_) => vec![
+            Line::from(" No se pudo buscar: el motivo está en el recuadro "),
+            Line::from(format!(
+                " {}: reintentar   {}: cerrar ",
+                key_labels(&keys.select),
+                key_labels(&keys.back),
+            )),
+        ],
     }
 }
 
@@ -2435,6 +2621,10 @@ pub(super) fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
         ];
     }
 
+    if let Some(search) = &app.spotify_search {
+        return spotify_search_footer(search);
+    }
+
     if app.theme_menu.is_some() {
         return vec![Line::from(
             " ↑/↓: previsualizar tema   ·   Enter: guardar   ·   Esc: cancelar ",
@@ -2652,15 +2842,36 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App, compact: bool) {
             }
         }
     }
+    let mut block = Block::bordered()
+        .border_style(Style::default().fg(theme().dim))
+        .title(accent_title("Atajos"));
+    // Sin modal encima, el borde recuerda cómo buscar en Spotify: el pie de
+    // cada modo está lleno y sus textos son contrato de los demás atajos.
+    if !modal_open(app) {
+        block = block.title_top(
+            Line::from(format!(
+                " {}: Spotify ",
+                key_labels(&config::config().keys.spotify_search)
+            ))
+            .right_aligned(),
+        );
+    }
     frame.render_widget(
         Paragraph::new(lines)
-            .block(
-                Block::bordered()
-                    .border_style(Style::default().fg(theme().dim))
-                    .title(accent_title("Atajos")),
-            )
+            .block(block)
             .style(Style::default().fg(theme().dim))
             .alignment(Alignment::Center),
         area,
     );
+}
+
+/// Hay un modal o un campo de texto abierto (el pie ya explica sus teclas).
+fn modal_open(app: &App) -> bool {
+    app.url_input.is_some()
+        || app.spotify_search.is_some()
+        || app.search.is_some()
+        || app.theme_menu.is_some()
+        || app.bands_menu.is_some()
+        || app.mode_menu.is_some()
+        || app.settings_panel.is_some()
 }

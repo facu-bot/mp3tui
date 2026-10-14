@@ -8,7 +8,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use super::auth::{self, AuthError, TokenClient, Tokens};
-use super::client::{SpotifyClient, SpotifyError, SpotifyTrack};
+use super::client::{SearchResults, SpotifyClient, SpotifyError, SpotifyTrack};
 use super::resolve::{ResolveError, resolve_track};
 use super::{MissingClientId, client_id};
 use crate::config::Config;
@@ -33,6 +33,18 @@ impl TrackSource for SpotifyClient {
 
     fn album_tracks(&self, id: &str) -> Result<Vec<SpotifyTrack>, SpotifyError> {
         SpotifyClient::album_tracks(self, id)
+    }
+}
+
+/// Lo mínimo del cliente que necesita la búsqueda de catálogo (seam para
+/// tests).
+pub trait SearchSource {
+    fn search(&self, query: &str) -> Result<SearchResults, SpotifyError>;
+}
+
+impl SearchSource for SpotifyClient {
+    fn search(&self, query: &str) -> Result<SearchResults, SpotifyError> {
+        SpotifyClient::search(self, query)
     }
 }
 
@@ -126,13 +138,34 @@ pub fn is_collection(url: &str) -> bool {
     playlist_id(url).is_some() || album_id(url).is_some()
 }
 
-fn failure(err: SpotifyError) -> YtDlpError {
+/// Texto para mostrar de un error del cliente: la falta de sesión (o su
+/// vencimiento) se traduce al aviso de login; el resto conserva su mensaje
+/// (incluido el límite de tasa, con el `Retry-After` si vino).
+fn failure_text(err: SpotifyError) -> String {
     match err {
         SpotifyError::Auth(AuthError::NotAuthorized | AuthError::ReauthorizationRequired) => {
-            YtDlpError::Failed(LOGIN_HINT.to_string())
+            LOGIN_HINT.to_string()
         }
-        other => YtDlpError::Failed(other.to_string()),
+        other => other.to_string(),
     }
+}
+
+fn failure(err: SpotifyError) -> YtDlpError {
+    YtDlpError::Failed(failure_text(err))
+}
+
+/// Busca canciones y playlists en el catálogo de Spotify. El error ya viene
+/// como mensaje listo para mostrar en pantalla: sin `client_id`, sin sesión
+/// (corré `mp3tui --spotify-login`), sesión vencida o límite de tasa (429).
+///
+/// `connect` se inyecta para que la UI lo corra en un hilo y los tests no
+/// toquen la red.
+pub fn search_catalog(
+    query: &str,
+    connect: &dyn Fn() -> Result<Box<dyn SearchSource>, ConnectError>,
+) -> Result<SearchResults, String> {
+    let client = connect().map_err(|e| e.to_string())?;
+    client.search(query).map_err(failure_text)
 }
 
 /// Resuelve una página a audio: una canción de Spotify pasa por
@@ -263,6 +296,87 @@ mod tests {
 
     fn connect_fails() -> Result<Box<dyn TrackSource>, ConnectError> {
         Err(ConnectError::NotLoggedIn)
+    }
+
+    struct FakeSearch {
+        result: Result<SearchResults, SpotifyError>,
+        seen: std::sync::Arc<Mutex<Vec<String>>>,
+    }
+
+    impl SearchSource for FakeSearch {
+        fn search(&self, query: &str) -> Result<SearchResults, SpotifyError> {
+            self.seen.lock().unwrap().push(query.to_string());
+            self.result.clone()
+        }
+    }
+
+    fn search_connect(
+        result: Result<SearchResults, SpotifyError>,
+        seen: std::sync::Arc<Mutex<Vec<String>>>,
+    ) -> impl Fn() -> Result<Box<dyn SearchSource>, ConnectError> {
+        move || {
+            Ok(Box::new(FakeSearch {
+                result: result.clone(),
+                seen: std::sync::Arc::clone(&seen),
+            }) as Box<dyn SearchSource>)
+        }
+    }
+
+    fn one_track_results() -> SearchResults {
+        SearchResults {
+            tracks: vec![track("t1", "Song", &["Artist"])],
+            playlists: Vec::new(),
+            artists: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_search_catalog_returns_the_client_results() {
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let connect = search_connect(Ok(one_track_results()), std::sync::Arc::clone(&seen));
+        let found = search_catalog("daft punk", &connect).unwrap();
+        assert_eq!(found.tracks.len(), 1);
+        assert_eq!(found.tracks[0].id, "t1");
+        assert_eq!(seen.lock().unwrap().as_slice(), &["daft punk"]);
+    }
+
+    #[test]
+    fn test_search_catalog_without_session_says_to_run_spotify_login() {
+        let connect = || Err(ConnectError::NotLoggedIn);
+        let msg = search_catalog("x", &connect).unwrap_err();
+        assert!(msg.contains("--spotify-login"), "{msg}");
+    }
+
+    #[test]
+    fn test_search_catalog_without_client_id_explains_how_to_set_it() {
+        let connect = || Err(ConnectError::ClientId(MissingClientId));
+        let msg = search_catalog("x", &connect).unwrap_err();
+        assert!(msg.contains(super::super::CLIENT_ID_ENV), "{msg}");
+    }
+
+    #[test]
+    fn test_search_catalog_expired_session_says_to_run_spotify_login() {
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        for auth in [AuthError::NotAuthorized, AuthError::ReauthorizationRequired] {
+            let connect =
+                search_connect(Err(SpotifyError::Auth(auth)), std::sync::Arc::clone(&seen));
+            let msg = search_catalog("x", &connect).unwrap_err();
+            assert!(msg.contains("--spotify-login"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn test_search_catalog_rate_limit_message_is_clear() {
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let connect = search_connect(
+            Err(SpotifyError::RateLimited {
+                retry_after_secs: Some(30),
+            }),
+            seen,
+        );
+        let msg = search_catalog("x", &connect).unwrap_err();
+        assert!(msg.contains("limitó la tasa"), "{msg}");
+        assert!(msg.contains("30"), "{msg}");
     }
 
     /// Responde según el primer argumento: `ytsearch` → candidatos, `--print`

@@ -176,7 +176,7 @@ pub(super) fn spawn_ytdlp_resolution(url: String, req_id: u64) -> Receiver<YtDlp
 /// Único punto del programa que lista una playlist de YouTube con yt-dlp
 /// `--flat-playlist`: devuelve el receiver del resultado (mismo patrón de
 /// seam que [`spawn_ytdlp_resolution`], sin tocar red en los tests).
-fn spawn_ytdlp_listing(url: String, req_id: u64) -> Receiver<YtDlpListMessage> {
+pub(super) fn spawn_ytdlp_listing(url: String, req_id: u64) -> Receiver<YtDlpListMessage> {
     let (tx, rx) = mpsc::channel();
     let url_clone = url.clone();
     thread::spawn(move || {
@@ -253,7 +253,7 @@ pub(super) fn submit_url_prompt_with_seams(
 /// id` pendiente y lanza la resolución (página) o el listado `--flat-playlist`
 /// (playlist). En la playlist se lista y la primera canción se resuelve
 /// enseguida; el resto entra a la cola al final cuando llega el listado.
-fn begin_url_flow(
+pub(super) fn begin_url_flow(
     app: &mut App,
     url: String,
     resolve_page: impl FnOnce(String, u64) -> Receiver<YtDlpMessage>,

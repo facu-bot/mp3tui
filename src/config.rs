@@ -909,6 +909,8 @@ pub struct Keys {
     pub repeat: Vec<KeyCode>,
     /// Abrir la búsqueda incremental.
     pub search: Vec<KeyCode>,
+    /// Abrir la búsqueda de Spotify (canciones y playlists). Por defecto '/'.
+    pub spotify_search: Vec<KeyCode>,
     pub speed_up: Vec<KeyCode>,
     pub speed_down: Vec<KeyCode>,
     /// Abrir/cerrar el panel lateral del explorador: `b` / `Tab` /
@@ -962,6 +964,7 @@ impl Default for Keys {
             shuffle: keys(&[KeyCode::Char('s')]),
             repeat: keys(&[KeyCode::Char('r')]),
             search: keys(&[KeyCode::Char('b')]),
+            spotify_search: keys(&[KeyCode::Char('/')]),
             speed_up: keys(&[KeyCode::Char(']')]),
             speed_down: keys(&[KeyCode::Char('[')]),
             explorer: keys(&[KeyCode::Tab]),
@@ -996,6 +999,7 @@ fn parse_keybindings(section: &toml::Table, keys: &mut Keys, warnings: &mut Vec<
             "shuffle" => &mut keys.shuffle,
             "repeat" => &mut keys.repeat,
             "search" => &mut keys.search,
+            "spotify_search" => &mut keys.spotify_search,
             "open_url" => &mut keys.open_url,
             "enqueue" => &mut keys.enqueue,
             "queue_panel" => &mut keys.queue_panel,
@@ -1076,6 +1080,11 @@ fn resolve_key_collisions(keys: &mut Keys, warnings: &mut Vec<String>) {
         ("shuffle", &mut keys.shuffle, &defaults.shuffle),
         ("repeat", &mut keys.repeat, &defaults.repeat),
         ("search", &mut keys.search, &defaults.search),
+        (
+            "spotify_search",
+            &mut keys.spotify_search,
+            &defaults.spotify_search,
+        ),
         ("open_url", &mut keys.open_url, &defaults.open_url),
         ("enqueue", &mut keys.enqueue, &defaults.enqueue),
         ("queue_panel", &mut keys.queue_panel, &defaults.queue_panel),
@@ -1920,6 +1929,19 @@ zoom = 2",
             vec![KeyCode::Esc],
             "solo Esc sale (doble pulsación)"
         );
+    }
+
+    #[test]
+    fn default_spotify_search_key_is_slash_and_can_be_remapped() {
+        assert_eq!(Keys::default().spotify_search, vec![KeyCode::Char('/')]);
+        let config = parse(
+            r#"
+            [keybindings]
+            spotify_search = "f"
+            "#,
+        );
+        assert_eq!(config.keys.spotify_search, vec![KeyCode::Char('f')]);
+        assert!(config.warnings.is_empty(), "{:?}", config.warnings);
     }
 
     #[test]

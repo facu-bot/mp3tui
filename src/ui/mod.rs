@@ -312,6 +312,14 @@ struct App {
     /// Receiver del listado `--flat-playlist` en curso.
     playlist_rx: Option<Receiver<YtDlpListMessage>>,
     ytdlp_request_id: u64,
+    /// Modal de búsqueda de Spotify: `Some` mientras está abierto.
+    spotify_search: Option<SpotifySearch>,
+    /// Receiver de la búsqueda de Spotify en curso (hilo aparte).
+    spotify_search_rx: Option<Receiver<SpotifySearchMessage>>,
+    /// Id de la búsqueda vigente: un resultado con otro id llegó tarde y se
+    /// descarta. Independiente de `ytdlp_request_id` para que buscar no corte
+    /// la reproducción en curso.
+    spotify_search_id: u64,
     is_url: bool,
     /// URL original (nunca la resuelta) + etiqueta de la pista cuando la
     /// reproducción actual viene de una URL; `None` en reproducción local.
@@ -532,6 +540,9 @@ pub fn run(engine: &mut AudioEngine, start: StartMode) -> io::Result<()> {
         ytdlp_rx: None,
         playlist_rx: None,
         ytdlp_request_id: 0,
+        spotify_search: None,
+        spotify_search_rx: None,
+        spotify_search_id: 0,
         is_url: is_url_start,
         current_url: None,
         ytdlp_failed: false,
@@ -615,6 +626,9 @@ fn event_loop(tui: &mut Tui, app: &mut App, engine: &mut AudioEngine) -> io::Res
             }
         }
 
+        // Búsqueda de Spotify en su hilo: el resultado llena el modal.
+        poll_spotify_search(app);
+
         if let Some(rx) = &app.ytdlp_rx {
             match rx.try_recv() {
                 Ok((req_id, orig_url, result)) => {
@@ -680,6 +694,9 @@ fn event_loop(tui: &mut Tui, app: &mut App, engine: &mut AudioEngine) -> io::Res
                 if let Some(buf) = app.url_input.as_mut() {
                     handle_prompt_paste(buf, &pasted);
                 }
+            }
+            Event::Paste(pasted) if app.spotify_search.is_some() => {
+                paste_into_spotify_search(app, &pasted);
             }
             _ => {}
         }
@@ -764,6 +781,13 @@ fn dispatch_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine) {
 
     if app.url_input.is_some() {
         handle_url_prompt_key(key, app, engine);
+        return;
+    }
+
+    // Búsqueda de Spotify: modal con su propio campo de texto, mismas reglas
+    // que el prompt de URL (todo lo que se teclea va al campo).
+    if app.spotify_search.is_some() {
+        handle_spotify_search_key(key, app, engine);
         return;
     }
 
@@ -1005,6 +1029,7 @@ mod keys;
 mod mouse;
 mod queue;
 mod render;
+mod spotify_search;
 #[cfg(test)]
 mod tests_common;
 
@@ -1012,6 +1037,7 @@ use self::keys::*;
 use self::mouse::*;
 use self::queue::*;
 use self::render::*;
+use self::spotify_search::*;
 
 #[cfg(test)]
 mod tests {

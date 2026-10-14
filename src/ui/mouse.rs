@@ -241,6 +241,7 @@ pub(super) fn handle_mouse(event: MouseEvent, app: &mut App, engine: &mut AudioE
     // bandas, selector de modo, panel de configuración) el clic no atraviesa
     // hacia lo que quedó tapado.
     if app.url_input.is_some()
+        || app.spotify_search.is_some()
         || app.theme_menu.is_some()
         || app.bands_menu.is_some()
         || app.mode_menu.is_some()
