@@ -18,6 +18,10 @@ struct Cli {
     /// Archivo de audio, carpeta con la biblioteca o URL HTTP/HTTPS a reproducir.
     #[arg(value_name = "TARGET")]
     target: Option<String>,
+
+    /// Autoriza mp3tui en Spotify (PKCE) y sale; no abre la TUI.
+    #[arg(long)]
+    spotify_login: bool,
 }
 
 fn main() -> ExitCode {
@@ -28,6 +32,25 @@ fn main() -> ExitCode {
     // default en config::parse.
     for warning in &config::init().warnings {
         eprintln!("mp3tui: config: {warning}");
+    }
+
+    if cli.spotify_login {
+        return match source::spotify::play::run_login(
+            source::spotify::client_id(config::config()),
+            source::spotify::auth::tokens_path(),
+            |client, store| {
+                source::spotify::auth::login(client, store, std::time::Duration::from_secs(300))
+            },
+        ) {
+            Ok(()) => {
+                println!("Listo: sesión de Spotify guardada.");
+                ExitCode::SUCCESS
+            }
+            Err(err) => {
+                eprintln!("mp3tui: {err}");
+                ExitCode::FAILURE
+            }
+        };
     }
 
     // Sin target: biblioteca por defecto (carpetas conocidas del sistema

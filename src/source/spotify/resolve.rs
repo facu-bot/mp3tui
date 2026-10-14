@@ -5,7 +5,8 @@
 
 use std::fmt;
 
-use super::client::{SpotifyClient, SpotifyTrack};
+use super::client::SpotifyTrack;
+use super::play::TrackSource;
 use crate::source::ytdlp::{self, CommandRunner, ResolveCache, YtDlpError};
 
 /// Errores de [`resolve_track`]. Nunca incluyen tokens: solo texto de la
@@ -58,7 +59,7 @@ fn search_query(track: &SpotifyTrack) -> String {
 /// `_client` no se usa todavía: queda en la firma para resolver por ISRC o
 /// metadatos extra sin cambiar a los llamadores.
 pub fn resolve_track(
-    _client: &SpotifyClient,
+    _client: &dyn TrackSource,
     cache: &mut ResolveCache,
     track: &SpotifyTrack,
     runner: &dyn CommandRunner,
@@ -89,6 +90,7 @@ pub fn resolve_track(
 mod tests {
     use super::*;
     use crate::source::spotify::auth::TokenClient;
+    use crate::source::spotify::client::SpotifyClient;
     use crate::source::ytdlp::{CommandOutput, RunError};
     use std::path::PathBuf;
     use std::sync::Mutex;

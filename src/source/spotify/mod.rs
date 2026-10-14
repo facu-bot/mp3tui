@@ -9,6 +9,7 @@
 
 pub mod auth;
 pub mod client;
+pub mod play;
 pub mod resolve;
 
 use crate::config::Config;

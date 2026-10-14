@@ -143,6 +143,16 @@ pub(super) fn start_url_playback(
     }
 }
 
+/// Cliente de Spotify para los hilos de resolución y listado (lee config y
+/// tokens; la red ocurre recién al usarlo).
+fn connect_spotify() -> Result<
+    Box<dyn crate::source::spotify::play::TrackSource>,
+    crate::source::spotify::play::ConnectError,
+> {
+    crate::source::spotify::play::connect(crate::config::config())
+        .map(|client| Box::new(client) as Box<dyn crate::source::spotify::play::TrackSource>)
+}
+
 /// Único punto del programa que lanza el proceso yt-dlp para resolver una URL
 /// de página: devuelve el receiver del resultado. Centralizarlo acá permite
 /// que los tests inyecten un doble y nunca toquen el proceso ni la red.
@@ -150,8 +160,14 @@ pub(super) fn spawn_ytdlp_resolution(url: String, req_id: u64) -> Receiver<YtDlp
     let (tx, rx) = mpsc::channel();
     let url_clone = url.clone();
     thread::spawn(move || {
-        let result =
-            crate::source::ytdlp::resolve(&url, &crate::source::ytdlp::ProcessCommandRunner);
+        let mut cache = crate::source::ytdlp::ResolveCache::new()
+            .unwrap_or_else(|| crate::source::ytdlp::ResolveCache::at_path(PathBuf::new()));
+        let result = crate::source::spotify::play::resolve_page(
+            &url,
+            &crate::source::ytdlp::ProcessCommandRunner,
+            &mut cache,
+            &connect_spotify,
+        );
         let _ = tx.send((req_id, url_clone, result));
     });
     rx
@@ -164,8 +180,11 @@ fn spawn_ytdlp_listing(url: String, req_id: u64) -> Receiver<YtDlpListMessage> {
     let (tx, rx) = mpsc::channel();
     let url_clone = url.clone();
     thread::spawn(move || {
-        let result =
-            crate::source::ytdlp::list_flat(&url, &crate::source::ytdlp::ProcessCommandRunner);
+        let result = if crate::source::spotify::play::playlist_id(&url).is_some() {
+            crate::source::spotify::play::list_playlist(&url, &connect_spotify)
+        } else {
+            crate::source::ytdlp::list_flat(&url, &crate::source::ytdlp::ProcessCommandRunner)
+        };
         let _ = tx.send((req_id, url_clone, result));
     });
     rx
@@ -219,7 +238,10 @@ pub(super) fn submit_url_prompt_with_seams(
             start_url_playback(app, engine, url.clone(), url, label);
             app.mode = Mode::Player;
         }
-        SubmitAction::Page(url) | SubmitAction::Playlist(url) => {
+        SubmitAction::Page(url)
+        | SubmitAction::Playlist(url)
+        | SubmitAction::SpotifyTrack(url)
+        | SubmitAction::SpotifyPlaylist(url) => {
             begin_url_flow(app, url, resolve_page, list_playlist);
         }
     }
@@ -239,7 +261,7 @@ fn begin_url_flow(
     let is_playlist = matches!(
         crate::source::classify(&url),
         crate::source::Input::Url {
-            kind: crate::source::UrlKind::Playlist,
+            kind: crate::source::UrlKind::Playlist | crate::source::UrlKind::SpotifyPlaylist,
             ..
         }
     );
@@ -295,15 +317,14 @@ pub(super) fn start_boot_url_with(
     list_playlist: impl FnOnce(String, u64) -> Receiver<YtDlpListMessage>,
 ) {
     match kind {
-        // Spotify: placeholder hasta que T5b cablee la resolución.
-        crate::source::UrlKind::DirectAudio
-        | crate::source::UrlKind::Unknown
-        | crate::source::UrlKind::SpotifyTrack
-        | crate::source::UrlKind::SpotifyPlaylist => {
+        crate::source::UrlKind::DirectAudio | crate::source::UrlKind::Unknown => {
             let label = url_display_label(&url);
             start_url_playback(app, engine, url.clone(), url, label);
         }
-        crate::source::UrlKind::Page | crate::source::UrlKind::Playlist => {
+        crate::source::UrlKind::Page
+        | crate::source::UrlKind::Playlist
+        | crate::source::UrlKind::SpotifyTrack
+        | crate::source::UrlKind::SpotifyPlaylist => {
             begin_url_flow(app, url, resolve_page, list_playlist);
         }
     }
