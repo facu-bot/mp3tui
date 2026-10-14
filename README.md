@@ -73,12 +73,12 @@ dashboard de Spotify y usás ese identificador. Es gratis y se hace una sola vez
    ejemplo:
 
    ```
-   http://127.0.0.1:8080
+   http://127.0.0.1:8080/callback
    ```
 
-   Tiene que ser `127.0.0.1` (la IP literal, no `localhost`) y el puerto es
-   libre: mp3tui abre uno efímero en cada login, así que no hace falta que
-   coincida con el que pusiste vos.
+   Tiene que ser `127.0.0.1` (la IP literal, no `localhost`), la ruta
+   `/callback` es obligatoria, y el puerto es libre: mp3tui abre uno efímero en
+   cada login, así que no hace falta que coincida con el que pusiste vos.
 3. Si te pregunta qué API vas a usar, marcá **Web API** y guardá.
 4. En **Settings** de la app copiá el **Client ID**. El **Client Secret** no se
    usa: mp3tui autentica con PKCE, que es para clientes públicos.

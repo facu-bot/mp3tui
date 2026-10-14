@@ -27,7 +27,7 @@ struct Cli {
                      TUI.\n\n\
                      Necesitás el client_id de una app tuya: registrala en \
                      https://developer.spotify.com/dashboard con un redirect URI loopback \
-                     (http://127.0.0.1:<puerto>) y pasá el Client ID en la variable \
+                     (http://127.0.0.1:<puerto>/callback) y pasá el Client ID en la variable \
                      MP3TUI_SPOTIFY_CLIENT_ID o en config.toml: [spotify] client_id = \"...\". \
                      La sesión dura 6 meses; después hay que volver a autorizar. No hace falta \
                      Client Secret (PKCE) ni Spotify Premium: la Web API solo aporta metadatos \
