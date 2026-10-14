@@ -6,12 +6,14 @@
 //! config dir con permisos `0600`. Ningún valor de token se imprime ni se
 //! incluye en un mensaje de error.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -513,9 +515,25 @@ impl TokenClient {
 
     /// Tokens vigentes desde `path`: renueva y persiste si faltan menos de
     /// [`REFRESH_MARGIN_SECS`] segundos para que venza el access token.
+    ///
+    /// Los tokens vigentes se sirven de una caché en memoria (por ruta): una
+    /// sesión hace decenas de pedidos y no hace falta leer ni parsear el TOML
+    /// en cada uno. Si el de memoria está por vencer, antes de renovar se
+    /// relee el disco (otra instancia pudo haberlo renovado y rotado el
+    /// refresh token).
     pub fn fresh_tokens(&self, path: &Path) -> Result<Tokens, AuthError> {
+        let now = unix_now();
+        if let Some(tokens) = cached_tokens(path).filter(|t| !t.needs_refresh(now)) {
+            return Ok(tokens);
+        }
+        // Un solo renovador a la vez: los demás esperan y reusan su resultado.
+        let _slow = REFRESH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(tokens) = cached_tokens(path).filter(|t| !t.needs_refresh(unix_now())) {
+            return Ok(tokens);
+        }
         let tokens = load_tokens(path)?.ok_or(AuthError::NotAuthorized)?;
         if !tokens.needs_refresh(unix_now()) {
+            remember_tokens(path, &tokens);
             return Ok(tokens);
         }
         let renewed = self.refresh(&tokens)?;
@@ -568,8 +586,32 @@ pub fn tokens_path() -> Option<PathBuf> {
     crate::config::config_dir().map(|dir| dir.join(TOKENS_FILE))
 }
 
+/// Caché de tokens en memoria, de todo el proceso y por ruta del archivo: los
+/// tests (y quien use otro `MP3TUI_CONFIG`) usan rutas distintas y nunca ven
+/// el token de otra.
+static TOKEN_CACHE: OnceLock<Mutex<HashMap<PathBuf, Tokens>>> = OnceLock::new();
+
+/// Serializa la ruta lenta (disco + renovación) de `fresh_tokens`.
+static REFRESH_LOCK: Mutex<()> = Mutex::new(());
+
+fn token_cache() -> MutexGuard<'static, HashMap<PathBuf, Tokens>> {
+    TOKEN_CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+fn cached_tokens(path: &Path) -> Option<Tokens> {
+    token_cache().get(path).cloned()
+}
+
+fn remember_tokens(path: &Path, tokens: &Tokens) {
+    token_cache().insert(path.to_path_buf(), tokens.clone());
+}
+
 /// Guarda los tokens como TOML con modo `0600` (Unix), escribiendo a un
 /// temporal privado y renombrando para que nunca exista legible por otros.
+/// Deja la caché en memoria con el mismo valor.
 pub fn save_tokens(path: &Path, tokens: &Tokens) -> Result<(), AuthError> {
     let storage = |e: io::Error| AuthError::Storage(e.to_string());
     let text = toml::to_string(tokens)
@@ -583,7 +625,9 @@ pub fn save_tokens(path: &Path, tokens: &Tokens) -> Result<(), AuthError> {
     fs::rename(&tmp, path).map_err(|e| {
         let _ = fs::remove_file(&tmp);
         storage(e)
-    })
+    })?;
+    remember_tokens(path, tokens);
+    Ok(())
 }
 
 /// Crea `path` (que no debe existir) legible solo por el dueño y lo escribe.
@@ -1205,6 +1249,122 @@ mod tests {
             client.fresh_tokens(&dir.join("spotify.toml")),
             Err(AuthError::NotAuthorized)
         );
+    }
+
+    // --- Caché de tokens en memoria ---
+
+    fn dead_client() -> TokenClient {
+        // Cualquier intento de refresh falla: prueba que no se pidió la red.
+        TokenClient::with_token_url("cid", "http://127.0.0.1:1/api/token")
+    }
+
+    fn tokens_named(access: &str, expires_at: u64) -> Tokens {
+        Tokens {
+            access_token: access.to_string(),
+            refresh_token: "REFRESH-TEST".to_string(),
+            expires_at,
+        }
+    }
+
+    #[test]
+    fn test_fresh_tokens_second_call_is_served_from_memory() {
+        let dir = temp_dir("cache_hit");
+        let path = dir.join("spotify.toml");
+        let valid = tokens_named("AT-MEM", unix_now() + 3600);
+        save_tokens(&path, &valid).unwrap();
+        let client = dead_client();
+
+        assert_eq!(client.fresh_tokens(&path).unwrap(), valid);
+        // Sin archivo, la segunda lectura sale de memoria: no hay disco.
+        fs::remove_file(&path).unwrap();
+        assert_eq!(client.fresh_tokens(&path).unwrap(), valid);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_fresh_tokens_cache_is_keyed_by_path() {
+        let dir_a = temp_dir("cache_key_a");
+        let dir_b = temp_dir("cache_key_b");
+        let (a, b) = (dir_a.join("spotify.toml"), dir_b.join("spotify.toml"));
+        let (ta, tb) = (
+            tokens_named("AT-A", unix_now() + 3600),
+            tokens_named("AT-B", unix_now() + 3600),
+        );
+        save_tokens(&a, &ta).unwrap();
+        save_tokens(&b, &tb).unwrap();
+        let client = dead_client();
+
+        assert_eq!(client.fresh_tokens(&a).unwrap(), ta);
+        assert_eq!(client.fresh_tokens(&b).unwrap(), tb);
+        assert_eq!(client.fresh_tokens(&a).unwrap(), ta);
+
+        // Una ruta sin sesión no hereda el token de otra.
+        let none = temp_dir("cache_key_none").join("spotify.toml");
+        assert_eq!(client.fresh_tokens(&none), Err(AuthError::NotAuthorized));
+        let _ = fs::remove_dir_all(&dir_a);
+        let _ = fs::remove_dir_all(&dir_b);
+    }
+
+    #[test]
+    fn test_save_tokens_keeps_the_cache_consistent() {
+        let dir = temp_dir("cache_save");
+        let path = dir.join("spotify.toml");
+        let client = dead_client();
+        save_tokens(&path, &tokens_named("AT-1", unix_now() + 3600)).unwrap();
+        assert_eq!(client.fresh_tokens(&path).unwrap().access_token, "AT-1");
+
+        // Un login nuevo (o un refresh) guarda otro token: la caché lo ve.
+        save_tokens(&path, &tokens_named("AT-2", unix_now() + 3600)).unwrap();
+        assert_eq!(client.fresh_tokens(&path).unwrap().access_token, "AT-2");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_fresh_tokens_refresh_updates_the_cache() {
+        let dir = temp_dir("cache_refresh");
+        let path = dir.join("spotify.toml");
+        save_tokens(&path, &tokens_named("AT-OLD", unix_now() + 10)).unwrap();
+        let stub = Stub::spawn(vec![(
+            200,
+            r#"{"access_token":"AT-NEW","token_type":"Bearer","expires_in":3600}"#,
+        )]);
+        let client = TokenClient::with_token_url("cid", stub.url.clone());
+
+        assert_eq!(client.fresh_tokens(&path).unwrap().access_token, "AT-NEW");
+        stub.finish();
+        // Segunda llamada: ni red (el stub ya terminó) ni disco.
+        fs::remove_file(&path).unwrap();
+        assert_eq!(client.fresh_tokens(&path).unwrap().access_token, "AT-NEW");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Si el access token en memoria está por vencer, antes de renovar se
+    /// relee el disco: otra instancia pudo haberlo renovado ya (y rotado el
+    /// refresh token), y usar el de memoria daría `invalid_grant`.
+    #[test]
+    fn test_expiring_cached_token_prefers_a_newer_one_on_disk() {
+        let dir = temp_dir("cache_disk_newer");
+        let path = dir.join("spotify.toml");
+        save_tokens(&path, &tokens_named("AT-STALE", unix_now() + 10)).unwrap();
+        // Otro proceso escribe un token vigente directo al archivo.
+        let newer = tokens_named("AT-OTHER-PROCESS", unix_now() + 3600);
+        fs::write(&path, toml::to_string(&newer).unwrap()).unwrap();
+
+        assert_eq!(dead_client().fresh_tokens(&path).unwrap(), newer);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_invalid_grant_is_not_cached_and_keeps_its_meaning() {
+        let dir = temp_dir("cache_invalid_grant");
+        let path = dir.join("spotify.toml");
+        save_tokens(&path, &tokens_named("AT-OLD", unix_now() + 10)).unwrap();
+        let stub = Stub::spawn(vec![(400, r#"{"error":"invalid_grant"}"#)]);
+        let client = TokenClient::with_token_url("cid", stub.url.clone());
+
+        assert_eq!(client.fresh_tokens(&path), Err(AuthError::ReauthorizationRequired));
+        stub.finish();
+        let _ = fs::remove_dir_all(&dir);
     }
 
     // --- Listener loopback ---

@@ -9,6 +9,7 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -107,6 +108,20 @@ impl From<AuthError> for SpotifyError {
     }
 }
 
+/// Agente HTTP compartido por todos los clientes del proceso. El agente es el
+/// pool de conexiones: compartirlo reusa la conexión TLS en vez de hacer un
+/// handshake por cliente (y hay uno por operación y por tema resuelto).
+fn shared_agent() -> &'static ureq::Agent {
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT.get_or_init(|| {
+        ureq::config::Config::builder()
+            .http_status_as_error(false)
+            .timeout_global(Some(Duration::from_secs(20)))
+            .build()
+            .new_agent()
+    })
+}
+
 /// Cliente de metadatos de la Web API de Spotify.
 ///
 /// La base de la API y el endpoint de tokens son inyectables para testear
@@ -130,15 +145,11 @@ impl SpotifyClient {
         token_client: TokenClient,
         tokens_path: impl Into<PathBuf>,
     ) -> Self {
-        let config = ureq::config::Config::builder()
-            .http_status_as_error(false)
-            .timeout_global(Some(Duration::from_secs(20)))
-            .build();
         Self {
             base_url: base_url.into(),
             tokens_path: tokens_path.into(),
             token_client,
-            agent: config.new_agent(),
+            agent: shared_agent().clone(),
         }
     }
 
@@ -1221,5 +1232,24 @@ mod tests {
             SpotifyError::RateLimited { retry_after_secs: Some(9) }
         );
         stub.finish();
+    }
+
+    // --- agente compartido ---
+
+    #[test]
+    fn test_clients_share_one_agent_and_keep_working_against_different_stubs() {
+        assert!(std::ptr::eq(shared_agent(), shared_agent()));
+
+        let path = temp_path("shared_agent");
+        write_tokens(&path, "TOKEN-SH");
+        let stub_a = Stub::spawn(|_| vec![json_response(200, r#"{"id":"a","name":"A"}"#)]);
+        let stub_b = Stub::spawn(|_| vec![json_response(200, r#"{"id":"b","name":"B"}"#)]);
+        let a = client_with(&stub_a.base_url, "http://127.0.0.1:1/api/token", &path);
+        let b = client_with(&stub_b.base_url, "http://127.0.0.1:1/api/token", &path);
+        // Mismo agente, bases distintas: cada cliente le habla a la suya.
+        assert_eq!(a.album_name("x").unwrap(), "A");
+        assert_eq!(b.album_name("y").unwrap(), "B");
+        assert_eq!(stub_a.finish().len(), 1);
+        assert_eq!(stub_b.finish().len(), 1);
     }
 }
