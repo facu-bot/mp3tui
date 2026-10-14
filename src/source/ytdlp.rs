@@ -1,6 +1,9 @@
 //! Resolución de URLs de páginas (YouTube, etc.) a URLs de audio directo y título
 //! delegando en la herramienta externa `yt-dlp`.
 
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
@@ -229,6 +232,7 @@ pub enum YtDlpError {
     NoCompatibleFormat(String),
     BadOutput(String),
     InvalidUrl(String),
+    EmptyQuery,
 }
 
 impl std::fmt::Display for YtDlpError {
@@ -248,6 +252,7 @@ impl std::fmt::Display for YtDlpError {
             }
             YtDlpError::BadOutput(msg) => write!(f, "salida inesperada de yt-dlp: {msg}"),
             YtDlpError::InvalidUrl(msg) => write!(f, "URL no válida para yt-dlp: {msg}"),
+            YtDlpError::EmptyQuery => write!(f, "la consulta de búsqueda está vacía"),
         }
     }
 }
@@ -433,6 +438,237 @@ pub fn list_flat_with_timeout(
     }
 
     Ok(entries)
+}
+
+// --- Búsqueda y matching (T4) ------------------------------------------------
+// `SearchCandidate`, `search`, `best_match` y `ResolveCache` los consume el
+// cableado de Spotify (T5); hasta entonces son API sin uso.
+
+/// Resultados que se le piden a yt-dlp en una búsqueda.
+#[allow(dead_code)]
+pub const SEARCH_RESULTS: usize = 5;
+
+/// Tolerancia de duración (segundos) para aceptar un candidato.
+const DURATION_TOLERANCE_SECS: f64 = 15.0;
+
+/// Cobertura mínima de tokens del título para considerar un candidato.
+const TITLE_COVERAGE_MIN: f64 = 0.75;
+
+/// Un resultado de búsqueda de yt-dlp (`ytsearch`).
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchCandidate {
+    pub title: String,
+    pub webpage_url: String,
+    pub duration_secs: Option<f64>,
+}
+
+/// Busca en YouTube una consulta de texto libre con `yt-dlp` (`ytsearchN:`).
+///
+/// La entrada es una pseudo-URL de búsqueda, no una URL real, así que a
+/// propósito no pasa por `is_valid_http_url`.
+#[allow(dead_code)]
+pub fn search(query: &str, runner: &dyn CommandRunner) -> Result<Vec<SearchCandidate>, YtDlpError> {
+    search_with_timeout(query, runner, DEFAULT_TIMEOUT)
+}
+
+/// [`search`] con timeout configurable.
+#[allow(dead_code)]
+pub fn search_with_timeout(
+    query: &str,
+    runner: &dyn CommandRunner,
+    timeout: Duration,
+) -> Result<Vec<SearchCandidate>, YtDlpError> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Err(YtDlpError::EmptyQuery);
+    }
+
+    let args = vec![
+        "--flat-playlist".to_string(),
+        "--no-warnings".to_string(),
+        "--encoding".to_string(),
+        "utf-8".to_string(),
+        "--print".to_string(),
+        "%(title)s".to_string(),
+        "--print".to_string(),
+        "%(webpage_url)s".to_string(),
+        "--print".to_string(),
+        "%(duration)s".to_string(),
+        "--".to_string(),
+        format!("ytsearch{SEARCH_RESULTS}:{query}"),
+    ];
+
+    let output = match runner.run("yt-dlp", &args, timeout) {
+        Ok(out) => out,
+        Err(RunError::NotFound) => return Err(YtDlpError::NotInstalled),
+        Err(RunError::Timeout) => return Err(YtDlpError::Timeout),
+        Err(RunError::Io(err)) => return Err(YtDlpError::Failed(err)),
+    };
+
+    if output.status_code != Some(0) {
+        let stderr_str = String::from_utf8_lossy(&output.stderr);
+        let first_err_line = stderr_str
+            .lines()
+            .map(|l| l.trim())
+            .find(|l| !l.is_empty())
+            .unwrap_or("falló la búsqueda de yt-dlp")
+            .to_string();
+        return Err(YtDlpError::Failed(first_err_line));
+    }
+
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    Ok(parse_search_candidates(&stdout_str))
+}
+
+/// Parsea la salida de `search`: bloques de 3 líneas (título, `webpage_url`,
+/// duración). Una duración `NA` o no numérica queda como `None`.
+fn parse_search_candidates(stdout: &str) -> Vec<SearchCandidate> {
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    let mut candidates = Vec::new();
+    for chunk in lines.chunks(3) {
+        if chunk.len() < 3 {
+            break;
+        }
+        let (title, webpage_url, duration) = (chunk[0], chunk[1], chunk[2]);
+        if title.is_empty() || webpage_url.is_empty() {
+            continue;
+        }
+        candidates.push(SearchCandidate {
+            title: title.to_string(),
+            webpage_url: webpage_url.to_string(),
+            duration_secs: duration.parse::<f64>().ok(),
+        });
+    }
+    candidates
+}
+
+/// Elige el mejor candidato para un track: exige cobertura de tokens del
+/// título y, si se conoce la duración, que la del candidato caiga dentro de
+/// [`DURATION_TOLERANCE_SECS`]. Los artistas suman puntaje.
+#[allow(dead_code)]
+pub fn best_match<'a>(
+    artists: &[String],
+    title: &str,
+    duration_secs: Option<f64>,
+    candidates: &'a [SearchCandidate],
+) -> Option<&'a SearchCandidate> {
+    let query_tokens = tokens(title);
+    let artist_tokens = tokens(&artists.join(" "));
+    let mut best: Option<(f64, &SearchCandidate)> = None;
+
+    for candidate in candidates {
+        let candidate_tokens = tokens(&candidate.title);
+        let title_coverage = coverage(&query_tokens, &candidate_tokens);
+        if title_coverage < TITLE_COVERAGE_MIN {
+            continue;
+        }
+        if let (Some(want), Some(got)) = (duration_secs, candidate.duration_secs)
+            && (want - got).abs() > DURATION_TOLERANCE_SECS
+        {
+            continue;
+        }
+        let score = title_coverage + 0.5 * coverage(&artist_tokens, &candidate_tokens);
+        match best {
+            Some((best_score, _)) if score <= best_score => {}
+            _ => best = Some((score, candidate)),
+        }
+    }
+
+    best.map(|(_, candidate)| candidate)
+}
+
+/// Tokens alfanuméricos en minúscula (descarta palabras de 1 carácter).
+fn tokens(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|word| word.len() >= 2)
+        .map(|word| word.to_lowercase())
+        .collect()
+}
+
+/// Fracción de `query` presente en `candidate` (0.0 si `query` está vacía).
+fn coverage(query: &[String], candidate: &[String]) -> f64 {
+    if query.is_empty() {
+        return 0.0;
+    }
+    let hits = query.iter().filter(|token| candidate.contains(token)).count();
+    hits as f64 / query.len() as f64
+}
+
+/// Nombre del archivo de la caché de resoluciones dentro del config dir.
+#[allow(dead_code)]
+pub const CACHE_FILE_NAME: &str = "ytdlp_cache.toml";
+
+/// Formato persistido de la caché.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct CacheFile {
+    #[serde(default)]
+    entries: BTreeMap<String, String>,
+}
+
+/// Caché persistente `clave -> URL de YouTube` para no re-resolver.
+///
+/// Es perezosa: no escribe hasta el primer [`ResolveCache::put`]. Un archivo
+/// corrupto se ignora (queda vacía) para no romper la reproducción.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub struct ResolveCache {
+    path: PathBuf,
+    entries: BTreeMap<String, String>,
+}
+
+#[allow(dead_code)]
+impl ResolveCache {
+    /// Caché en `path`. Lee el archivo si existe y es válido.
+    pub fn at_path(path: PathBuf) -> Self {
+        let entries = fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| toml::from_str::<CacheFile>(&text).ok())
+            .map(|file| file.entries)
+            .unwrap_or_default();
+        Self { path, entries }
+    }
+
+    /// Caché en la ruta por defecto dentro del config dir, si existe.
+    pub fn new() -> Option<Self> {
+        crate::config::config_dir().map(|dir| Self::at_path(dir.join(CACHE_FILE_NAME)))
+    }
+
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.entries.get(key).map(String::as_str)
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Inserta y persiste (temporal + rename, para no corromper el archivo).
+    pub fn put(&mut self, key: &str, url: &str) -> Result<(), String> {
+        self.entries.insert(key.to_string(), url.to_string());
+        self.save()
+    }
+
+    fn save(&self) -> Result<(), String> {
+        if let Some(parent) = self.path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            let _ = fs::create_dir_all(parent);
+        }
+        let file = CacheFile {
+            entries: self.entries.clone(),
+        };
+        let text = toml::to_string(&file).map_err(|e| e.to_string())?;
+        let temp = self.path.with_extension("toml.tmp");
+        fs::write(&temp, text).map_err(|e| e.to_string())?;
+        fs::rename(&temp, &self.path).map_err(|e| {
+            let _ = fs::remove_file(&temp);
+            e.to_string()
+        })
+    }
 }
 
 #[cfg(test)]
@@ -940,6 +1176,239 @@ mod tests {
         let fake = FakeRunner::new(Err(RunError::NotFound));
         let err = list_flat("https://www.youtube.com/playlist?list=PL123", &fake).unwrap_err();
         assert_eq!(err, YtDlpError::NotInstalled);
+    }
+
+    // ------------------------------------------------------------------
+    // T4: búsqueda y matcher (S2/S3)
+    // ------------------------------------------------------------------
+
+    fn search_candidate(
+        title: &str,
+        webpage_url: &str,
+        duration_secs: Option<f64>,
+    ) -> SearchCandidate {
+        SearchCandidate {
+            title: title.to_string(),
+            webpage_url: webpage_url.to_string(),
+            duration_secs,
+        }
+    }
+
+    #[test]
+    fn test_search_pseudo_url_bypasses_http_guard() {
+        // El guard sigue siendo para URLs reales: la pseudo-URL de búsqueda no
+        // debe pasar por él, pero una URL real sí.
+        assert!(!is_valid_http_url("ytsearch5:never gonna give you up"));
+        assert!(is_valid_http_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ"));
+
+        let fake = FakeRunner::new(Ok(CommandOutput {
+            status_code: Some(0),
+            stdout:
+                b"Never Gonna Give You Up\nhttps://www.youtube.com/watch?v=x\n213\n".to_vec(),
+            stderr: Vec::new(),
+        }));
+        let res = search("never gonna give you up", &fake);
+        assert!(
+            res.is_ok(),
+            "search debe aceptar la pseudo-URL de búsqueda: {res:?}"
+        );
+        assert_eq!(fake.calls().len(), 1, "search debe invocar yt-dlp una vez");
+    }
+
+    #[test]
+    fn test_search_builds_exact_ytsearch_args() {
+        let fake = FakeRunner::new(Ok(CommandOutput {
+            status_code: Some(0),
+            stdout:
+                b"Never Gonna Give You Up\nhttps://www.youtube.com/watch?v=x\n213\n".to_vec(),
+            stderr: Vec::new(),
+        }));
+        let _ = search("never gonna give you up", &fake).expect("búsqueda válida");
+
+        let calls = fake.calls();
+        assert_eq!(calls.len(), 1);
+        let (prog, args, _timeout) = &calls[0];
+        assert_eq!(prog, "yt-dlp");
+        assert_eq!(
+            args,
+            &[
+                "--flat-playlist".to_string(),
+                "--no-warnings".to_string(),
+                "--encoding".to_string(),
+                "utf-8".to_string(),
+                "--print".to_string(),
+                "%(title)s".to_string(),
+                "--print".to_string(),
+                "%(webpage_url)s".to_string(),
+                "--print".to_string(),
+                "%(duration)s".to_string(),
+                "--".to_string(),
+                format!("ytsearch{SEARCH_RESULTS}:never gonna give you up"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_search_parses_candidates_and_optional_duration() {
+        let fake = FakeRunner::new(Ok(CommandOutput {
+            status_code: Some(0),
+            stdout: b"Uno\nhttps://www.youtube.com/watch?v=uno\n213\nDos\nhttps://www.youtube.com/watch?v=dos\nNA\n".to_vec(),
+            stderr: Vec::new(),
+        }));
+        let candidates = search("consulta", &fake).expect("salida válida");
+        assert_eq!(
+            candidates,
+            vec![
+                search_candidate("Uno", "https://www.youtube.com/watch?v=uno", Some(213.0)),
+                search_candidate("Dos", "https://www.youtube.com/watch?v=dos", None),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_search_empty_query_is_rejected_without_running() {
+        let fake = FakeRunner::new(Ok(CommandOutput {
+            status_code: Some(0),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        }));
+        let res = search("   ", &fake);
+        assert!(
+            matches!(res, Err(YtDlpError::EmptyQuery)),
+            "consulta vacía debe fallar: {res:?}"
+        );
+        assert_eq!(fake.calls().len(), 0, "no se invoca yt-dlp sin consulta");
+    }
+
+    #[test]
+    fn test_best_match_picks_candidate_by_tokens_and_duration() {
+        let candidates = vec![
+            search_candidate(
+                "Rick Astley - Never Gonna Give You Up (Official Video)",
+                "https://www.youtube.com/watch?v=a",
+                Some(213.0),
+            ),
+            search_candidate(
+                "Totally Different Song",
+                "https://www.youtube.com/watch?v=b",
+                Some(210.0),
+            ),
+            search_candidate(
+                "Never Gonna Give You Up but it's a 10 hour loop",
+                "https://www.youtube.com/watch?v=c",
+                Some(36000.0),
+            ),
+        ];
+        let got = best_match(
+            &["Rick Astley".to_string()],
+            "Never Gonna Give You Up",
+            Some(213.0),
+            &candidates,
+        );
+        assert_eq!(
+            got.map(|c| c.webpage_url.as_str()),
+            Some("https://www.youtube.com/watch?v=a")
+        );
+    }
+
+    #[test]
+    fn test_best_match_returns_none_when_nothing_close() {
+        let candidates = vec![
+            search_candidate(
+                "Completely Unrelated Tune",
+                "https://www.youtube.com/watch?v=x",
+                Some(200.0),
+            ),
+            search_candidate(
+                "Another Different Song",
+                "https://www.youtube.com/watch?v=y",
+                Some(180.0),
+            ),
+        ];
+        let got = best_match(
+            &["Rick Astley".to_string()],
+            "Never Gonna Give You Up",
+            Some(213.0),
+            &candidates,
+        );
+        assert!(got.is_none(), "no debe elegir nada lejano: {got:?}");
+    }
+
+    #[test]
+    fn test_best_match_rejects_duration_outside_tolerance() {
+        let candidates = vec![search_candidate(
+            "Rick Astley Never Gonna Give You Up",
+            "https://www.youtube.com/watch?v=a",
+            Some(999.0),
+        )];
+        let got = best_match(
+            &["Rick Astley".to_string()],
+            "Never Gonna Give You Up",
+            Some(213.0),
+            &candidates,
+        );
+        assert!(
+            got.is_none(),
+            "una duración fuera de tolerancia debe descartar el candidato: {got:?}"
+        );
+    }
+
+    #[test]
+    fn test_cache_round_trip() {
+        let dir = std::env::temp_dir().join(format!(
+            "mp3tui_ytdlp_cache_rt_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join(CACHE_FILE_NAME);
+
+        let mut cache = ResolveCache::at_path(path.clone());
+        assert_eq!(cache.get("spotify:track:abc"), None);
+        assert!(
+            !path.exists(),
+            "la caché no debe tocar el disco antes del primer guardado"
+        );
+
+        cache
+            .put("spotify:track:abc", "https://www.youtube.com/watch?v=abc")
+            .expect("primer put");
+        cache
+            .put("spotify:track:def", "https://www.youtube.com/watch?v=def")
+            .expect("segundo put");
+        assert_eq!(cache.len(), 2);
+        assert!(path.exists(), "put debe persistir la caché");
+
+        let mut reloaded = ResolveCache::at_path(path.clone());
+        assert_eq!(
+            reloaded.get("spotify:track:abc"),
+            Some("https://www.youtube.com/watch?v=abc")
+        );
+        assert_eq!(
+            reloaded.get("spotify:track:def"),
+            Some("https://www.youtube.com/watch?v=def")
+        );
+        assert_eq!(reloaded.get("spotify:track:zzz"), None);
+        assert_eq!(reloaded.len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_cache_corrupt_file_is_ignored() {
+        let dir = std::env::temp_dir().join(format!(
+            "mp3tui_ytdlp_cache_corrupt_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(CACHE_FILE_NAME);
+        std::fs::write(&path, "no es [[[ toml").unwrap();
+
+        let mut cache = ResolveCache::at_path(path.clone());
+        assert_eq!(cache.len(), 0, "una caché corrupta se ignora y queda vacía");
+        assert_eq!(cache.get("spotify:track:abc"), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
