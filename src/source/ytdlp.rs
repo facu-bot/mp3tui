@@ -591,7 +591,10 @@ fn coverage(query: &[String], candidate: &[String]) -> f64 {
     if query.is_empty() {
         return 0.0;
     }
-    let hits = query.iter().filter(|token| candidate.contains(token)).count();
+    let hits = query
+        .iter()
+        .filter(|token| candidate.contains(token))
+        .count();
     hits as f64 / query.len() as f64
 }
 
@@ -1199,12 +1202,13 @@ mod tests {
         // El guard sigue siendo para URLs reales: la pseudo-URL de búsqueda no
         // debe pasar por él, pero una URL real sí.
         assert!(!is_valid_http_url("ytsearch5:never gonna give you up"));
-        assert!(is_valid_http_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ"));
+        assert!(is_valid_http_url(
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+        ));
 
         let fake = FakeRunner::new(Ok(CommandOutput {
             status_code: Some(0),
-            stdout:
-                b"Never Gonna Give You Up\nhttps://www.youtube.com/watch?v=x\n213\n".to_vec(),
+            stdout: b"Never Gonna Give You Up\nhttps://www.youtube.com/watch?v=x\n213\n".to_vec(),
             stderr: Vec::new(),
         }));
         let res = search("never gonna give you up", &fake);
@@ -1219,8 +1223,7 @@ mod tests {
     fn test_search_builds_exact_ytsearch_args() {
         let fake = FakeRunner::new(Ok(CommandOutput {
             status_code: Some(0),
-            stdout:
-                b"Never Gonna Give You Up\nhttps://www.youtube.com/watch?v=x\n213\n".to_vec(),
+            stdout: b"Never Gonna Give You Up\nhttps://www.youtube.com/watch?v=x\n213\n".to_vec(),
             stderr: Vec::new(),
         }));
         let _ = search("never gonna give you up", &fake).expect("búsqueda válida");
@@ -1355,10 +1358,8 @@ mod tests {
 
     #[test]
     fn test_cache_round_trip() {
-        let dir = std::env::temp_dir().join(format!(
-            "mp3tui_ytdlp_cache_rt_{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("mp3tui_ytdlp_cache_rt_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join(CACHE_FILE_NAME);
 
@@ -1395,10 +1396,8 @@ mod tests {
 
     #[test]
     fn test_cache_corrupt_file_is_ignored() {
-        let dir = std::env::temp_dir().join(format!(
-            "mp3tui_ytdlp_cache_corrupt_{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("mp3tui_ytdlp_cache_corrupt_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join(CACHE_FILE_NAME);
