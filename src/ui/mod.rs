@@ -32,6 +32,9 @@ use crate::runtime;
 use crate::visualizer::{NUM_BANDS, SpectrumAnalyzer};
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+/// Espera de `event::poll` con la app ociosa: nada que animar ni trabajo en
+/// vuelo, así que solo hay que despertar para atender teclas.
+const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 const VOLUME_STEP: f32 = 0.05;
 
@@ -321,6 +324,14 @@ struct App {
     spotify_search_id: u64,
     /// Árbol de playlists de Spotify (columna central de la vista de lista).
     playlist_tree: PlaylistTree,
+    /// Hay algo nuevo que mostrar desde el último dibujo (input, mensaje de un
+    /// hilo, cambio de estado). Con la app ociosa solo se redibuja si está en
+    /// `true`.
+    dirty: bool,
+    /// El loop estaba en modo fluido (`is_fast`) en la vuelta anterior: al
+    /// pasar a ocioso se dibuja una vez más para no dejar congelado un frame
+    /// intermedio (barras cayendo, aviso de salida que vence, spinner).
+    was_fast: bool,
     /// El foco de la vista de lista está en el árbol de playlists (si no,
     /// `queue_panel` elige entre la cola y los archivos locales).
     tree_focus: bool,
@@ -552,6 +563,8 @@ pub fn run(engine: &mut AudioEngine, start: StartMode) -> io::Result<()> {
         spotify_search_rx: None,
         spotify_search_id: 0,
         playlist_tree: PlaylistTree::new(),
+        dirty: true,
+        was_fast: false,
         tree_focus: false,
         history_modal: None,
         replace_queue_req: None,
@@ -600,6 +613,7 @@ fn event_loop(tui: &mut Tui, app: &mut App, engine: &mut AudioEngine) -> io::Res
         let playback_error = engine.take_error();
         if let Some(err) = &playback_error {
             app.error = Some(err.to_string());
+            app.dirty = true;
         }
 
         // La transición Playing → Ended es el fin natural de la pista: ahí
@@ -609,6 +623,9 @@ fn event_loop(tui: &mut Tui, app: &mut App, engine: &mut AudioEngine) -> io::Res
             engine.had_playback_error() || playback_error.is_some() || app.ytdlp_failed;
         let snapshot = EngineSnapshot::from_engine(engine, playback_failed);
         app.status = apply_engine_snapshot(app, snapshot);
+        if app.status != previous_status {
+            app.dirty = true;
+        }
         if playback_error.is_none()
             && previous_status == Status::Playing
             && app.status == Status::Ended
@@ -619,6 +636,7 @@ fn event_loop(tui: &mut Tui, app: &mut App, engine: &mut AudioEngine) -> io::Res
         // mostrarlo; no corta la reproducción.
         if let Some(err) = engine.take_seek_error() {
             app.error = Some(err.to_string());
+            app.dirty = true;
         }
         poll_scan(app);
 
@@ -627,11 +645,13 @@ fn event_loop(tui: &mut Tui, app: &mut App, engine: &mut AudioEngine) -> io::Res
         if let Some(rx) = &app.playlist_rx {
             match rx.try_recv() {
                 Ok((req_id, _orig_playlist_url, result)) => {
+                    app.dirty = true;
                     app.playlist_rx = None;
                     handle_playlist_result(app, req_id, result, &mut spawn_ytdlp_resolution);
                 }
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => {
+                    app.dirty = true;
                     app.playlist_rx = None;
                 }
             }
@@ -644,6 +664,7 @@ fn event_loop(tui: &mut Tui, app: &mut App, engine: &mut AudioEngine) -> io::Res
         if let Some(rx) = &app.ytdlp_rx {
             match rx.try_recv() {
                 Ok((req_id, orig_url, result)) => {
+                    app.dirty = true;
                     app.ytdlp_rx = None;
                     // Historia: la URL original que se guarda es la de la
                     // sesión actual (`current_url`), que para la primera de
@@ -668,53 +689,115 @@ fn event_loop(tui: &mut Tui, app: &mut App, engine: &mut AudioEngine) -> io::Res
                 }
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => {
+                    app.dirty = true;
                     app.ytdlp_rx = None;
                 }
             }
         }
 
-        // Lock corto: solo copiar muestras del tap; la FFT corre después, sin lock.
-        {
+        // Redibujo bajo demanda: con la app ociosa (nada suena, nada en vuelo,
+        // sin input) no se dibuja ni se analiza audio; `event::poll` espera
+        // largo y el CPU baja a casi cero. Con algo que animar sigue a
+        // `FRAME_INTERVAL`.
+        let fast = is_fast(app, Instant::now());
+        if take_redraw(app, fast) {
+            // Lock corto: solo copiar muestras del tap; la FFT corre después,
+            // sin lock. Un lock envenenado (el hilo de audio murió con él
+            // tomado) saltea el ingest de este frame en vez de tirar la UI.
             let tap = engine.visualizer();
-            let mut tap = tap.lock().unwrap();
-            app.analyzer.ingest(&mut tap);
+            with_tap(&tap, |tap| app.analyzer.ingest(tap));
+            app.analyzer.analyze();
+            // Bailarina (modo `miku`): la pose avanza por frame según la
+            // energía de graves (o por timer en pausa).
+            app.analyzer.tick_dance(app.status == Status::Playing);
+            // Reloj del render y franja «Próxima canción»: se actualizan por
+            // frame para el marquee y para no calcular el próximo en el draw.
+            app.ui_frame = app.ui_frame.wrapping_add(1);
+            refresh_next_up(app);
+
+            tui.terminal.draw(|frame| render(frame, app, engine))?;
         }
-        app.analyzer.analyze();
-        // Bailarina (modo `miku`): la pose avanza por frame según la energía
-        // de graves (o por timer en pausa).
-        app.analyzer.tick_dance(app.status == Status::Playing);
-        // Reloj del render y franja «Próxima canción»: se actualizan por
-        // frame para el marquee y para no calcular el próximo en el draw.
-        app.ui_frame = app.ui_frame.wrapping_add(1);
-        refresh_next_up(app);
 
-        tui.terminal.draw(|frame| render(frame, app, engine))?;
-
-        if !event::poll(FRAME_INTERVAL)? {
+        let timeout = if fast {
+            FRAME_INTERVAL
+        } else {
+            IDLE_POLL_INTERVAL
+        };
+        if !event::poll(timeout)? {
             continue;
         }
 
-        match event::read()? {
-            Event::Key(key) if key.kind != KeyEventKind::Release => {
-                handle_key(key, app, engine);
-                if app.should_quit {
-                    break;
-                }
-            }
-            Event::Mouse(mouse) => handle_mouse(mouse, app, engine),
-            Event::Paste(pasted) if app.url_input.is_some() => {
-                if let Some(buf) = app.url_input.as_mut() {
-                    handle_prompt_paste(buf, &pasted);
-                }
-            }
-            Event::Paste(pasted) if app.spotify_search.is_some() => {
-                paste_into_spotify_search(app, &pasted);
-            }
-            _ => {}
+        handle_terminal_event(event::read()?, app, engine);
+        if app.should_quit {
+            break;
         }
     }
 
     Ok(())
+}
+
+/// Atiende un evento de la terminal. Cualquiera (tecla, mouse, pegado, resize,
+/// foco) deja la pantalla sucia: el próximo ciclo la redibuja.
+fn handle_terminal_event(event: Event, app: &mut App, engine: &mut AudioEngine) {
+    app.dirty = true;
+    match event {
+        Event::Key(key) if key.kind != KeyEventKind::Release => handle_key(key, app, engine),
+        Event::Mouse(mouse) => handle_mouse(mouse, app, engine),
+        Event::Paste(pasted) if app.url_input.is_some() => {
+            if let Some(buf) = app.url_input.as_mut() {
+                handle_prompt_paste(buf, &pasted);
+            }
+        }
+        Event::Paste(pasted) if app.spotify_search.is_some() => {
+            paste_into_spotify_search(app, &pasted);
+        }
+        _ => {}
+    }
+}
+
+/// ¿Hay algo que animar o trabajo en vuelo? Entonces el loop va a
+/// `FRAME_INTERVAL`; si no, está ocioso y solo dibuja cuando algo cambió.
+///
+/// Anima: reproduciendo (progreso, visualizador, baile `miku` y marquee de
+/// «Próxima canción»), resolviendo o conectando, cualquier receiver pendiente
+/// (resolución, listado, búsqueda, escaneo, árbol de playlists), un arrastre
+/// del mouse, el aviso de salida en cuenta regresiva y las barras mientras
+/// terminan de caer. En pausa el baile y el marquee quedan quietos.
+fn is_fast(app: &App, now: Instant) -> bool {
+    matches!(
+        app.status,
+        Status::Playing | Status::Resolving | Status::Connecting
+    ) || app.ytdlp_rx.is_some()
+        || app.playlist_rx.is_some()
+        || app.spotify_search_rx.is_some()
+        || app.scan_rx.is_some()
+        || app.playlist_tree.is_loading()
+        || app.drag.is_some()
+        || app.quit_guard.is_armed(now)
+        || app.analyzer.is_settling()
+}
+
+/// Decide si esta vuelta dibuja: sucio, modo fluido, o recién salido del modo
+/// fluido (un último frame con el estado final). Limpia `dirty` y recuerda el
+/// modo para la próxima.
+fn take_redraw(app: &mut App, fast: bool) -> bool {
+    let draw = app.dirty || fast || app.was_fast;
+    app.dirty = false;
+    app.was_fast = fast;
+    draw
+}
+
+/// Corre `f` con el tap de audio bajo lock. Devuelve `false` (sin llamar a
+/// `f`) si el lock está envenenado: sin `unwrap`, la UI no se cae con el hilo
+/// de audio.
+fn with_tap<T>(tap: &std::sync::Mutex<T>, f: impl FnOnce(&mut T)) -> bool {
+    match tap.lock() {
+        Ok(mut guard) => {
+            f(&mut guard);
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -943,6 +1026,7 @@ fn poll_scan(app: &mut App) {
     match result {
         None | Some(Err(TryRecvError::Empty)) => {}
         Some(Ok(playlist)) => {
+            app.dirty = true;
             app.library = Some(playlist);
             app.scan_rx = None;
             // Reaplica filtro y, si había shuffle activo, regenera el orden
@@ -952,6 +1036,7 @@ fn poll_scan(app: &mut App) {
         Some(Err(TryRecvError::Disconnected)) => {
             // El thread murió sin entregar: biblioteca vacía para no dejar la
             // UI en "Escaneando…" para siempre.
+            app.dirty = true;
             app.library = Some(Playlist::new());
             app.scan_rx = None;
             refresh_view(app);
@@ -2180,6 +2265,176 @@ mod tests {
         poll_scan(&mut app);
         assert_eq!(app.library.as_ref().map(Playlist::len), Some(1));
         assert!(app.scan_rx.is_none());
+    }
+
+    // --- redibujo bajo demanda ---
+
+    #[test]
+    fn an_idle_app_is_not_fast_and_each_kind_of_pending_work_makes_it_fast() {
+        let now = Instant::now();
+        let mut app = test_app();
+        assert!(!is_fast(&app, now), "ociosa: nada que animar");
+
+        for status in [Status::Playing, Status::Resolving, Status::Connecting] {
+            app.status = status;
+            assert!(is_fast(&app, now), "{status:?}");
+        }
+        for status in [Status::Paused, Status::Ended, Status::Stopped] {
+            app.status = status;
+            assert!(!is_fast(&app, now), "{status:?} no anima");
+        }
+
+        let pending = |set: fn(&mut App)| {
+            let mut app = test_app();
+            set(&mut app);
+            is_fast(&app, now)
+        };
+        assert!(pending(|a| a.ytdlp_rx = Some(mpsc::channel().1)), "ytdlp_rx");
+        assert!(pending(|a| a.playlist_rx = Some(mpsc::channel().1)), "playlist_rx");
+        assert!(
+            pending(|a| a.spotify_search_rx = Some(mpsc::channel().1)),
+            "spotify_search_rx"
+        );
+        assert!(pending(|a| a.scan_rx = Some(mpsc::channel().1)), "scan_rx");
+        assert!(
+            pending(|a| a.playlist_tree.load = TreeLoad::Loading),
+            "playlists cargando"
+        );
+        assert!(
+            pending(|a| a.drag = Some(Drag::Volume)),
+            "arrastre en curso"
+        );
+        assert!(
+            pending(|a| {
+                a.quit_guard.on_quit_key(Instant::now());
+            }),
+            "aviso de salida en cuenta regresiva"
+        );
+    }
+
+    #[test]
+    fn tracks_loading_in_the_tree_and_a_settling_visualizer_keep_the_loop_fast() {
+        let now = Instant::now();
+        let mut app = test_app();
+        app.playlist_tree.load = TreeLoad::Ready;
+        app.playlist_tree.playlists = vec![TreePlaylist {
+            id: "p1".into(),
+            name: "Rock".into(),
+            detail: None,
+            public: None,
+            collaborative: false,
+            expanded: true,
+            tracks: TrackState::Loading,
+        }];
+        assert!(is_fast(&app, now), "canciones en vuelo");
+        app.playlist_tree.playlists[0].tracks = TrackState::NotLoaded;
+        assert!(!is_fast(&app, now));
+    }
+
+    #[test]
+    fn the_quit_warning_stops_being_fast_once_the_window_expires() {
+        let mut app = test_app();
+        let t0 = Instant::now();
+        app.quit_guard.on_quit_key(t0);
+        assert!(is_fast(&app, t0 + Duration::from_millis(500)));
+        assert!(!is_fast(&app, t0 + QUIT_CONFIRM_WINDOW + Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn dirty_is_consumed_by_a_redraw_and_a_fast_to_idle_transition_draws_once_more() {
+        let mut app = test_app();
+        assert!(app.dirty, "el primer frame siempre se dibuja");
+        assert!(take_redraw(&mut app, false));
+        assert!(!app.dirty, "dibujar limpia la bandera");
+        assert!(!take_redraw(&mut app, false), "ocioso y limpio: no dibuja");
+        assert!(!take_redraw(&mut app, false));
+
+        app.dirty = true;
+        assert!(take_redraw(&mut app, false));
+        assert!(!take_redraw(&mut app, false));
+
+        // Fluido: dibuja en cada vuelta aunque no esté sucio.
+        assert!(take_redraw(&mut app, true));
+        assert!(take_redraw(&mut app, true));
+        // Al volver a ocioso: un último dibujo (estado final) y se calla.
+        assert!(take_redraw(&mut app, false));
+        assert!(!take_redraw(&mut app, false));
+    }
+
+    #[test]
+    fn background_messages_mark_the_screen_dirty() {
+        // Árbol de playlists.
+        let mut app = test_app();
+        app.dirty = false;
+        poll_playlist_tree(&mut app);
+        assert!(!app.dirty, "sin mensajes no hay nada que mostrar");
+        // El hilo (simulado) deja su resultado en el channel del árbol.
+        focus_playlist_tree_with(&mut app, |generation, tx| {
+            tx.send((generation, TreePayload::Playlists(Ok(Vec::new())))).unwrap();
+        });
+        app.dirty = false;
+        poll_playlist_tree(&mut app);
+        assert!(app.dirty, "el árbol consumió un mensaje");
+
+        // Búsqueda de Spotify.
+        let mut app = test_app();
+        app.dirty = false;
+        let (tx, rx) = mpsc::channel();
+        app.spotify_search_rx = Some(rx);
+        poll_spotify_search(&mut app);
+        assert!(!app.dirty, "canal vacío");
+        tx.send((app.spotify_search_id, "q".into(), Ok(Default::default()))).unwrap();
+        poll_spotify_search(&mut app);
+        assert!(app.dirty);
+
+        // Escaneo de la biblioteca.
+        let mut app = test_app();
+        app.dirty = false;
+        let (tx, rx) = mpsc::channel();
+        app.scan_rx = Some(rx);
+        poll_scan(&mut app);
+        assert!(!app.dirty);
+        tx.send(crate::playlist::from_tracks_for_test(vec![track_named("a")])).unwrap();
+        poll_scan(&mut app);
+        assert!(app.dirty);
+    }
+
+    #[test]
+    fn every_terminal_event_marks_the_screen_dirty() {
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
+        let mut app = test_app();
+        for event in [
+            Event::Resize(80, 24),
+            Event::Key(theme_menu_key(KeyCode::Down)),
+            Event::Paste("hola".into()),
+            Event::FocusGained,
+        ] {
+            app.dirty = false;
+            handle_terminal_event(event, &mut app, &mut engine);
+            assert!(app.dirty);
+        }
+    }
+
+    #[test]
+    fn a_poisoned_tap_lock_is_skipped_instead_of_panicking() {
+        let tap = std::sync::Arc::new(std::sync::Mutex::new(1));
+        let poisoner = std::sync::Arc::clone(&tap);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("el hilo de audio murió con el lock tomado");
+        })
+        .join();
+        assert!(tap.is_poisoned());
+
+        let mut seen = 0;
+        assert!(!with_tap(&tap, |value| seen = *value), "se saltea el ingest");
+        assert_eq!(seen, 0);
+
+        let healthy = std::sync::Mutex::new(7);
+        assert!(with_tap(&healthy, |value| seen = *value));
+        assert_eq!(seen, 7);
     }
 
     #[test]

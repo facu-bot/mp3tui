@@ -195,11 +195,13 @@ pub(super) fn poll_spotify_search(app: &mut App) {
     };
     match rx.try_recv() {
         Ok((request_id, _query, result)) => {
+            app.dirty = true;
             app.spotify_search_rx = None;
             handle_spotify_search_result(app, request_id, result);
         }
         Err(TryRecvError::Empty) => {}
         Err(TryRecvError::Disconnected) => {
+            app.dirty = true;
             app.spotify_search_rx = None;
             if let Some(search) = app.spotify_search.as_mut()
                 && search.phase == SearchPhase::Searching

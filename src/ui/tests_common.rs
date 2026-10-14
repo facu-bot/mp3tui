@@ -71,6 +71,8 @@ pub(crate) fn test_app() -> App {
         spotify_search_rx: None,
         spotify_search_id: 0,
         playlist_tree: PlaylistTree::new(),
+        dirty: true,
+        was_fast: false,
         tree_focus: false,
         history_modal: None,
         replace_queue_req: None,

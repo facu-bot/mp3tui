@@ -292,6 +292,16 @@ impl SpectrumAnalyzer {
         self.update_wave_gain();
     }
 
+    /// ¿Queda algo moviéndose? Barras, VU o su pico todavía por encima de un
+    /// umbral invisible: mientras sea `true` la UI sigue redibujando para que
+    /// la caída termine en vez de congelarse a mitad de camino.
+    pub fn is_settling(&self) -> bool {
+        const VISIBLE: f32 = 0.002;
+        self.vu > VISIBLE
+            || self.vu_peak > VISIBLE
+            || self.bands.iter().any(|band| *band > VISIBLE)
+    }
+
     /// Magnitudes por banda normalizadas en 0.0..=1.0.
     pub fn bands(&self) -> &[f32; NUM_BANDS] {
         &self.bands
@@ -553,6 +563,24 @@ mod tests {
             let t = i as f32 / 44_100.0;
             analyzer.ring[i] = amplitude * (std::f32::consts::TAU * freq * t).sin();
         }
+    }
+
+    #[test]
+    fn settling_is_true_while_the_bars_are_still_falling_and_false_once_silent() {
+        let mut analyzer = SpectrumAnalyzer::new();
+        assert!(!analyzer.is_settling(), "recién creado no anima nada");
+        analyzer.bands[0] = 0.8;
+        assert!(analyzer.is_settling(), "una barra arriba sigue cayendo");
+        // Sin muestras nuevas cada `analyze` las hace decaer hasta apagarse.
+        for _ in 0..2_000 {
+            analyzer.analyze();
+        }
+        assert!(!analyzer.is_settling(), "ya cayó todo: no hace falta redibujar");
+        analyzer.vu = 0.5;
+        assert!(analyzer.is_settling(), "el VU también cuenta");
+        analyzer.vu = 0.0;
+        analyzer.vu_peak = 0.5;
+        assert!(analyzer.is_settling(), "y su pico");
     }
 
     #[test]

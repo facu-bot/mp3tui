@@ -136,6 +136,15 @@ impl PlaylistTree {
         rows
     }
 
+    /// ¿Hay un pedido de red en vuelo? (lista de playlists o canciones).
+    pub(super) fn is_loading(&self) -> bool {
+        self.load == TreeLoad::Loading
+            || self
+                .playlists
+                .iter()
+                .any(|playlist| playlist.tracks == TrackState::Loading)
+    }
+
     /// Fila bajo la selección.
     pub(super) fn selected_row(&self) -> Option<TreeRow> {
         self.rows().get(self.selected).copied()
@@ -339,6 +348,7 @@ fn nothing_playing(app: &App) -> bool {
 /// cada frame).
 pub(super) fn poll_playlist_tree(app: &mut App) {
     while let Ok((generation, payload)) = app.playlist_tree.rx.try_recv() {
+        app.dirty = true;
         handle_tree_result(app, generation, payload);
     }
 }
