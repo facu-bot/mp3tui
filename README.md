@@ -27,7 +27,9 @@ Se maneja por teclado.
 
 - [Rust](https://rustup.rs) (toolchain estable) instalado.
 - Un dispositivo de audio disponible.
-- `yt-dlp` si querés reproducir links de YouTube.
+- `yt-dlp` si querés reproducir links de YouTube o pistas de Spotify.
+- Una app de Spotify registrada por vos si querés usar links de Spotify (ver
+  [Spotify](#spotify)).
 
 ## Clonar y correr
 
@@ -38,6 +40,7 @@ cd mp3tui
 cargo run "cancion.mp3"        # archivo local
 cargo run "C:/Musica"          # carpeta con la biblioteca
 cargo run "https://www.youtube.com/watch?v=dQw4w9WgXcQ"   # YouTube (requiere yt-dlp)
+cargo run "https://open.spotify.com/track/..."             # Spotify (autorizá antes)
 cargo run                      # biblioteca por defecto
 ```
 
@@ -50,6 +53,83 @@ sistema:
 - **Linux / macOS:** el gestor de paquetes de tu distribución o `pip install yt-dlp`
 
 Si no está instalado, la app avisa al intentar reproducir una URL de YouTube.
+
+## Spotify
+
+Podés pegar links de Spotify (pistas, playlists y álbumes) y mp3tui los
+reproduce. **El audio no sale de Spotify**: la Web API solo entrega metadatos
+(título, artistas, duración) y cada canción se busca en YouTube con `yt-dlp`,
+igual que cualquier link de YouTube. Por eso **no hace falta Spotify Premium ni
+cookies de Spotify**; sí necesitás `yt-dlp` instalado.
+
+### Registrar una app propia
+
+mp3tui no trae un `client_id` de fábrica: registrás tu propia app en el
+dashboard de Spotify y usás ese identificador. Es gratis y se hace una sola vez.
+
+1. Entrá a <https://developer.spotify.com/dashboard> con tu cuenta y creá una
+   app (**Create app**). El nombre y la descripción son para vos.
+2. En **Redirect URIs** cargá una dirección **loopback con IP literal**, por
+   ejemplo:
+
+   ```
+   http://127.0.0.1:8080
+   ```
+
+   Tiene que ser `127.0.0.1` (la IP literal, no `localhost`) y el puerto es
+   libre: mp3tui abre uno efímero en cada login, así que no hace falta que
+   coincida con el que pusiste vos.
+3. Si te pregunta qué API vas a usar, marcá **Web API** y guardá.
+4. En **Settings** de la app copiá el **Client ID**. El **Client Secret** no se
+   usa: mp3tui autentica con PKCE, que es para clientes públicos.
+
+Después pasale ese `client_id` a mp3tui de una de estas dos formas (la variable
+de entorno gana):
+
+- Variable de entorno: `MP3TUI_SPOTIFY_CLIENT_ID`.
+- `config.toml`, en el directorio de config (`~/.config/mp3tui/` en Linux o
+  `%APPDATA%\mp3tui\` en Windows):
+
+  ```toml
+  [spotify]
+  client_id = "tu-client-id"
+  ```
+
+### Autorizar
+
+```sh
+mp3tui --spotify-login
+```
+
+El comando imprime la URL de autorización y trata de abrir el navegador; el
+redirect vuelve a `127.0.0.1` y la app espera hasta 5 minutos. No abre la TUI:
+cuando termina, sale. Los permisos que pide son para leer tus playlists
+(privadas y colaborativas), tu biblioteca y tu perfil.
+
+Después podés reproducir, como argumento (`mp3tui "https://open.spotify.com/..."`)
+o desde el prompt de URL de la app:
+
+- Pistas: `https://open.spotify.com/track/<id>` o `spotify:track:<id>`.
+- Playlists: `https://open.spotify.com/playlist/<id>` o `spotify:playlist:<id>`.
+- Álbumes: `https://open.spotify.com/album/<id>` o `spotify:album:<id>`.
+
+Cada canción se resuelve recién cuando le toca sonar: mp3tui busca
+`"Artistas - Título"` en YouTube, valida que la duración coincida y guarda el
+resultado en caché para no repetir la búsqueda. Si no encuentra un candidato
+que coincida (o no está `yt-dlp`), el ítem se saltea con el aviso de siempre.
+
+### Sesión y token
+
+El token se guarda en el directorio de config (`spotify.toml`) con permisos
+`0600` en Linux y macOS. El `access_token` dura 1 hora y mp3tui lo renueva solo
+con el `refresh_token`; ese sí **vence a los 6 meses**, y ahí hay que volver a
+correr `mp3tui --spotify-login`. La sesión es revocable en cualquier momento
+desde tu cuenta de Spotify (**Cuenta → Apps con acceso**, quitale el acceso a
+mp3tui); si la revocás, la sesión local queda inservible y hay que autorizar de
+nuevo.
+
+Si te falta el `client_id` o nunca autorizaste, la app no arranca la
+reproducción y te dice qué hacer.
 
 ## Limitaciones y errores comunes
 
@@ -138,6 +218,7 @@ src/
 │   └── tests_common.rs     #   helpers de los tests
 ├── source/                 # orígenes de audio
 │   ├── http_stream.rs      #   streaming por HTTP con rangos
+│   ├── spotify/            #   auth PKCE, metadatos y resolución
 │   └── ytdlp.rs            #   resolución de links (YouTube, etc.)
 ├── visualizer/             # analizador de espectro y arte del modo miku
 ├── audio/                  # motor de audio

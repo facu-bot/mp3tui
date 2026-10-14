@@ -15,12 +15,24 @@ use std::process::ExitCode;
 #[derive(Parser, Debug)]
 #[command(name = "mp3tui", about = "Reproductor MP3 visual para terminal")]
 struct Cli {
-    /// Archivo de audio, carpeta con la biblioteca o URL HTTP/HTTPS a reproducir.
+    /// Archivo de audio, carpeta con la biblioteca o URL (HTTP, YouTube o
+    /// Spotify) a reproducir.
     #[arg(value_name = "TARGET")]
     target: Option<String>,
 
     /// Autoriza mp3tui en Spotify (PKCE) y sale; no abre la TUI.
-    #[arg(long)]
+    #[arg(
+        long,
+        long_help = "Autoriza mp3tui en Spotify con Authorization Code + PKCE y sale sin abrir la \
+                     TUI.\n\n\
+                     Necesitás el client_id de una app tuya: registrala en \
+                     https://developer.spotify.com/dashboard con un redirect URI loopback \
+                     (http://127.0.0.1:<puerto>) y pasá el Client ID en la variable \
+                     MP3TUI_SPOTIFY_CLIENT_ID o en config.toml: [spotify] client_id = \"...\". \
+                     La sesión dura 6 meses; después hay que volver a autorizar. No hace falta \
+                     Client Secret (PKCE) ni Spotify Premium: la Web API solo aporta metadatos \
+                     y el audio lo resuelve yt-dlp en YouTube."
+    )]
     spotify_login: bool,
 }
 
