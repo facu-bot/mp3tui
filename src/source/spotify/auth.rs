@@ -38,7 +38,10 @@ pub const REFRESH_MARGIN_SECS: u64 = 60;
 /// Archivo de tokens dentro del config dir de mp3tui.
 const TOKENS_FILE: &str = "spotify.toml";
 /// Ruta que atiende el listener loopback.
-const CALLBACK_PATH: &str = "/callback";
+/// Ruta del redirect. Es la raíz (`http://127.0.0.1:<puerto>`) para que
+/// coincida con la Redirect URI que el usuario registra: Spotify exige
+/// coincidencia exacta y en loopback solo permite que varíe el puerto.
+const CALLBACK_PATH: &str = "";
 /// Espera por defecto del redirect antes de rendirse.
 pub const DEFAULT_LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -221,7 +224,7 @@ fn parse_query(query: &str) -> Vec<(String, String)> {
 }
 
 /// Extrae `code` de un redirect validando `state`. Acepta la URL completa
-/// pegada a mano, el request-target (`/callback?code=...`) o solo la query.
+/// pegada a mano, el request-target (`/?code=...`) o solo la query.
 pub fn parse_redirect(input: &str, expected_state: &str) -> Result<String, AuthError> {
     let input = input.trim();
     let without_fragment = input.split('#').next().unwrap_or("");
@@ -307,7 +310,7 @@ fn respond(stream: &mut TcpStream, status: &str, body: &str) {
 }
 
 /// Espera el redirect en `listener`: ignora requests a otras rutas, valida
-/// `state` en `/callback`, contesta un HTML mínimo y devuelve el `code`.
+/// `state` en la raíz, contesta un HTML mínimo y devuelve el `code`.
 pub fn wait_for_callback(
     listener: &TcpListener,
     expected_state: &str,
@@ -326,7 +329,9 @@ pub fn wait_for_callback(
                     continue;
                 };
                 let path = target.split('?').next().unwrap_or("");
-                if method != "GET" || path != CALLBACK_PATH {
+                // La Redirect URI es la raíz del loopback: el navegador pide `/`.
+                let is_root = path.is_empty() || path == "/";
+                if method != "GET" || !is_root {
                     respond(&mut stream, "404 Not Found", NOT_FOUND_HTML);
                     continue;
                 }
@@ -1208,7 +1213,7 @@ mod tests {
     fn test_bind_loopback_uses_ephemeral_port_on_127_0_0_1() {
         let (listener, redirect) = bind_loopback().unwrap();
         let port = listener.local_addr().unwrap().port();
-        assert_eq!(redirect, format!("http://127.0.0.1:{port}/callback"));
+        assert_eq!(redirect, format!("http://127.0.0.1:{port}"));
     }
 
     #[test]
@@ -1218,7 +1223,7 @@ mod tests {
         let client = thread::spawn(move || {
             // Una ruta ajena (favicon) se ignora y el flujo sigue esperando.
             let other = http_get(addr, "/favicon.ico");
-            let ok = http_get(addr, "/callback?code=THE-CODE&state=S1");
+            let ok = http_get(addr, "/?code=THE-CODE&state=S1");
             (other, ok)
         });
 
@@ -1239,7 +1244,7 @@ mod tests {
     fn test_wait_for_callback_rejects_wrong_state() {
         let (listener, _) = bind_loopback().unwrap();
         let addr = listener.local_addr().unwrap();
-        let client = thread::spawn(move || http_get(addr, "/callback?code=c&state=ATACANTE"));
+        let client = thread::spawn(move || http_get(addr, "/?code=c&state=ATACANTE"));
 
         let res = wait_for_callback(&listener, "S1", Duration::from_secs(5));
         assert_eq!(res, Err(AuthError::StateMismatch));
