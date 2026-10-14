@@ -41,12 +41,18 @@ pub(super) fn handle_playlist_result(
     }
     match result {
         Ok(entries) if entries.is_empty() => {
+            app.replace_queue_req = None;
             app.status = Status::Stopped;
             app.error = Some(PLAYLIST_EMPTY_MSG.to_string());
             app.ytdlp_failed = true;
-            app.pending_history = None;
         }
         Ok(entries) => {
+            // Volver a poner una playlist del historial REEMPLAZA la cola; el
+            // vaciado espera al listado exitoso para no perderla si falla.
+            if app.replace_queue_req.take() == Some(request_id) {
+                clear_queue(app);
+            }
+            record_collection(app, &entries);
             // Las siguientes van al final de la cola existente, sin
             // tocar el cursor de la cola. Cada una se resuelve recién
             // cuando le toque sonar.
@@ -71,10 +77,10 @@ pub(super) fn handle_playlist_result(
             app.ytdlp_rx = Some(resolve_page(first.page_url.clone(), req_id));
         }
         Err(err) => {
+            app.replace_queue_req = None;
             app.status = Status::Stopped;
             app.error = Some(err.to_string());
             app.ytdlp_failed = true;
-            app.pending_history = None;
         }
     }
 }
@@ -87,8 +93,7 @@ pub(super) fn init_url_playback(app: &mut App, original_url: String, label: Stri
     app.has_player = true;
     app.status = Status::Connecting;
     app.error = None;
-    app.current_url = Some((original_url.clone(), label.clone()));
-    app.pending_history = Some((original_url, label));
+    app.current_url = Some((original_url, label));
 }
 
 fn start_local_playback(app: &mut App, engine: &mut AudioEngine, path: PathBuf) -> bool {
@@ -113,21 +118,6 @@ fn start_local_playback(app: &mut App, engine: &mut AudioEngine, path: PathBuf) 
     }
 }
 
-pub(super) fn record_history_entry(app: &mut App, original_url: &str, label: &str) {
-    let selected_history_url = match app.view.get(app.selected) {
-        Some(ViewItem::History(idx)) => app.history.get(*idx).map(|e| e.url.clone()),
-        _ => None,
-    };
-    let clean_url = crate::history::sanitize_url(original_url);
-    app.history.add(label.to_string(), clean_url);
-    if let Some(path) = &app.history_path
-        && let Err(err) = crate::history::save_to(&app.history, path)
-    {
-        app.error = Some(format!("Error al guardar historial: {err}"));
-    }
-    refresh_view_with_hint(app, selected_history_url.as_deref());
-}
-
 pub(super) fn start_url_playback(
     app: &mut App,
     engine: &mut AudioEngine,
@@ -139,7 +129,6 @@ pub(super) fn start_url_playback(
     if let Err(err) = engine.play_url(&playable_url) {
         app.status = Status::Stopped;
         app.error = Some(err.to_string());
-        app.pending_history = None;
     }
 }
 
@@ -354,12 +343,6 @@ pub(super) fn play_selected(app: &mut App, engine: &mut AudioEngine) {
         return;
     };
     match item {
-        ViewItem::History(hist_idx) => {
-            if let Some(entry) = app.history.get(hist_idx) {
-                let url = entry.url.clone();
-                submit_url_prompt(url, app, engine);
-            }
-        }
         ViewItem::Track(library_index) => {
             let Some(track) = library_get(app, library_index) else {
                 return;
@@ -372,8 +355,7 @@ pub(super) fn play_selected(app: &mut App, engine: &mut AudioEngine) {
 }
 
 /// Encolar: suma el ítem seleccionado de la Biblioteca al final de la cola.
-/// Una pista local va como `QueueItem::Local`; una fila del historial, como
-/// `QueueItem::Url` (se resuelve recién cuando le toque el turno).
+/// Una pista local va como `QueueItem::Local`.
 pub(super) fn enqueue_selected(app: &mut App) {
     let Some(item) = app.view.get(app.selected).copied() else {
         return;
@@ -382,19 +364,6 @@ pub(super) fn enqueue_selected(app: &mut App) {
         ViewItem::Track(library_index) => {
             if let Some(track) = library_get(app, library_index) {
                 app.queue.push(QueueItem::Local(track.clone()));
-            }
-        }
-        ViewItem::History(hist_idx) => {
-            if let Some(entry) = app.history.get(hist_idx) {
-                let title = if entry.title.is_empty() {
-                    entry.url.clone()
-                } else {
-                    entry.title.clone()
-                };
-                app.queue.push(QueueItem::Url {
-                    url: entry.url.clone(),
-                    title,
-                });
             }
         }
     }
@@ -477,13 +446,6 @@ pub(super) fn refresh_next_up(app: &mut App) {
         Some(ViewItem::Track(library_index)) => {
             library_get(app, *library_index).map(|track| track.title.clone())
         }
-        Some(ViewItem::History(history_index)) => app.history.get(*history_index).map(|entry| {
-            if entry.title.is_empty() {
-                entry.url.clone()
-            } else {
-                entry.title.clone()
-            }
-        }),
         None => None,
     };
     app.next_up = Some(label.unwrap_or_default());
@@ -566,9 +528,9 @@ pub(super) fn skip_failed_queue_item(
             QueueAdvance::Step(step) => step,
         };
         if step >= 0 {
-            queue_exhausted_pool_fallback(app, engine, step, &mut replay);
+            queue_exhausted_pool_fallback(app, engine, step);
         } else {
-            queue_exhausted_pool_fallback(app, engine, -1, &mut replay);
+            queue_exhausted_pool_fallback(app, engine, -1);
         }
     }
     // El aviso queda visible aunque haya arrancado el siguiente.
@@ -576,13 +538,12 @@ pub(super) fn skip_failed_queue_item(
 }
 
 /// Fallback de cuando la cola se agotó tras saltar ítems fallidos:
-/// avanza el pool de la biblioteca/historial en `step` (`1` hacia adelante,
+/// avanza el pool de la biblioteca en `step` (`1` hacia adelante,
 /// `-1` hacia atrás). Sin hacer nada si el pool está vacío o no hay destino.
 fn queue_exhausted_pool_fallback(
     app: &mut App,
     engine: &mut AudioEngine,
     step: isize,
-    replay: &mut impl FnMut(&mut App, &mut AudioEngine, UrlReplayRequest),
 ) {
     let pool = pool_positions_in_view(app);
     if pool.is_empty() {
@@ -599,7 +560,7 @@ fn queue_exhausted_pool_fallback(
     ) else {
         return;
     };
-    play_pool_target(app, engine, pool[target_idx], replay);
+    play_pool_target(app, engine, pool[target_idx]);
 }
 
 /// Borra el ítem seleccionado de la Cola y acota la selección al nuevo alto.
@@ -645,10 +606,7 @@ pub(super) fn pool_positions_in_view(app: &mut App) -> Vec<usize> {
         .view
         .iter()
         .enumerate()
-        .filter_map(|(pos, item)| match item {
-            ViewItem::Track(_) => Some(pos),
-            ViewItem::History(_) => Some(pos),
-        })
+        .map(|(pos, _item)| pos)
         .collect();
     if app.shuffle && !pool.is_empty() && app.shuffle_order.len() != pool.len() {
         app.shuffle_order = shuffle_order(pool.len());
@@ -662,14 +620,10 @@ pub(super) fn pool_positions_in_view(app: &mut App) -> Vec<usize> {
 /// cuya URL coincide con la original de `app.current_url` (`None` si esa URL no
 /// está en el historial visible, lo que conserva la caída de antes).
 fn finished_item_pool_index(app: &App, pool: &[usize]) -> Option<usize> {
+    // Una URL ya no está en la vista (el historial de URLs salió de la
+    // biblioteca): cae como antes cuando la URL no estaba en el historial.
     let view_pos = if app.is_url {
-        let original_url = app.current_url.as_ref().map(|(url, _label)| url)?;
-        app.view.iter().position(|item| match item {
-            ViewItem::History(idx) => {
-                app.history.get(*idx).map(|entry| &entry.url) == Some(original_url)
-            }
-            ViewItem::Track(_) => false,
-        })?
+        return None;
     } else {
         current_view_position(app)?
     };
@@ -696,31 +650,10 @@ fn play_view_position(app: &mut App, engine: &mut AudioEngine, target: usize) ->
 }
 
 /// Arranca el objetivo del pool de navegación (el «siguiente» de `n`/`p` o
-/// del fin natural). Para una pista local usa [`play_view_position`]; para
-/// una entrada del historial la re-resuelve por el camino inyectable `replay`
-/// (en producción re-pide la página con yt-dlp y en los tests se captura sin
-/// red). Devuelve false si la posición no es jugable.
-fn play_pool_target(
-    app: &mut App,
-    engine: &mut AudioEngine,
-    target: usize,
-    replay: &mut impl FnMut(&mut App, &mut AudioEngine, UrlReplayRequest),
-) -> bool {
+/// del fin natural) por [`play_view_position`]. Devuelve false si la posición
+/// no es jugable.
+fn play_pool_target(app: &mut App, engine: &mut AudioEngine, target: usize) -> bool {
     match app.view.get(target).copied() {
-        Some(ViewItem::History(hist_idx)) => {
-            if let Some(entry) = app.history.get(hist_idx) {
-                replay(
-                    app,
-                    engine,
-                    UrlReplayRequest {
-                        original_url: entry.url.clone(),
-                    },
-                );
-                true
-            } else {
-                false
-            }
-        }
         Some(ViewItem::Track(_)) => play_view_position(app, engine, target),
         None => false,
     }
@@ -770,7 +703,7 @@ pub(super) fn play_step_with(
     ) else {
         return;
     };
-    play_pool_target(app, engine, pool[target_idx], &mut replay);
+    play_pool_target(app, engine, pool[target_idx]);
 }
 
 pub(super) fn toggle_shuffle(app: &mut App) {
@@ -778,14 +711,7 @@ pub(super) fn toggle_shuffle(app: &mut App) {
     if app.shuffle {
         // El orden vive sobre el pool (pistas + historial), igual que el
         // pool que se usa al navegar / reproducir con el shuffle activo.
-        let count = app
-            .view
-            .iter()
-            .filter(|item| {
-                matches!(item, ViewItem::Track(_)) || matches!(item, ViewItem::History(_))
-            })
-            .count();
-        app.shuffle_order = shuffle_order(count);
+        app.shuffle_order = shuffle_order(app.view.len());
     }
 }
 
@@ -869,7 +795,7 @@ pub(super) fn handle_natural_end_with(
             // por el mismo camino único del pool (`play_pool_target`): la URL
             // se re-resuelve por el seam inyectable `replay`.
             if let Some(&target) = pool.get(target_idx) {
-                play_pool_target(app, engine, target, &mut replay);
+                play_pool_target(app, engine, target);
             }
         }
         NextAction::Stop => {}

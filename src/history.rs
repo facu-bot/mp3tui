@@ -1,28 +1,99 @@
-//! Historial de URLs reproducidas.
+//! Historial de playlists y álbumes de Spotify reproducidos.
 //!
-//! Guarda hasta 20 entradas (título + URL original), ordenadas de la más
-//! reciente a la más antigua. Se persiste en formato TOML en el directorio de
-//! configuración (la misma carpeta que `config.toml`: `%APPDATA%\mp3tui` en
-//! Windows, `~/.config/mp3tui` en Linux/macOS; o el directorio indicado por
-//! `MP3TUI_CONFIG`).
+//! Guarda hasta 20 entradas (id, nombre, cantidad de canciones y los nombres
+//! de las primeras), de la más reciente a la más antigua. Se persiste en
+//! formato TOML en el directorio de configuración (la misma carpeta que
+//! `config.toml`: `%APPDATA%\mp3tui` en Windows, `~/.config/mp3tui` en
+//! Linux/macOS; o el directorio indicado por `MP3TUI_CONFIG`).
+//!
+//! El archivo de versiones anteriores guardaba URLs reproducidas
+//! (`title` + `url`): esa forma se reconoce y se descarta sin avisar de
+//! corrupción, arrancando con el historial vacío.
 
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
 pub const MAX_ENTRIES: usize = 20;
+/// Cuántos nombres de canciones se guardan por entrada.
+pub const SAMPLE_TRACKS: usize = 5;
 pub const HISTORY_FILE_NAME: &str = "history.toml";
+
+/// Qué tipo de colección de Spotify es la entrada.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CollectionKind {
+    Playlist,
+    Album,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryEntry {
-    pub title: String,
-    pub url: String,
+    pub kind: CollectionKind,
+    pub id: String,
+    pub name: String,
+    pub track_count: usize,
+    /// Nombres de las primeras canciones («Artistas - Título»).
+    #[serde(default)]
+    pub sample_tracks: Vec<String>,
+}
+
+impl HistoryEntry {
+    /// Entrada con las primeras [`SAMPLE_TRACKS`] canciones de `track_names`.
+    pub fn new(
+        kind: CollectionKind,
+        id: String,
+        name: String,
+        track_count: usize,
+        track_names: &[String],
+    ) -> Self {
+        Self {
+            kind,
+            id,
+            name,
+            track_count,
+            sample_tracks: track_names.iter().take(SAMPLE_TRACKS).cloned().collect(),
+        }
+    }
+
+    /// Marcador que entiende el flujo de URLs para volver a reproducirla.
+    pub fn marker(&self) -> String {
+        match self.kind {
+            CollectionKind::Playlist => format!("spotify:playlist:{}", self.id),
+            CollectionKind::Album => format!("spotify:album:{}", self.id),
+        }
+    }
+
+    /// «Nombre - N canciones».
+    pub fn title_line(&self) -> String {
+        let count = match self.track_count {
+            1 => "1 canción".to_string(),
+            n => format!("{n} canciones"),
+        };
+        format!("{} - {count}", self.name)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct History {
     #[serde(default)]
     pub entries: Vec<HistoryEntry>,
+}
+
+/// Forma del archivo de versiones anteriores (URLs reproducidas).
+#[derive(Deserialize)]
+struct LegacyHistory {
+    #[serde(default)]
+    #[allow(dead_code)]
+    entries: Vec<LegacyEntry>,
+}
+
+#[derive(Deserialize)]
+struct LegacyEntry {
+    #[allow(dead_code)]
+    title: String,
+    #[allow(dead_code)]
+    url: String,
 }
 
 impl History {
@@ -48,9 +119,12 @@ impl History {
         &self.entries
     }
 
-    pub fn add(&mut self, title: String, url: String) {
-        self.entries.retain(|e| e.url != url);
-        self.entries.insert(0, HistoryEntry { title, url });
+    /// Registra la colección al frente; si ya estaba (mismo tipo e id) la
+    /// refresca en vez de duplicarla.
+    pub fn add(&mut self, entry: HistoryEntry) {
+        self.entries
+            .retain(|e| !(e.kind == entry.kind && e.id == entry.id));
+        self.entries.insert(0, entry);
         if self.entries.len() > MAX_ENTRIES {
             self.entries.truncate(MAX_ENTRIES);
         }
@@ -60,27 +134,16 @@ impl History {
         toml::to_string_pretty(self).map_err(|e| e.to_string())
     }
 
+    /// Parsea el archivo. Un archivo con la forma vieja (URLs) no es un
+    /// error: se descarta y queda el historial vacío.
     pub fn from_toml(content: &str) -> Result<Self, String> {
-        toml::from_str::<Self>(content).map_err(|e| e.to_string())
-    }
-}
-
-pub fn sanitize_url(url: &str) -> String {
-    let (scheme, rest) = if let Some(idx) = url.find("://") {
-        (&url[..idx + 3], &url[idx + 3..])
-    } else {
-        ("", url)
-    };
-
-    let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let authority = &rest[..auth_end];
-    let remainder = &rest[auth_end..];
-
-    if let Some(at_idx) = authority.rfind('@') {
-        let host_port = &authority[at_idx + 1..];
-        format!("{scheme}{host_port}{remainder}")
-    } else {
-        url.to_string()
+        match toml::from_str::<Self>(content) {
+            Ok(history) => Ok(history),
+            Err(err) => match toml::from_str::<LegacyHistory>(content) {
+                Ok(_) => Ok(Self::default()),
+                Err(_) => Err(err.to_string()),
+            },
+        }
     }
 }
 
@@ -161,222 +224,154 @@ pub fn save(history: &History) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_history_add_and_dedup_moves_to_top() {
-        let mut history = History::new();
-        history.add(
-            "Canción 1".to_string(),
-            "https://example.com/1.mp3".to_string(),
-        );
-        history.add(
-            "Canción 2".to_string(),
-            "https://example.com/2.mp3".to_string(),
-        );
-        assert_eq!(history.len(), 2);
-        assert_eq!(history.get(0).unwrap().title, "Canción 2");
+    fn names(n: usize) -> Vec<String> {
+        (1..=n).map(|i| format!("Artista - Tema {i}")).collect()
+    }
 
-        // Re-agregar URL existente: debe refrescar el título y moverlo al inicio
-        history.add(
-            "Canción 1 Nueva".to_string(),
-            "https://example.com/1.mp3".to_string(),
-        );
-        assert_eq!(history.len(), 2, "no debe duplicar la URL existente");
-        assert_eq!(history.get(0).unwrap().title, "Canción 1 Nueva");
-        assert_eq!(history.get(0).unwrap().url, "https://example.com/1.mp3");
-        assert_eq!(history.get(1).unwrap().title, "Canción 2");
+    fn entry(kind: CollectionKind, id: &str, name: &str, count: usize) -> HistoryEntry {
+        HistoryEntry::new(kind, id.to_string(), name.to_string(), count, &names(count))
+    }
+
+    #[test]
+    fn test_entry_keeps_only_the_first_five_track_names() {
+        let e = entry(CollectionKind::Playlist, "p1", "Mix", 12);
+        assert_eq!(e.track_count, 12);
+        assert_eq!(e.sample_tracks, names(5));
+    }
+
+    #[test]
+    fn test_entry_marker_and_title_line() {
+        let p = entry(CollectionKind::Playlist, "p1", "Mix", 3);
+        assert_eq!(p.marker(), "spotify:playlist:p1");
+        assert_eq!(p.title_line(), "Mix - 3 canciones");
+        let a = entry(CollectionKind::Album, "a1", "Disco", 1);
+        assert_eq!(a.marker(), "spotify:album:a1");
+        assert_eq!(a.title_line(), "Disco - 1 canción");
+    }
+
+    #[test]
+    fn test_history_add_dedups_by_kind_and_id_and_moves_to_top() {
+        let mut history = History::new();
+        history.add(entry(CollectionKind::Playlist, "p1", "Uno", 2));
+        history.add(entry(CollectionKind::Playlist, "p2", "Dos", 2));
+        assert_eq!(history.get(0).unwrap().name, "Dos");
+
+        history.add(entry(CollectionKind::Playlist, "p1", "Uno renombrada", 4));
+        assert_eq!(history.len(), 2, "no duplica la misma playlist");
+        assert_eq!(history.get(0).unwrap().name, "Uno renombrada");
+        assert_eq!(history.get(0).unwrap().track_count, 4);
+
+        // Mismo id pero otro tipo: es otra entrada.
+        history.add(entry(CollectionKind::Album, "p1", "Álbum", 2));
+        assert_eq!(history.len(), 3);
     }
 
     #[test]
     fn test_history_trim_to_max_20() {
         let mut history = History::new();
         for i in 0..25 {
-            history.add(
-                format!("Canción {i}"),
-                format!("https://example.com/{i}.mp3"),
-            );
+            history.add(entry(CollectionKind::Playlist, &format!("p{i}"), &format!("L{i}"), 1));
         }
-        assert_eq!(history.len(), 20, "debe acotar a un máximo de 20 entradas");
-        assert_eq!(
-            history.get(0).unwrap().title,
-            "Canción 24",
-            "la más reciente debe estar arriba"
-        );
-        assert_eq!(
-            history.get(19).unwrap().title,
-            "Canción 5",
-            "la más antigua preservada"
-        );
+        assert_eq!(history.len(), MAX_ENTRIES);
+        assert_eq!(history.get(0).unwrap().name, "L24");
+        assert_eq!(history.get(19).unwrap().name, "L5");
     }
 
     #[test]
     fn test_history_toml_round_trip() {
         let mut history = History::new();
-        history.add(
-            "Tema 1".to_string(),
-            "https://example.com/1.mp3".to_string(),
-        );
-        history.add(
-            "Tema 2".to_string(),
-            "https://example.com/2.mp3".to_string(),
-        );
-
-        let toml_str = history
-            .to_toml()
-            .expect("serialización toml debe funcionar");
-        let parsed = History::from_toml(&toml_str).expect("deserialización toml debe funcionar");
-        assert_eq!(history, parsed);
+        history.add(entry(CollectionKind::Album, "a1", "Disco \"raro\"", 7));
+        history.add(entry(CollectionKind::Playlist, "p1", "Mix", 0));
+        let text = history.to_toml().unwrap();
+        assert_eq!(History::from_toml(&text).unwrap(), history);
     }
 
     #[test]
-    fn test_history_corrupt_yields_empty_and_warning() {
-        let corrupt_toml = "[[entries\nurl = invalid";
-        let res = History::from_toml(corrupt_toml);
-        assert!(res.is_err(), "debe fallar ante toml corrupto");
-    }
+    fn test_legacy_url_history_is_tolerated_as_empty_without_error() {
+        let legacy = r#"
+            [[entries]]
+            title = "Canción 1"
+            url = "https://example.com/1.mp3"
 
-    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    #[test]
-    fn test_history_persistence_in_temp_dir_via_config_override() {
-        let _guard = ENV_MUTEX.lock().unwrap();
-        let temp_dir =
-            std::env::temp_dir().join(format!("mp3tui_hist_test_{}", std::process::id()));
-        let _ = fs::create_dir_all(&temp_dir);
-        let config_file = temp_dir.join("config.toml");
-        let _ = fs::write(&config_file, "");
-
-        unsafe {
-            std::env::set_var(crate::config::CONFIG_ENV_OVERRIDE, &config_file);
-        }
-
-        let mut history = History::new();
-        history.add(
-            "Canción Guardada".to_string(),
-            "https://example.com/saved.mp3".to_string(),
-        );
-        save(&history).expect("debe guardar en temp dir");
-
-        let (loaded, warning) = load();
-        assert!(
-            warning.is_none(),
-            "no debe dar warning para archivo válido: {warning:?}"
-        );
-        assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded.get(0).unwrap().title, "Canción Guardada");
-
-        // Limpieza de variable
-        unsafe {
-            std::env::remove_var(crate::config::CONFIG_ENV_OVERRIDE);
-        }
-        let _ = fs::remove_dir_all(&temp_dir);
+            [[entries]]
+            title = "Otra"
+            url = "spotify:track:abc"
+        "#;
+        let history = History::from_toml(legacy).expect("la forma vieja no es un error");
+        assert!(history.is_empty());
+        assert_eq!(History::from_toml("").unwrap(), History::default());
+        assert_eq!(History::from_toml("entries = []").unwrap(), History::default());
     }
 
     #[test]
-    fn test_history_load_corrupt_file_returns_warning() {
-        let _guard = ENV_MUTEX.lock().unwrap();
-        let temp_dir =
-            std::env::temp_dir().join(format!("mp3tui_hist_corrupt_{}", std::process::id()));
-        let _ = fs::create_dir_all(&temp_dir);
-        let config_file = temp_dir.join("config.toml");
-        let _ = fs::write(&config_file, "");
-        let history_file = temp_dir.join(HISTORY_FILE_NAME);
-        let _ = fs::write(&history_file, "[[entries\ninvalid = [");
+    fn test_history_corrupt_yields_error() {
+        assert!(History::from_toml("[[entries\nurl = invalid").is_err());
+        // Forma nueva a medias (sin id): tampoco es la vieja, es corrupta.
+        assert!(History::from_toml("[[entries]]\nname = \"x\"").is_err());
+    }
 
-        unsafe {
-            std::env::set_var(crate::config::CONFIG_ENV_OVERRIDE, &config_file);
-        }
-
-        let (loaded, warning) = load();
-        assert_eq!(
-            loaded.len(),
-            0,
-            "debe dar historial vacío si el archivo es corrupto"
-        );
-        assert!(
-            warning.is_some(),
-            "debe retornar un warning ante archivo corrupto"
-        );
-        assert!(warning.unwrap().contains("corrupto"));
-
-        unsafe {
-            std::env::remove_var(crate::config::CONFIG_ENV_OVERRIDE);
-        }
-        let _ = fs::remove_dir_all(&temp_dir);
+    fn temp_file(name: &str) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("mp3tui_hist_{name}_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(HISTORY_FILE_NAME);
+        (dir, file)
     }
 
     #[test]
-    fn test_sanitize_url_strips_userinfo_and_handles_unicode() {
-        assert_eq!(
-            sanitize_url("http://user:pass@example.com/audio.mp3"),
-            "http://example.com/audio.mp3"
-        );
-        assert_eq!(
-            sanitize_url("https://alice:s3cr3t@domain.com:8080/path?q=val&u=user@other#hash"),
-            "https://domain.com:8080/path?q=val&u=user@other#hash"
-        );
-        assert_eq!(
-            sanitize_url("http://usér:páss@example.com/música.mp3?query=val"),
-            "http://example.com/música.mp3?query=val"
-        );
-        assert_eq!(
-            sanitize_url("https://example.com/clean.mp3"),
-            "https://example.com/clean.mp3"
-        );
+    fn test_load_from_legacy_file_starts_empty_without_warning_and_saves_new_shape() {
+        let (dir, file) = temp_file("legacy");
+        fs::write(&file, "[[entries]]\ntitle = \"t\"\nurl = \"https://x/y.mp3\"\n").unwrap();
+
+        let (mut history, warning) = load_from(&file);
+        assert!(history.is_empty());
+        assert!(warning.is_none(), "{warning:?}");
+
+        history.add(entry(CollectionKind::Playlist, "p1", "Mix", 2));
+        save_to(&history, &file).unwrap();
+        let (reloaded, warning) = load_from(&file);
+        assert!(warning.is_none());
+        assert_eq!(reloaded, history);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn test_corrupt_history_preserved_in_bak_after_save() {
-        let temp_dir = std::env::temp_dir().join(format!("mp3tui_hist_bak_{}", std::process::id()));
-        let _ = fs::create_dir_all(&temp_dir);
-        let hist_file = temp_dir.join("history.toml");
-        let corrupt_bytes = "broken toml [[[]]";
-        fs::write(&hist_file, corrupt_bytes).unwrap();
+    fn test_load_from_missing_file_is_empty() {
+        let (dir, file) = temp_file("missing");
+        let (history, warning) = load_from(&file);
+        assert!(history.is_empty() && warning.is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
 
-        let (mut hist, warn) = load_from(&hist_file);
-        assert!(warn.is_some());
-        assert_eq!(hist.len(), 0);
+    #[test]
+    fn test_load_corrupt_file_returns_warning_and_keeps_a_backup() {
+        let (dir, file) = temp_file("corrupt");
+        let corrupt = "broken toml [[[]]";
+        fs::write(&file, corrupt).unwrap();
 
-        hist.add(
-            "New Title".to_string(),
-            "https://example.com/audio.mp3".to_string(),
-        );
-        save_to(&hist, &hist_file).unwrap();
+        let (mut history, warning) = load_from(&file);
+        assert!(history.is_empty());
+        assert!(warning.expect("debe avisar").contains("corrupto"));
 
-        let bak_file = hist_file.with_extension("toml.bak");
-        assert!(bak_file.exists(), "debe crear respaldo .bak");
-        assert_eq!(fs::read_to_string(&bak_file).unwrap(), corrupt_bytes);
-
-        let (reloaded, warn2) = load_from(&hist_file);
-        assert!(warn2.is_none());
-        assert_eq!(reloaded.len(), 1);
-
-        let _ = fs::remove_dir_all(&temp_dir);
+        history.add(entry(CollectionKind::Playlist, "p1", "Mix", 1));
+        save_to(&history, &file).unwrap();
+        let bak = file.with_extension("toml.bak");
+        assert_eq!(fs::read_to_string(&bak).unwrap(), corrupt);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn test_save_to_uses_temp_and_rename_without_leaving_temp_files() {
-        let temp_dir =
-            std::env::temp_dir().join(format!("mp3tui_hist_atomic_{}", std::process::id()));
-        let _ = fs::create_dir_all(&temp_dir);
-        let hist_file = temp_dir.join("history.toml");
+        let (dir, file) = temp_file("atomic");
+        let mut history = History::new();
+        history.add(entry(CollectionKind::Album, "a1", "Disco", 3));
+        save_to(&history, &file).unwrap();
 
-        let mut hist = History::new();
-        hist.add(
-            "Atomic Title".to_string(),
-            "https://example.com/atomic.mp3".to_string(),
-        );
-        save_to(&hist, &hist_file).unwrap();
-
-        assert!(hist_file.exists());
-        let entries = fs::read_dir(&temp_dir).unwrap();
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            assert!(
-                !name.contains("tmp"),
-                "no debe quedar archivo temporal: {name}"
-            );
+        assert!(file.exists());
+        for item in fs::read_dir(&dir).unwrap().flatten() {
+            let name = item.file_name().to_string_lossy().into_owned();
+            assert!(!name.contains("tmp"), "no debe quedar archivo temporal: {name}");
         }
-
-        let _ = fs::remove_dir_all(&temp_dir);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

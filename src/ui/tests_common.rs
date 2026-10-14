@@ -73,11 +73,12 @@ pub(crate) fn test_app() -> App {
         spotify_library: None,
         spotify_library_rx: None,
         spotify_library_id: 0,
+        history_modal: None,
+        replace_queue_req: None,
         is_url: false,
         current_url: None,
         ytdlp_failed: false,
         history: crate::history::History::default(),
-        pending_history: None,
         history_path: Some(test_temp_history_path()),
         theme_menu: None,
         bands_menu: None,
@@ -285,30 +286,6 @@ pub(crate) fn make_test_wav(num_samples: usize) -> Vec<u8> {
         wav.extend_from_slice(&sample.to_le_bytes());
     }
     wav
-}
-pub(crate) fn local_wav_url(filename: &str, wav: &[u8]) -> String {
-    use std::io::{Read, Write};
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
-    let addr = listener.local_addr().expect("local_addr");
-    let wav = wav.to_vec();
-    std::thread::spawn(move || {
-        for socket in listener.incoming() {
-            let Ok(mut socket) = socket else {
-                break;
-            };
-            let mut request = [0u8; 1024];
-            let _ = socket.read(&mut request);
-            let header = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                wav.len()
-            );
-            if socket.write_all(header.as_bytes()).is_err() {
-                continue;
-            }
-            let _ = socket.write_all(&wav);
-        }
-    });
-    format!("http://{addr}/{filename}")
 }
 pub(crate) fn track_with_path(path: PathBuf, name: &str) -> Track {
     Track {

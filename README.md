@@ -66,6 +66,13 @@ Con `l` abrís un panel con **tus playlists** (incluye las privadas, requiere ha
 hecho `mp3tui --spotify-login`): al elegir una ves sus temas y podés reproducir
 toda la playlist o un tema suelto, sin volcar nada a la cola.
 
+Cada playlist o álbum de Spotify que ponés queda registrado (nombre, cantidad de
+canciones y las primeras) y con `h` abrís el historial para volver a ponerlo.
+El historial viejo de URLs sueltas ya no existe: el archivo anterior se ignora
+sin avisar de corrupción. Si pegaste el link de la playlist, el nombre que se
+guarda es genérico ("Playlist de Spotify"); al elegirla desde `u` o `l` se
+guarda con su nombre real.
+
 ### Registrar una app propia
 
 mp3tui no trae un `client_id` de fábrica: registrás tu propia app en el
@@ -218,7 +225,7 @@ src/
 ├── playlist/               # biblioteca local (escaneo y tags)
 ├── config.rs               # config.toml, temas y teclas
 ├── playback.rs             # lógica de reproducción (repeat, shuffle)
-├── history.rs              # historial de URLs
+├── history.rs              # historial de playlists/álbumes de Spotify
 └── runtime.rs              # estado activo compartido
 ```
 
@@ -245,12 +252,13 @@ request — las contribuciones son bienvenidas.
 | `d` | Borrar el ítem seleccionado de la Cola |
 | `x` | Vaciar toda la Cola (lo que suena sigue sonando) |
 | `l` | Mis playlists de Spotify: elegí una para ver sus temas (`espacio` reproduce toda la playlist, `Enter` un tema suelto) |
+| `h` | Historial de playlists y álbumes de Spotify que pusiste (`Enter` la vuelve a reproducir y **reemplaza la cola**) |
 | `Ctrl+P` | Configuración (temas, bandas, modo) |
 | `Esc` `Esc` | Salir |
 
 ## Cola de reproducción
 
-Encolá pistas con `a` (Biblioteca) o desde la URL e historial. Los ítems
+Encolá pistas con `a` (Biblioteca) o pegando una URL. Los ítems
 encolados se ven en el panel lateral con `c`. La cola es una lista con un
 **cursor** sobre el ítem que está sonando desde ella: `n` y el fin de pista
 avanzan el cursor, `p` retrocede uno y reproduce el anterior. Los ítems no se
@@ -271,8 +279,7 @@ playlist —tiene `list=` en la query o su path es `/playlist`—, se lista con
 reproduce enseguida y el resto entra a la cola **al final** de la existente;
 cada canción se resuelve **recién cuando le toca su turno** (las URLs de audio
 directo que devuelve yt-dlp vencen, así que las playlists largas se aguantan
-sin romperse). El historial guarda la URL de la playlist cuando suena su
-primera canción y la URL de cada canción cuando suena desde la cola.
+sin romperse).
 
 Si la playlist sale vacía o el listado falla, se muestra un aviso visible y la
 cola no se toca.

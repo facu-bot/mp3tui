@@ -215,6 +215,10 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &App, engine: &AudioEngine) {
         render_spotify_library(frame, library);
     }
 
+    if let Some(modal) = &app.history_modal {
+        render_history_modal(frame, &app.history, modal);
+    }
+
     if let Some(panel) = &app.settings_panel {
         render_settings_panel(frame, panel, app.mouse_enabled);
     }
@@ -607,12 +611,14 @@ pub(super) fn error_line(app: &App) -> Line<'static> {
 pub(super) fn player_areas(area: Rect, explorer_open: bool) -> (Rect, Rect, Rect, Option<Rect>) {
     // Umbral de compresión: con exactamente 30 filas se usa el layout completo.
     let compact = area.height < 30;
+    // Cada línea de atajos suma una fila: el pie lleva las teclas de Spotify
+    // (`u`, `l`, `h`) en su propia línea para que entren en 78 columnas.
     let footer_height = if compact {
         2
     } else if explorer_open {
-        5
+        6
     } else {
-        4
+        5
     };
 
     let zones = Layout::default()
@@ -1018,7 +1024,7 @@ fn render_browser(frame: &mut Frame<'_>, app: &App) {
         .constraints([
             Constraint::Length(5),
             Constraint::Min(6),
-            Constraint::Length(5),
+            Constraint::Length(6),
         ])
         .split(frame.area());
 
@@ -1189,23 +1195,14 @@ fn render_next_up_section(frame: &mut Frame<'_>, area: Rect, title: &str, frame_
 
 fn item_group<'a>(app: &'a App, item: &ViewItem) -> Option<&'a str> {
     match item {
-        ViewItem::History(_) => Some("Agregadas por URL"),
         ViewItem::Track(idx) => library_get(app, *idx).map(|t| t.folder.as_str()),
     }
 }
 
-/// ¿La vista agrupa más de una carpeta o incluye historial?
-/// Con una sola carpeta en pantalla (y sin historial) los encabezados solo ensucian,
-/// así que no se dibujan. Si hay historial, siempre se dibuja "Agregadas por URL"
-/// y el grupo correspondiente a las pistas locales.
+/// ¿La vista agrupa más de una carpeta?
+/// Con una sola carpeta en pantalla los encabezados solo ensucian,
+/// así que no se dibujan.
 fn view_is_grouped(app: &App) -> bool {
-    let has_history = app
-        .view
-        .iter()
-        .any(|item| matches!(item, ViewItem::History(_)));
-    if has_history {
-        return true;
-    }
     let mut first: Option<&str> = None;
     for position in 0..app.view.len() {
         let Some(track) = view_get(app, position) else {
@@ -1265,76 +1262,8 @@ fn visible_start(app: &App, height: usize, grouped: bool) -> usize {
     start
 }
 
-fn history_row_line(
-    entry: &crate::history::HistoryEntry,
-    selected: bool,
-    playing: bool,
-    width: u16,
-) -> Line<'static> {
-    let cursor = if selected { CURSOR } else { " " };
-    let marker = if playing { PLAYING } else { " " };
-    let badge = "[URL] ";
-
-    let budget = (width as usize).saturating_sub(2 + badge.chars().count());
-
-    let title_raw = if entry.title.is_empty() {
-        &entry.url
-    } else {
-        &entry.title
-    };
-
-    let title_chars = title_raw.chars().count();
-    let (title_display, padding) = if title_chars <= budget {
-        (title_raw.to_string(), budget - title_chars)
-    } else {
-        let truncated = truncate_chars(title_raw, budget);
-        let pad = budget.saturating_sub(truncated.chars().count());
-        (truncated, pad)
-    };
-
-    let (cursor_style, marker_style, badge_style, title_style) = if selected {
-        let bg = theme().select_bg;
-        (
-            Style::default()
-                .bg(bg)
-                .fg(theme().accent)
-                .add_modifier(Modifier::BOLD),
-            Style::default().bg(bg).fg(theme().ok),
-            Style::default()
-                .bg(bg)
-                .fg(theme().accent)
-                .add_modifier(Modifier::BOLD),
-            Style::default()
-                .bg(bg)
-                .fg(theme().text)
-                .add_modifier(Modifier::BOLD),
-        )
-    } else {
-        (
-            Style::default()
-                .fg(theme().accent)
-                .add_modifier(Modifier::BOLD),
-            Style::default().fg(theme().ok),
-            Style::default().fg(theme().accent),
-            Style::default().fg(theme().text),
-        )
-    };
-
-    let spaces = " ".repeat(padding);
-    let title_with_pad = format!("{title_display}{spaces}");
-
-    let spans = vec![
-        Span::styled(cursor, cursor_style),
-        Span::styled(marker, marker_style),
-        Span::styled(badge, badge_style),
-        Span::styled(title_with_pad, title_style),
-    ];
-
-    Line::from(spans)
-}
-
 /// Filas visibles de la biblioteca: encabezados de grupo
-/// intercalados ("Agregadas por URL" y carpetas). Los encabezados
+/// intercalados (carpetas). Los encabezados
 /// no son seleccionables — `selected` sigue siendo un índice sobre `view`
 /// y las flechas los saltan solas.
 pub(super) fn library_rows(app: &App, width: u16, height: u16) -> Vec<Line<'static>> {
@@ -1370,15 +1299,6 @@ pub(super) fn library_rows(app: &App, width: u16, height: u16) -> Vec<Line<'stat
         }
         let is_selected = position == app.selected;
         match item {
-            ViewItem::History(hist_idx) => {
-                let Some(entry) = app.history.get(*hist_idx) else {
-                    break;
-                };
-                let is_playing = app.is_url
-                    && ((!entry.title.is_empty() && app.track_label == entry.title)
-                        || app.track_label == entry.url);
-                lines.push(history_row_line(entry, is_selected, is_playing, width));
-            }
             ViewItem::Track(library_index) => {
                 let Some(track) = library_get(app, *library_index) else {
                     break;
@@ -2633,6 +2553,10 @@ pub(super) fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
         return spotify_library_footer(library);
     }
 
+    if app.history_modal.is_some() {
+        return history_modal_footer(app);
+    }
+
     if app.theme_menu.is_some() {
         return vec![Line::from(
             " ↑/↓: previsualizar tema   ·   Enter: guardar   ·   Esc: cancelar ",
@@ -2674,8 +2598,13 @@ pub(super) fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
 
     if compact {
         let keys = &config::config().keys;
+        // Una sola fila: las teclas de Spotify y vaciar cola van antes que el
+        // resto (que ya está en el pie completo).
         return vec![Line::from(format!(
-            " {}: pausa   {}×2: salir",
+            " {}: Spotify   {}: playlists   {}: vaciar   {}: pausa   {}×2: salir",
+            key_labels(&keys.spotify_search),
+            key_labels(&keys.spotify_library),
+            key_labels(&keys.clear_queue),
             key_labels(&keys.play_pause),
             key_labels(&keys.quit),
         ))];
@@ -2733,6 +2662,7 @@ pub(super) fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
                     key_labels(&keys.speed_down),
                     key_labels(&keys.speed_up),
                 )),
+                spotify_keys_line(keys, false),
             ]
         }
         // `Tab: biblio` vuelve; `b` sube a la línea 1 como
@@ -2762,6 +2692,7 @@ pub(super) fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
                 settings_key_display(),
                 key_labels(&keys.quit),
             )),
+            spotify_keys_line(keys, true),
         ],
         // `sig/ant` expandido (`b` baja a la línea 2 para que entre);
         // `Inicio/Fin` se documenta y sale el `Esc: volver` inexacto (sin
@@ -2795,8 +2726,25 @@ pub(super) fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
                 settings_key_display(),
                 key_labels(&keys.quit),
             )),
+            spotify_keys_line(keys, true),
         ],
     }
+}
+
+/// Línea del pie con las teclas de Spotify y de la cola: buscador (también
+/// URLs y rutas), tus playlists, el historial de playlists y, si `clear`,
+/// vaciar la cola. Cada una es un chip clickeable.
+fn spotify_keys_line(keys: &config::Keys, clear: bool) -> Line<'static> {
+    let mut text = format!(
+        " {}: Spotify   {}: playlists   {}: historial",
+        key_labels(&keys.spotify_search),
+        key_labels(&keys.spotify_library),
+        key_labels(&keys.playlist_history),
+    );
+    if clear {
+        text.push_str(&format!("   {}: vaciar cola", key_labels(&keys.clear_queue)));
+    }
+    Line::from(text)
 }
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App, compact: bool) {
@@ -2877,6 +2825,7 @@ fn modal_open(app: &App) -> bool {
     app.url_input.is_some()
         || app.spotify_search.is_some()
         || app.spotify_library.is_some()
+        || app.history_modal.is_some()
         || app.search.is_some()
         || app.theme_menu.is_some()
         || app.bands_menu.is_some()

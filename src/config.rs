@@ -913,6 +913,8 @@ pub struct Keys {
     pub spotify_search: Vec<KeyCode>,
     /// Abrir el panel con tus playlists de Spotify y sus temas. Por defecto 'l'.
     pub spotify_library: Vec<KeyCode>,
+    /// Abrir el historial de playlists y álbumes de Spotify. Por defecto 'h'.
+    pub playlist_history: Vec<KeyCode>,
     pub speed_up: Vec<KeyCode>,
     pub speed_down: Vec<KeyCode>,
     /// Abrir/cerrar el panel lateral del explorador: `b` / `Tab` /
@@ -971,6 +973,7 @@ impl Default for Keys {
             search: keys(&[KeyCode::Char('b')]),
             spotify_search: keys(&[KeyCode::Char('u')]),
             spotify_library: keys(&[KeyCode::Char('l')]),
+            playlist_history: keys(&[KeyCode::Char('h')]),
             speed_up: keys(&[KeyCode::Char(']')]),
             speed_down: keys(&[KeyCode::Char('[')]),
             explorer: keys(&[KeyCode::Tab]),
@@ -1008,6 +1011,7 @@ fn parse_keybindings(section: &toml::Table, keys: &mut Keys, warnings: &mut Vec<
             "search" => &mut keys.search,
             "spotify_search" => &mut keys.spotify_search,
             "spotify_library" => &mut keys.spotify_library,
+            "playlist_history" => &mut keys.playlist_history,
             "open_url" => &mut keys.open_url,
             "enqueue" => &mut keys.enqueue,
             "queue_panel" => &mut keys.queue_panel,
@@ -1098,6 +1102,11 @@ fn resolve_key_collisions(keys: &mut Keys, warnings: &mut Vec<String>) {
             "spotify_library",
             &mut keys.spotify_library,
             &defaults.spotify_library,
+        ),
+        (
+            "playlist_history",
+            &mut keys.playlist_history,
+            &defaults.playlist_history,
         ),
         ("open_url", &mut keys.open_url, &defaults.open_url),
         ("enqueue", &mut keys.enqueue, &defaults.enqueue),
@@ -2464,6 +2473,24 @@ zoom = 2",
         assert_eq!(config.keys.spotify_library, vec![KeyCode::Char('l')]);
         assert_eq!(config.warnings.len(), 1, "{:?}", config.warnings);
         assert!(config.warnings[0].contains("spotify_library"), "{:?}", config.warnings);
+    }
+
+    #[test]
+    fn playlist_history_default_is_h_and_can_be_remapped() {
+        assert_eq!(Keys::default().playlist_history, vec![KeyCode::Char('h')]);
+        let config = parse("[keybindings]\nplaylist_history = \"j\"");
+        assert_eq!(config.keys.playlist_history, vec![KeyCode::Char('j')]);
+        assert!(config.warnings.is_empty(), "{:?}", config.warnings);
+    }
+
+    #[test]
+    fn playlist_history_collision_warns_and_the_earlier_action_wins() {
+        let config = parse("[keybindings]\nplaylist_history = \"l\"");
+        // spotify_library va antes: playlist_history pierde 'l' y vuelve a 'h'.
+        assert_eq!(config.keys.spotify_library, vec![KeyCode::Char('l')]);
+        assert_eq!(config.keys.playlist_history, vec![KeyCode::Char('h')]);
+        assert_eq!(config.warnings.len(), 1, "{:?}", config.warnings);
+        assert!(config.warnings[0].contains("playlist_history"), "{:?}", config.warnings);
     }
 
     #[test]

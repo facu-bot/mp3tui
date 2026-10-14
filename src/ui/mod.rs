@@ -196,7 +196,6 @@ enum Mode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewItem {
-    History(usize),
     Track(usize),
 }
 
@@ -210,7 +209,6 @@ impl PartialEq<usize> for ViewItem {
     fn eq(&self, other: &usize) -> bool {
         match self {
             ViewItem::Track(idx) => idx == other,
-            ViewItem::History(_) => false,
         }
     }
 }
@@ -326,6 +324,11 @@ struct App {
     spotify_library_rx: Option<Receiver<SpotifyLibraryMessage>>,
     /// Id de la carga vigente: un resultado con otro id llegó tarde.
     spotify_library_id: u64,
+    /// Modal del historial de playlists: `Some` mientras está abierto.
+    history_modal: Option<HistoryModal>,
+    /// Pedido de listado cuyo resultado REEMPLAZA la cola (replay desde el
+    /// historial) en vez de sumarse a ella.
+    replace_queue_req: Option<u64>,
     is_url: bool,
     /// URL original (nunca la resuelta) + etiqueta de la pista cuando la
     /// reproducción actual viene de una URL; `None` en reproducción local.
@@ -334,7 +337,6 @@ struct App {
     current_url: Option<(String, String)>,
     ytdlp_failed: bool,
     pub history: crate::history::History,
-    pub pending_history: Option<(String, String)>,
     pub history_path: Option<PathBuf>,
     /// Menú de temas abierto: `Some` mientras el modal está activo.
     theme_menu: Option<ThemeMenuState>,
@@ -552,11 +554,12 @@ pub fn run(engine: &mut AudioEngine, start: StartMode) -> io::Result<()> {
         spotify_library: None,
         spotify_library_rx: None,
         spotify_library_id: 0,
+        history_modal: None,
+        replace_queue_req: None,
         is_url: is_url_start,
         current_url: None,
         ytdlp_failed: false,
         history,
-        pending_history: None,
         history_path: crate::history::history_path(),
         theme_menu: None,
         bands_menu: None,
@@ -753,19 +756,7 @@ pub fn compute_status(pending_resolution: bool, snapshot: EngineSnapshot) -> Sta
 fn apply_engine_snapshot(app: &mut App, snapshot: EngineSnapshot) -> Status {
     let pending_resolution = app.ytdlp_rx.is_some();
     let new_status = compute_status(pending_resolution, snapshot);
-    let previous_status = app.status;
     app.status = new_status;
-
-    if snapshot.had_playback_error || new_status == Status::Stopped {
-        app.pending_history = None;
-    } else if previous_status == Status::Connecting
-        && new_status == Status::Playing
-        && app.is_url
-        && !snapshot.had_playback_error
-        && let Some((original_url, label)) = app.pending_history.take()
-    {
-        record_history_entry(app, &original_url, &label);
-    }
     new_status
 }
 
@@ -798,6 +789,11 @@ fn dispatch_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine) {
     // que el prompt de URL (todo lo que se teclea va al campo).
     if app.spotify_search.is_some() {
         handle_spotify_search_key(key, app, engine);
+        return;
+    }
+
+    if app.history_modal.is_some() {
+        handle_history_key(key, app);
         return;
     }
 
@@ -859,7 +855,6 @@ fn library_get(app: &App, index: usize) -> Option<&Track> {
 fn view_get(app: &App, index: usize) -> Option<&Track> {
     match app.view.get(index)? {
         ViewItem::Track(library_index) => library_get(app, *library_index),
-        ViewItem::History(_) => None,
     }
 }
 
@@ -868,7 +863,6 @@ fn position_in_view(app: &App, path: &Path) -> Option<usize> {
     let library_index = app.library.as_ref()?.index_of(path)?;
     app.view.iter().position(|item| match item {
         ViewItem::Track(index) => *index == library_index,
-        ViewItem::History(_) => false,
     })
 }
 
@@ -879,41 +873,16 @@ fn current_view_position(app: &App) -> Option<usize> {
     position_in_view(app, path)
 }
 
-fn matches_history_filter(entry: &crate::history::HistoryEntry, needle: &str) -> bool {
-    let trimmed = needle.trim().to_lowercase();
-    if trimmed.is_empty() {
-        return true;
-    }
-    let title = if entry.title.is_empty() {
-        &entry.url
-    } else {
-        &entry.title
-    };
-    title.to_lowercase().contains(&trimmed)
-}
-
 /// Recalcula la lista visible (biblioteca filtrada por búsqueda/filtro) sin
 /// perder la selección: se preserva la pista seleccionada por path, si ya no
 /// existe se usa la sonando y si ninguna está en la vista se acota a rango.
 /// Con shuffle activo regenera el orden mezclado para la nueva lista.
 fn refresh_view(app: &mut App) {
-    refresh_view_with_hint(app, None);
-}
-
-fn refresh_view_with_hint(app: &mut App, preserved_history_url: Option<&str>) {
     let previous_item = app.view.get(app.selected).copied();
-    let previous_path = previous_item.and_then(|item| match item {
-        ViewItem::Track(library_index) => {
-            library_get(app, library_index).map(|track| track.path.clone())
-        }
-        ViewItem::History(_) => None,
+    let previous_path = previous_item.map(|ViewItem::Track(library_index)| {
+        library_get(app, library_index).map(|track| track.path.clone())
     });
-    let previous_history_url = preserved_history_url.map(String::from).or_else(|| {
-        previous_item.and_then(|item| match item {
-            ViewItem::History(hist_idx) => app.history.get(hist_idx).map(|entry| entry.url.clone()),
-            ViewItem::Track(_) => None,
-        })
-    });
+    let previous_path = previous_path.flatten();
 
     let needle = app
         .search
@@ -922,11 +891,6 @@ fn refresh_view_with_hint(app: &mut App, preserved_history_url: Option<&str>) {
         .map(String::as_str);
 
     let mut new_view = Vec::new();
-    for (idx, entry) in app.history.entries().iter().enumerate() {
-        if matches_history_filter(entry, needle.unwrap_or_default()) {
-            new_view.push(ViewItem::History(idx));
-        }
-    }
     if let Some(library) = &app.library {
         for track_idx in filter_tracks(library.tracks(), needle) {
             new_view.push(ViewItem::Track(track_idx));
@@ -934,34 +898,16 @@ fn refresh_view_with_hint(app: &mut App, preserved_history_url: Option<&str>) {
     }
     app.view = new_view;
 
-    let new_selected = if let Some(url) = &previous_history_url {
-        app.view.iter().position(|item| match item {
-            ViewItem::History(idx) => app.history.get(*idx).map(|entry| &entry.url) == Some(url),
-            _ => false,
-        })
-    } else if let Some(path) = &previous_path {
-        position_in_view(app, path)
-    } else {
-        None
-    }
+    let new_selected = previous_path
+        .as_ref()
+        .and_then(|path| position_in_view(app, path))
     .or_else(|| current_view_position(app))
     .unwrap_or(0)
     .min(app.view.len().saturating_sub(1));
     app.selected = new_selected;
 
     if app.shuffle {
-        // El orden vive sobre el pool MIXTO (pistas + historial), igual que en
-        // `toggle_shuffle` y en `pool_positions_in_view`: si el refresco lo
-        // dejara con solo las pistas, quedaría a medio armar hasta el próximo
-        // salto.
-        let pool_count = app
-            .view
-            .iter()
-            .filter(|item| {
-                matches!(item, ViewItem::Track(_)) || matches!(item, ViewItem::History(_))
-            })
-            .count();
-        app.shuffle_order = shuffle_order(pool_count);
+        app.shuffle_order = shuffle_order(app.view.len());
     }
 }
 
@@ -978,7 +924,6 @@ fn cancel_pending_ytdlp(app: &mut App) {
     app.playlist_rx = None;
     app.queue_resolving = None;
     app.ytdlp_failed = false;
-    app.pending_history = None;
 }
 
 /// Lanza el escaneo de `app.roots` en un thread aparte (una o varias
@@ -1045,6 +990,7 @@ mod keys;
 mod mouse;
 mod queue;
 mod render;
+mod playlist_history;
 mod spotify_library;
 mod spotify_search;
 #[cfg(test)]
@@ -1054,6 +1000,7 @@ use self::keys::*;
 use self::mouse::*;
 use self::queue::*;
 use self::render::*;
+use self::playlist_history::*;
 use self::spotify_library::*;
 use self::spotify_search::*;
 
@@ -2250,7 +2197,7 @@ mod tests {
         assert_eq!(panel, None, "panel cerrado = layout clásico");
         assert_eq!((info.x, info.width), (0, 100));
         assert_eq!((visual.x, visual.width), (0, 100));
-        assert_eq!(footer.height, 4, "pie clásico con 2 líneas");
+        assert_eq!(footer.height, 5, "pie clásico con 3 líneas");
 
         let (info, visual, footer, panel) = player_areas(area, true);
         let panel = panel.expect("panel abierto");
@@ -2272,8 +2219,8 @@ mod tests {
         );
         assert_eq!(footer.width, 100, "el pie sigue a todo lo ancho");
         assert_eq!(
-            footer.height, 5,
-            "pie con 3 líneas para los atajos del panel"
+            footer.height, 6,
+            "pie con 4 líneas para los atajos del panel"
         );
         assert_eq!(
             info.y + info.height + visual.height,
@@ -2466,37 +2413,6 @@ mod tests {
         assert_eq!(sorted, vec![0, 1], "sigue siendo una permutación");
     }
 
-    ///: con shuffle activo el orden mezclado cubre el **pool mixto** que
-    /// recorren `n`/`p` y el fin de pista (biblioteca + historial de URLs), no
-    /// solo las pistas locales: si un refresco de la vista lo dejara corto, el
-    /// orden quedaría a medio armar hasta el próximo salto.
-    #[test]
-    fn refresh_view_shuffle_order_covers_the_mixed_pool() {
-        let mut app = test_app();
-        app.library = Some(crate::playlist::from_tracks_for_test(vec![
-            track_named("alpha"),
-            track_named("beta"),
-        ]));
-        app.history.add(
-            "Video de YouTube".to_string(),
-            "https://www.youtube.com/watch?v=x".to_string(),
-        );
-        app.shuffle = true;
-        refresh_view(&mut app);
-        let after_refresh = app.shuffle_order.len();
-
-        let pool = pool_positions_in_view(&mut app);
-        assert_eq!(pool.len(), 3, "el pool mixto suma la URL del historial");
-        assert_eq!(
-            after_refresh,
-            pool.len(),
-            "el orden mezclado ya cubre el pool mixto al refrescar la vista"
-        );
-        let mut sorted = app.shuffle_order.clone();
-        sorted.sort_unstable();
-        assert_eq!(sorted, vec![0, 1, 2], "sigue siendo una permutación");
-    }
-
     #[test]
     fn footer_shows_the_new_shortcuts_in_each_mode() {
         let mut app = library_with_three();
@@ -2520,6 +2436,10 @@ mod tests {
             "[/]: vel",
             "Ctrl+P: config",
             "Esc×2: salir",
+            "u: Spotify",
+            "l: playlists",
+            "h: historial",
+            "x: vaciar cola",
         ] {
             assert!(
                 player.contains(hint),
@@ -2555,6 +2475,13 @@ mod tests {
                 "footer del explorador falta '{hint}': {browser}"
             );
         }
+        for hint in ["u: Spotify", "l: playlists", "h: historial", "x: vaciar cola"] {
+            assert!(
+                browser.contains(hint),
+                "footer del explorador falta '{hint}': {browser}"
+            );
+        }
+        assert!(!browser.contains(": URL"), "{browser}");
         assert!(
             !browser.contains("Esc: volver"),
             "sin `Esc: volver` inexacto: {browser}"
@@ -2586,9 +2513,12 @@ mod tests {
         }
         assert_eq!(
             footer_lines(&app, false).len(),
-            3,
-            "el pie con panel usa sus 3 líneas"
+            4,
+            "el pie con panel usa sus 4 líneas"
         );
+        for hint in ["u: Spotify", "l: playlists", "h: historial", "x: vaciar"] {
+            assert!(panel.contains(hint), "footer del panel falta '{hint}': {panel}");
+        }
         app.explorer_open = false;
 
         // Pie del panel de configuración (`abrir/alternar`: en «Mouse»
@@ -2635,6 +2565,34 @@ mod tests {
             .join("\n");
         assert!(search.contains("Backspace"));
         assert!(search.contains("Esc: cancelar"));
+    }
+
+    /// Las teclas nuevas del pie son chips clickeables: cada etiqueta se
+    /// resuelve a la tecla configurada de su acción.
+    #[test]
+    fn spotify_footer_chips_resolve_to_their_configured_keys() {
+        let keys = &crate::config::config().keys;
+        assert_eq!(key_for_chip("u"), Some(keys.spotify_search[0]));
+        assert_eq!(key_for_chip("l"), Some(keys.spotify_library[0]));
+        assert_eq!(key_for_chip("h"), Some(keys.playlist_history[0]));
+        assert_eq!(key_for_chip("x"), Some(keys.clear_queue[0]));
+        // Y se registran como chips al dibujar el pie.
+        for text in ["u: Spotify", "l: playlists", "h: historial", "x: vaciar cola"] {
+            let (_, entries) = footer_chip_spans(&format!(" {text}"));
+            assert_eq!(entries.len(), 1, "{text}");
+        }
+    }
+
+    #[test]
+    fn compact_footer_keeps_the_spotify_and_queue_keys_within_78_columns() {
+        let app = test_app();
+        let lines = footer_lines(&app, true);
+        assert_eq!(lines.len(), 1);
+        let text = line_text(&lines[0]);
+        for hint in ["u: Spotify", "l: playlists", "x: vaciar", "espacio: pausa", "Esc×2: salir"] {
+            assert!(text.contains(hint), "falta '{hint}': {text}");
+        }
+        assert!(line_width(&lines[0]) <= 78, "{text}");
     }
 
     #[test]
@@ -5632,90 +5590,6 @@ mod tests {
         assert_eq!(app.queue.len(), 1, "la URL sigue en la cola");
     }
 
-    /// con el shuffle activo: una pista local que termina encadena con
-    /// la URL del historial que le sigue en el pool, pasando por el seam
-    /// inyectado `replay` (no se lanza yt-dlp en el test). Con un pool de
-    /// exactamente dos elementos el «siguiente» está forzado, así que no
-    /// depende de la entropía del orden.
-    #[test]
-    fn test_shuffle_natural_end_local_chains_to_history_url_via_replay() {
-        let mut app = test_app();
-        app.library = Some(crate::playlist::from_tracks_for_test(vec![track_named(
-            "alpha",
-        )]));
-        app.history.add(
-            "Video de YouTube".to_string(),
-            "https://www.youtube.com/watch?v=urlA".to_string(),
-        );
-        refresh_view(&mut app);
-        app.shuffle = true;
-        app.repeat = RepeatMode::All;
-        app.is_url = false;
-        app.current_path = Some(PathBuf::from(r"C:\x\alpha.mp3"));
-        app.status = Status::Playing;
-
-        let mut engine = match AudioEngine::new() {
-            Ok(e) => e,
-            Err(_) => return,
-        };
-        let mut dispatched: Option<UrlReplayRequest> = None;
-        handle_natural_end_with(&mut app, &mut engine, |_app, _engine, request| {
-            dispatched = Some(request);
-        });
-
-        assert_eq!(
-            dispatched.map(|r| r.original_url),
-            Some("https://www.youtube.com/watch?v=urlA".to_string()),
-            "con shuffle una pista local encadena a la URL del historial"
-        );
-    }
-
-    /// con el shuffle activo: una URL que termina encadena a la OTRA
-    /// URL del historial, nunca a la misma. Pool de dos URLs → el siguiente
-    /// está forzado.
-    #[test]
-    fn test_shuffle_natural_end_url_chains_to_other_history_url() {
-        let mut app = test_app();
-        app.history.add(
-            "A".to_string(),
-            "https://www.youtube.com/watch?v=uA".to_string(),
-        );
-        app.history.add(
-            "B".to_string(),
-            "https://www.youtube.com/watch?v=uB".to_string(),
-        );
-        refresh_view(&mut app);
-        app.shuffle = true;
-        app.repeat = RepeatMode::All;
-        app.is_url = true;
-        app.current_url = Some((
-            "https://www.youtube.com/watch?v=uA".to_string(),
-            "A".to_string(),
-        ));
-        app.status = Status::Playing;
-
-        let mut engine = match AudioEngine::new() {
-            Ok(e) => e,
-            Err(_) => return,
-        };
-        let mut dispatched: Option<UrlReplayRequest> = None;
-        handle_natural_end_with(&mut app, &mut engine, |_app, _engine, request| {
-            dispatched = Some(request);
-        });
-
-        let url = dispatched.map(|r| r.original_url);
-        assert_eq!(
-            url.as_deref(),
-            Some("https://www.youtube.com/watch?v=uB"),
-            "una URL terminada encadena a la otra URL del historial"
-        );
-        assert_ne!(
-            url.as_deref(),
-            Some("https://www.youtube.com/watch?v=uA"),
-            "nunca vuelve a la URL que acaba de terminar"
-        );
-    }
-
     ///: el shuffle no repite la pista que acaba de terminar. Con el
     /// orden forzado `[2, 0, 1]` y una pista local en el pool 0, el siguiente
     /// es determinista (el pool 1) y nunca vuelve a ser la pista que terminó.
@@ -5773,7 +5647,7 @@ mod tests {
     }
 
     /// Preservación: con el shuffle APAGADO el fin natural avanza a la
-    /// siguiente pista local en orden, nunca a una URL del historial, y
+    /// siguiente pista local en orden, nunca a una URL, y
     /// `n`/`p` se comportan igual que antes.
     #[test]
     fn test_shuffle_off_natural_end_and_steps_stay_natural_never_url() {
@@ -5792,11 +5666,6 @@ mod tests {
             track_with_path(p2.clone(), "dos"),
             track_with_path(p3.clone(), "tres"),
         ]));
-        // Una URL del historial adelante de la vista: no debe saltarse nunca.
-        app.history.add(
-            "Video".to_string(),
-            "https://www.youtube.com/watch?v=vX".to_string(),
-        );
         refresh_view(&mut app);
         app.repeat = RepeatMode::All;
         app.is_url = false;
@@ -5848,49 +5717,6 @@ mod tests {
         }
     }
 
-    /// con shuffle activo: `n`/`p` deben recorrer el mismo pool mixto
-    /// que el fin de pista. Con un pool de exactamente dos elementos (una
-    /// pista local + una URL del historial) el «siguiente» está forzado; el
-    /// paso tiene que despachar la URL por el seam inyectado `replay` en vez
-    /// de quedar en silencio.
-    #[test]
-    fn test_shuffle_step_dispatches_history_url_through_replay() {
-        let Some(mut engine) = engine_or_skip() else {
-            return;
-        };
-        let mut app = test_app();
-        let dir = std::env::temp_dir();
-        let wav_path = dir.join(format!("mp3tui_step_url_{}.wav", std::process::id()));
-        std::fs::write(&wav_path, make_test_wav(4410)).unwrap();
-
-        let local = track_with_path(wav_path.clone(), "local");
-        // RED note: con play_step la URL no se despacha (quedaba en silencio);
-        // el seam play_step_with la entrega al closure capturado.
-
-        app.library = Some(crate::playlist::from_tracks_for_test(vec![local]));
-        app.history.add(
-            "Video de YouTube".to_string(),
-            "https://www.youtube.com/watch?v=stepUrl".to_string(),
-        );
-        refresh_view(&mut app);
-        app.shuffle = true;
-        app.repeat = RepeatMode::All;
-        app.current_path = Some(wav_path.clone());
-
-        let mut captured: Option<UrlReplayRequest> = None;
-        play_step_with(&mut app, &mut engine, 1, |_app, _engine, request| {
-            captured = Some(request);
-        });
-
-        assert_eq!(
-            captured.map(|r| r.original_url),
-            Some("https://www.youtube.com/watch?v=stepUrl".to_string()),
-            "con shuffle 'n' encadena la URL del historial por el seam de replay"
-        );
-
-        let _ = std::fs::remove_file(wav_path);
-    }
-
     /// «Encolar» (`a`) suma la pista seleccionada de la Biblioteca como
     /// `QueueItem::Local`, sin mover la selección ni la lista.
     #[test]
@@ -5907,32 +5733,6 @@ mod tests {
         assert_eq!(app.queue.first().map(QueueItem::label), Some("beta"));
         assert_eq!(app.selected, 1, "la selección de la biblioteca no se mueve");
         assert_eq!(app.view.len(), 3, "la lista no cambia");
-    }
-
-    /// Una fila del historial se encola como URL (se resuelve cuando le toca
-    /// sonar), no como pista local.
-    #[test]
-    fn enqueue_key_adds_a_history_url_as_a_queue_url_item() {
-        let Some(mut engine) = engine_or_skip() else {
-            return;
-        };
-        let mut app = test_app();
-        app.history.add(
-            "Video de YouTube".to_string(),
-            "https://www.youtube.com/watch?v=x".to_string(),
-        );
-        refresh_view(&mut app);
-        app.selected = 0;
-
-        handle_list_key(theme_menu_key(KeyCode::Char('a')), &mut app, &mut engine);
-
-        assert_eq!(
-            app.queue.first(),
-            Some(&QueueItem::Url {
-                url: "https://www.youtube.com/watch?v=x".to_string(),
-                title: "Video de YouTube".to_string(),
-            })
-        );
     }
 
     /// `c` alterna Biblioteca y Cola dentro del panel; cada lista conserva su
@@ -6644,264 +6444,6 @@ mod tests {
     }
 
     #[test]
-    fn test_row_building_with_history_and_local_groups() {
-        let mut app = library_with_three();
-        app.history.add(
-            "Historial Cancion 1".to_string(),
-            "https://example.com/song1.mp3".to_string(),
-        );
-        refresh_view(&mut app);
-
-        assert_eq!(app.view.len(), 4);
-        assert_eq!(app.view[0], ViewItem::History(0));
-        assert_eq!(app.view[1], ViewItem::Track(0));
-
-        let lines = library_rows(&app, 60, 10);
-        let has_history_header = lines.iter().any(|l| {
-            l.spans
-                .iter()
-                .any(|s| s.content.contains("Agregadas por URL"))
-        });
-        assert!(
-            has_history_header,
-            "debe contener encabezado 'Agregadas por URL'"
-        );
-
-        let has_history_badge = lines
-            .iter()
-            .any(|l| l.spans.iter().any(|s| s.content.contains("[URL] ")));
-        assert!(
-            has_history_badge,
-            "fila de historial debe tener badge '[URL] '"
-        );
-
-        let has_history_title = lines.iter().any(|l| {
-            l.spans
-                .iter()
-                .any(|s| s.content.contains("Historial Cancion 1"))
-        });
-        assert!(
-            has_history_title,
-            "fila de historial debe mostrar el título"
-        );
-    }
-
-    #[test]
-    fn test_navigation_crossing_boundary_between_history_and_local() {
-        let mut app = library_with_three();
-        app.history.add(
-            "Historial Cancion 1".to_string(),
-            "https://example.com/song1.mp3".to_string(),
-        );
-        refresh_view(&mut app);
-
-        assert_eq!(app.view[0], ViewItem::History(0));
-        assert_eq!(app.view[1], ViewItem::Track(0));
-
-        app.selected = 0;
-        app.selected = move_selection(app.selected, 1, app.view.len());
-        assert_eq!(app.selected, 1);
-        assert_eq!(app.view[app.selected], ViewItem::Track(0));
-
-        app.selected = move_selection(app.selected, -1, app.view.len());
-        assert_eq!(app.selected, 0);
-        assert_eq!(app.view[app.selected], ViewItem::History(0));
-    }
-
-    #[test]
-    fn test_search_filters_history_by_title_and_local_tracks() {
-        let mut app = library_with_three();
-        app.history.add(
-            "Bohemian Rhapsody".to_string(),
-            "https://example.com/queen.mp3".to_string(),
-        );
-        app.history.add(
-            "Yesterday".to_string(),
-            "https://example.com/beatles.mp3".to_string(),
-        );
-        refresh_view(&mut app);
-
-        assert_eq!(app.view.len(), 5);
-
-        app.filter = Some("bohemian".to_string());
-        refresh_view(&mut app);
-        assert_eq!(app.view.len(), 1);
-        assert_eq!(app.view[0], ViewItem::History(1));
-
-        app.filter = Some("beta".to_string());
-        refresh_view(&mut app);
-        assert_eq!(app.view.len(), 1);
-        assert_eq!(app.view[0], ViewItem::Track(1));
-    }
-
-    #[test]
-    fn test_enter_on_history_row_dispatches_playback() {
-        let mut app = library_with_three();
-        // URL local vía servidor de loopback: la fila del historial reproduce
-        // sin salir a la red externa (el label sigue siendo el filename).
-        let url = local_wav_url("stream.mp3", &make_test_wav(4410));
-        app.history.add("Historial Cancion".to_string(), url);
-        refresh_view(&mut app);
-
-        app.selected = 0;
-        let mut engine = match AudioEngine::new() {
-            Ok(e) => e,
-            Err(_) => return,
-        };
-
-        play_selected(&mut app, &mut engine);
-
-        assert_eq!(app.mode, Mode::Player);
-        assert!(app.is_url);
-        assert_eq!(app.track_label, "stream.mp3");
-    }
-
-    #[test]
-    fn test_history_recording_happens_only_on_successful_start() {
-        let mut app = test_app();
-        assert_eq!(app.history.len(), 0);
-
-        let mut engine = match AudioEngine::new() {
-            Ok(e) => e,
-            Err(_) => return,
-        };
-
-        // Reproduce una URL local de loopback: sin red externa, y la entrada
-        // registrada debe ser exactamente esa URL.
-        let url = local_wav_url("audio.mp3", &make_test_wav(4410));
-        start_url_playback(
-            &mut app,
-            &mut engine,
-            url.clone(),
-            url.clone(),
-            "audio.mp3".to_string(),
-        );
-
-        assert_eq!(app.status, Status::Connecting);
-        assert_eq!(app.history.len(), 0);
-        assert!(app.pending_history.is_some());
-
-        let snapshot_playing = EngineSnapshot {
-            is_connecting: false,
-            is_playing: true,
-            is_paused: false,
-            had_playback_error: false,
-        };
-        apply_engine_snapshot(&mut app, snapshot_playing);
-
-        assert_eq!(app.status, Status::Playing);
-        assert_eq!(app.history.len(), 1);
-        assert_eq!(
-            app.history.get(0).unwrap().url,
-            url,
-            "la entrada registrada es la URL local que se reprodujo"
-        );
-        assert_eq!(app.history.get(0).unwrap().title, "audio.mp3");
-        assert!(app.pending_history.is_none());
-    }
-
-    #[test]
-    fn test_url_playback_error_keeps_history_empty() {
-        let mut app = test_app();
-        init_url_playback(
-            &mut app,
-            "https://youtube.com/watch?v=123".to_string(),
-            "My Song".to_string(),
-        );
-        assert_eq!(app.status, Status::Connecting);
-
-        let snapshot_error = EngineSnapshot {
-            is_connecting: false,
-            is_playing: false,
-            is_paused: false,
-            had_playback_error: true,
-        };
-        apply_engine_snapshot(&mut app, snapshot_error);
-        assert_eq!(app.status, Status::Stopped);
-        assert!(
-            app.history.is_empty(),
-            "history must stay empty on playback error"
-        );
-        assert!(app.pending_history.is_none());
-    }
-
-    #[test]
-    fn test_url_playback_connecting_keeps_history_empty_until_playing() {
-        let mut app = test_app();
-        init_url_playback(
-            &mut app,
-            "https://youtube.com/watch?v=123".to_string(),
-            "My Song".to_string(),
-        );
-
-        let snapshot_connecting = EngineSnapshot {
-            is_connecting: true,
-            is_playing: true,
-            is_paused: false,
-            had_playback_error: false,
-        };
-        apply_engine_snapshot(&mut app, snapshot_connecting);
-        assert_eq!(app.status, Status::Connecting);
-        assert!(
-            app.history.is_empty(),
-            "history must be empty while connecting"
-        );
-
-        let snapshot_playing = EngineSnapshot {
-            is_connecting: false,
-            is_playing: true,
-            is_paused: false,
-            had_playback_error: false,
-        };
-        apply_engine_snapshot(&mut app, snapshot_playing);
-        assert_eq!(app.status, Status::Playing);
-        assert_eq!(
-            app.history.len(),
-            1,
-            "exactly one history entry recorded on playing"
-        );
-        assert_eq!(
-            app.history.get(0).unwrap().url,
-            "https://youtube.com/watch?v=123"
-        );
-        assert_eq!(app.history.get(0).unwrap().title, "My Song");
-        assert!(app.pending_history.is_none());
-    }
-
-    #[test]
-    fn test_superseded_url_playback_is_never_recorded() {
-        let mut app = test_app();
-        init_url_playback(
-            &mut app,
-            "https://example.com/A.mp3".to_string(),
-            "Track A".to_string(),
-        );
-        init_url_playback(
-            &mut app,
-            "https://example.com/B.mp3".to_string(),
-            "Track B".to_string(),
-        );
-
-        let snapshot_playing = EngineSnapshot {
-            is_connecting: false,
-            is_playing: true,
-            is_paused: false,
-            had_playback_error: false,
-        };
-        apply_engine_snapshot(&mut app, snapshot_playing);
-        assert_eq!(app.status, Status::Playing);
-        assert_eq!(app.history.len(), 1);
-        assert_eq!(app.history.get(0).unwrap().url, "https://example.com/B.mp3");
-        assert!(
-            !app.history
-                .entries()
-                .iter()
-                .any(|e| e.url == "https://example.com/A.mp3"),
-            "URL A must never be recorded"
-        );
-    }
-
-    #[test]
     fn test_ui_app_uses_isolated_temp_history_path() {
         let app = test_app();
         let hist_path = app.history_path.as_ref().expect("history_path must be set");
@@ -6914,47 +6456,6 @@ mod tests {
             Some(hist_path.clone()),
             crate::history::history_path(),
             "must not be real user path"
-        );
-    }
-
-    #[test]
-    fn test_record_history_preserves_selected_history_item() {
-        let mut app = library_with_three();
-        app.history.add(
-            "Song 1".to_string(),
-            "https://example.com/1.mp3".to_string(),
-        );
-        app.history.add(
-            "Song 2".to_string(),
-            "https://example.com/2.mp3".to_string(),
-        );
-        refresh_view(&mut app);
-
-        // View has History(0) ("Song 2") and History(1) ("Song 1")
-        assert_eq!(app.view[0], ViewItem::History(0));
-        assert_eq!(app.view[1], ViewItem::History(1));
-        app.selected = 1; // User selected Song 1 (2nd row)
-
-        record_history_entry(&mut app, "https://example.com/3.mp3", "Song 3");
-
-        // Song 3 was added at top. Song 1 is now at index 2.
-        // The selection must remain on Song 1!
-        assert_eq!(app.view[app.selected], ViewItem::History(2));
-        assert_eq!(app.history.get(2).unwrap().title, "Song 1");
-    }
-
-    #[test]
-    fn test_record_history_strips_userinfo() {
-        let mut app = test_app();
-        record_history_entry(
-            &mut app,
-            "http://user:pass@example.com/secret.mp3",
-            "Secret",
-        );
-        assert_eq!(app.history.len(), 1);
-        assert_eq!(
-            app.history.get(0).unwrap().url,
-            "http://example.com/secret.mp3"
         );
     }
 
@@ -7630,70 +7131,6 @@ mod tests {
             !text.contains("Próxima canción"),
             "sin player la franja no aparece (solo en el panel de Tab)"
         );
-    }
-
-    /// Bug: con shuffle apagado, `n`/`p` salteaban las filas de URL del
-    /// listado y caían en la primera pista local. El pool navegable ahora
-    /// incluye siempre las entradas del historial en orden de lista.
-    #[test]
-    fn step_keys_follow_url_rows_in_the_list_even_without_shuffle() {
-        let Some(mut engine) = engine_or_skip() else {
-            return;
-        };
-        let mut app = test_app();
-        let dir = std::env::temp_dir();
-        let p1 = dir.join(format!("mp3tui_stepurl_{}.wav", std::process::id()));
-        std::fs::write(&p1, make_test_wav(4410)).unwrap();
-        app.library = Some(crate::playlist::from_tracks_for_test(vec![
-            track_with_path(p1.clone(), "local"),
-        ]));
-        app.history.add(
-            "Uno".to_string(),
-            "https://www.youtube.com/watch?v=uno".to_string(),
-        );
-        app.history.add(
-            "Dos".to_string(),
-            "https://www.youtube.com/watch?v=dos".to_string(),
-        );
-        // El historial guarda el más reciente primero: la vista queda
-        // [Dos, Uno, local]. Parado en la URL del frente (Dos), 'n' debe
-        // reproducir la siguiente URL de la lista, no saltar a la pista local.
-        refresh_view(&mut app);
-        app.is_url = true;
-        app.current_url = Some((
-            "https://www.youtube.com/watch?v=dos".to_string(),
-            "Dos".to_string(),
-        ));
-        app.status = Status::Playing;
-
-        let mut captured: Vec<String> = Vec::new();
-        play_step_with(&mut app, &mut engine, 1, |_a, _e, request| {
-            captured.push(request.original_url);
-        });
-        assert_eq!(
-            captured,
-            vec!["https://www.youtube.com/watch?v=uno".to_string()],
-            "'n' desde una URL de la lista reproduce la SIGUIENTE URL del listado, no la pista local"
-        );
-
-        // Desde la segunda URL de la lista, 'p' vuelve a la primera.
-        app.current_url = Some((
-            "https://www.youtube.com/watch?v=uno".to_string(),
-            "Uno".to_string(),
-        ));
-        play_step_with(&mut app, &mut engine, -1, |_a, _e, request| {
-            captured.push(request.original_url);
-        });
-        assert_eq!(
-            captured,
-            vec![
-                "https://www.youtube.com/watch?v=uno".to_string(),
-                "https://www.youtube.com/watch?v=dos".to_string(),
-            ],
-            "'p' retrocede a la URL anterior de la lista"
-        );
-
-        let _ = std::fs::remove_file(&p1);
     }
 
     /// una URL encolada que falla al resolver se saltea — el cursor
