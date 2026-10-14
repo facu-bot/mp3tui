@@ -92,7 +92,9 @@ pub(super) fn handle_player_key(key: KeyEvent, app: &mut App, engine: &mut Audio
     } else if config::pressed(&keys.spotify_search, code) {
         open_spotify_search(app);
     } else if config::pressed(&keys.spotify_library, code) {
-        open_spotify_library(app);
+        focus_playlist_tree(app);
+    } else if config::pressed(&keys.player_view, code) {
+        toggle_explorer(app);
     } else if config::pressed(&keys.playlist_history, code) {
         open_history_modal(app);
     } else if config::pressed(&keys.clear_queue, code) {
@@ -113,6 +115,9 @@ pub(super) fn handle_list_key(key: KeyEvent, app: &mut App, engine: &mut AudioEn
     // suelta nunca cae acá.
     if config::pressed_ctrl(&keys.settings, key) {
         open_settings_panel(app);
+    // Con el foco en el árbol de playlists, sus teclas (mover, plegar,
+    // desplegar, reproducir) mandan; el resto sigue el camino de siempre.
+    } else if app.tree_focus && handle_tree_key(key, app) {
     // El orden importa: «back» antes que «quit» — Esc cierra el panel (o
     // sale del explorador sin player) aunque Esc también esté en «quit».
     // Tab no está en «back»: cae en «explorer» y no-opea sin player.
@@ -122,10 +127,12 @@ pub(super) fn handle_list_key(key: KeyEvent, app: &mut App, engine: &mut AudioEn
         toggle_explorer(app);
     } else if config::pressed(&keys.quit, code) {
         request_quit(app);
+    } else if config::pressed(&keys.player_view, code) {
+        toggle_explorer(app);
     } else if config::pressed(&keys.queue_panel, code) {
-        // Alterna la solapa del panel lateral (Biblioteca | Cola): cada lista
-        // conserva su propia selección (`selected` / `queue_selected`).
-        app.queue_panel = !app.queue_panel;
+        // Rota el foco entre las tres columnas (Locales → Playlists → Cola):
+        // cada lista conserva su propia selección.
+        cycle_panel_focus(app);
     } else if config::pressed(&keys.select, code) {
         if app.queue_panel {
             play_selected_queue_item(app, engine);
@@ -134,11 +141,11 @@ pub(super) fn handle_list_key(key: KeyEvent, app: &mut App, engine: &mut AudioEn
         }
     } else if config::pressed(&keys.enqueue, code) {
         // Encolar solo tiene sentido sobre la lista Biblioteca.
-        if !app.queue_panel {
+        if !app.queue_panel && !app.tree_focus {
             enqueue_selected(app);
         }
     } else if config::pressed(&keys.queue_delete, code) {
-        if app.queue_panel {
+        if app.queue_panel && !app.tree_focus {
             delete_selected_queue_item(app);
         }
     } else if config::pressed(&keys.clear_queue, code) {
@@ -160,7 +167,7 @@ pub(super) fn handle_list_key(key: KeyEvent, app: &mut App, engine: &mut AudioEn
     } else if config::pressed(&keys.spotify_search, code) {
         open_spotify_search(app);
     } else if config::pressed(&keys.spotify_library, code) {
-        open_spotify_library(app);
+        focus_playlist_tree(app);
     } else if config::pressed(&keys.playlist_history, code) {
         open_history_modal(app);
     } else if config::pressed(&keys.move_up, code) {
@@ -522,6 +529,7 @@ pub(super) fn go_back(app: &mut App) {
     if app.explorer_open {
         app.explorer_open = false;
         app.queue_panel = false;
+        app.tree_focus = false;
     } else if app.has_player {
         app.mode = Mode::Player;
     } else {
@@ -544,7 +552,28 @@ pub(super) fn toggle_explorer(app: &mut App) {
         resync_selection(app);
         start_scan(app);
     } else {
-        // Al cerrar el panel vuelve siempre a la solapa Biblioteca.
+        // Al cerrar la vista de lista el foco vuelve a los archivos locales.
         app.queue_panel = false;
+        app.tree_focus = false;
+    }
+}
+
+/// Rota el foco de la vista de lista: Locales → Playlists → Cola → Locales.
+/// Al entrar al árbol por primera vez pide las playlists.
+pub(super) fn cycle_panel_focus(app: &mut App) {
+    cycle_panel_focus_with(app, spawn_load_playlists);
+}
+
+pub(super) fn cycle_panel_focus_with(
+    app: &mut App,
+    spawn_playlists: impl FnOnce(u64, TreeSender),
+) {
+    if app.tree_focus {
+        app.tree_focus = false;
+        app.queue_panel = true;
+    } else if app.queue_panel {
+        app.queue_panel = false;
+    } else {
+        focus_playlist_tree_with(app, spawn_playlists);
     }
 }

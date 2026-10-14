@@ -211,10 +211,6 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &App, engine: &AudioEngine) {
         render_spotify_search(frame, search);
     }
 
-    if let Some(library) = &app.spotify_library {
-        render_spotify_library(frame, library);
-    }
-
     if let Some(modal) = &app.history_modal {
         render_history_modal(frame, &app.history, modal);
     }
@@ -600,26 +596,17 @@ pub(super) fn error_line(app: &App) -> Line<'static> {
     }
 }
 
-/// Áreas del reproductor: info (8 filas), visualizador (resto) y pie. Con el
-/// panel lateral abierto info + visualizador se achican al 64% del
-/// ancho y el explorador ocupa el 36% derecho superpuesto (más barras
-/// visibles pero el espectro sigue animando); el pie crece a 5 filas (3 de
-/// texto) para los atajos del panel y sigue a todo lo ancho para no cortarse.
+/// Áreas de la vista Reproductor (pantalla completa): info (9 filas),
+/// visualizador (resto) y pie.
 ///
 /// Footer comprimible — si `area.height < 30`, el pie se reduce a
-/// 2 filas (1 de borde + 1 de contenido) independientemente del panel.
-pub(super) fn player_areas(area: Rect, explorer_open: bool) -> (Rect, Rect, Rect, Option<Rect>) {
+/// 2 filas (1 de borde + 1 de contenido).
+pub(super) fn player_areas(area: Rect) -> (Rect, Rect, Rect) {
     // Umbral de compresión: con exactamente 30 filas se usa el layout completo.
     let compact = area.height < 30;
     // Cada línea de atajos suma una fila: el pie lleva las teclas de Spotify
     // (`u`, `l`, `h`) en su propia línea para que entren en 78 columnas.
-    let footer_height = if compact {
-        2
-    } else if explorer_open {
-        6
-    } else {
-        5
-    };
+    let footer_height = if compact { 2 } else { 5 };
 
     let zones = Layout::default()
         .direction(Direction::Vertical)
@@ -629,48 +616,171 @@ pub(super) fn player_areas(area: Rect, explorer_open: bool) -> (Rect, Rect, Rect
             Constraint::Length(footer_height),
         ])
         .split(area);
-    let footer = zones[2];
-    if !explorer_open {
-        return (zones[0], zones[1], footer, None);
+    (zones[0], zones[1], zones[2])
+}
+
+/// Con menos columnas que esto las tres no entran: se ve solo la que tiene el
+/// foco.
+const MIN_THREE_COLUMNS: u16 = 66;
+
+/// Columna de la vista de lista.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ListPanel {
+    Local,
+    Playlists,
+    Queue,
+}
+
+/// Columna que tiene el foco del teclado.
+pub(super) fn focused_panel(app: &App) -> ListPanel {
+    if app.tree_focus {
+        ListPanel::Playlists
+    } else if app.queue_panel {
+        ListPanel::Queue
+    } else {
+        ListPanel::Local
     }
-    let upper = Rect {
-        height: zones[0].height + zones[1].height,
-        ..zones[0]
-    };
+}
+
+/// Áreas de la vista de lista: línea de reproducción (1 fila), zona de
+/// columnas y pie. El pie crece con las líneas de atajos de las columnas.
+pub(super) fn list_areas(area: Rect) -> (Rect, Rect, Rect) {
+    let compact = area.height < 30;
+    let footer_height = if compact { 2 } else { 6 };
+    let zones = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(4),
+            Constraint::Length(footer_height),
+        ])
+        .split(area);
+    (zones[0], zones[1], zones[2])
+}
+
+/// Reparte la zona de columnas: Locales │ Playlists │ Cola, o solo la columna
+/// con el foco si el ancho no alcanza para las tres.
+pub(super) fn list_columns(area: Rect, focus: ListPanel) -> Vec<(ListPanel, Rect)> {
+    if area.width < MIN_THREE_COLUMNS {
+        return vec![(focus, area)];
+    }
     let columns = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(64), Constraint::Percentage(36)])
-        .split(upper);
-    let left = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(9), Constraint::Min(4)])
-        .split(columns[0]);
-    (left[0], left[1], footer, Some(columns[1]))
+        .constraints([
+            Constraint::Ratio(1, 3),
+            Constraint::Ratio(1, 3),
+            Constraint::Ratio(1, 3),
+        ])
+        .split(area);
+    vec![
+        (ListPanel::Local, columns[0]),
+        (ListPanel::Playlists, columns[1]),
+        (ListPanel::Queue, columns[2]),
+    ]
 }
 
 fn render_player(frame: &mut Frame<'_>, app: &App, engine: &AudioEngine) {
-    let (info_area, visual_area, footer_area, panel) =
-        player_areas(frame.area(), app.explorer_open);
+    if app.explorer_open {
+        render_list_view(frame, app, engine);
+        return;
+    }
+    let (info_area, visual_area, footer_area) = player_areas(frame.area());
     app.hit.borrow_mut().player = Some(info_area.union(visual_area));
 
-    // El foco visual va al panel cuando está abierto; info y
-    // visualizador quedan con borde apagado en ese caso.
-    let player_focused = !app.explorer_open;
-
-    render_player_info(frame, info_area, app, engine, player_focused);
-    render_visualizer(frame, visual_area, &app.analyzer, player_focused);
-    if let Some(panel_area) = panel {
-        render_explorer_panel(frame, panel_area, app);
-    }
+    render_player_info(frame, info_area, app, engine, true);
+    render_visualizer(frame, visual_area, &app.analyzer, true);
     let compact = frame.area().height < 30;
     render_footer(frame, footer_area, app, compact);
 }
 
-/// Panel lateral del explorador: la biblioteca superpuesta sobre el
-/// costado derecho, con el mismo bloque, título, scroll y marcadores de
-/// selección/reproducción que el explorador a pantalla completa.
-fn render_explorer_panel(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    render_library(frame, area, app, true);
+/// Vista de lista (la principal): canción actual en una línea, las tres
+/// columnas y el pie de atajos.
+fn render_list_view(frame: &mut Frame<'_>, app: &App, engine: &AudioEngine) {
+    let (now_area, columns_area, footer_area) = list_areas(frame.area());
+    app.hit.borrow_mut().player = Some(now_area);
+    let width = usize::from(now_area.width);
+    frame.render_widget(
+        Paragraph::new(now_playing_line(
+            &app.track_label,
+            app.status,
+            engine.position(),
+            engine.duration().or_else(|| current_track_duration(app)),
+            width,
+        )),
+        now_area,
+    );
+    render_columns(frame, columns_area, app);
+    let compact = frame.area().height < 30;
+    render_footer(frame, footer_area, app, compact);
+}
+
+/// Dibuja las columnas de la vista de lista.
+fn render_columns(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let focus = focused_panel(app);
+    for (panel, rect) in list_columns(area, focus) {
+        let focused = panel == focus;
+        match panel {
+            ListPanel::Local => render_library(frame, rect, app, focused, false),
+            ListPanel::Playlists => render_playlist_panel(frame, rect, app, focused),
+            ListPanel::Queue => render_library(frame, rect, app, focused, true),
+        }
+    }
+}
+
+/// Columna central: el árbol de playlists de Spotify.
+fn render_playlist_panel(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
+    let color = if focused { theme().accent } else { theme().dim };
+    let tree = &app.playlist_tree;
+    let title = match (&tree.load, tree.playlists.len()) {
+        (TreeLoad::Ready, count) if count > 0 => format!(" Playlists · {count} "),
+        _ => " Playlists ".to_string(),
+    };
+    let block = Block::bordered()
+        .border_style(Style::default().fg(color))
+        .title(Span::styled(
+            title,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let lines = playlist_tree_lines(tree, usize::from(inner.width), usize::from(inner.height));
+    frame.render_widget(
+        Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }),
+        inner,
+    );
+}
+
+/// Línea compacta de la vista de lista: estado, canción y progreso.
+pub(super) fn now_playing_line(
+    label: &str,
+    status: Status,
+    position: Duration,
+    duration: Option<Duration>,
+    width: usize,
+) -> Line<'static> {
+    let colors = theme();
+    let (icon, icon_color) = match status {
+        Status::Playing => (PLAYING, colors.ok),
+        Status::Paused => ("\u{23f8}", colors.warn),
+        Status::Ended | Status::Stopped => ("\u{25a0}", colors.dim),
+        Status::Resolving | Status::Connecting => ("\u{2026}", colors.warn),
+    };
+    let progress = match duration.filter(|total| !total.is_zero()) {
+        Some(total) => format!("{} / {}", format_duration(position), format_duration(total)),
+        None => format_duration(position),
+    };
+    let title = if label.is_empty() { "—" } else { label };
+    // « ▶ título … 01:23 / 04:00 »: el título cede ancho antes que el tiempo.
+    let progress_width = progress.chars().count();
+    let title_width = width.saturating_sub(progress_width + 5).max(1);
+    let title = truncate_chars(title, title_width);
+    let gap = width.saturating_sub(title.chars().count() + progress_width + 3);
+    Line::from(vec![
+        Span::styled(format!(" {icon} "), Style::default().fg(icon_color)),
+        Span::styled(title, Style::default().fg(colors.text)),
+        Span::raw(" ".repeat(gap)),
+        Span::styled(progress, Style::default().fg(colors.dim)),
+    ])
 }
 
 fn render_player_info(
@@ -1029,7 +1139,7 @@ fn render_browser(frame: &mut Frame<'_>, app: &App) {
         .split(frame.area());
 
     render_browser_header(frame, zones[0], app);
-    render_library(frame, zones[1], app, false);
+    render_columns(frame, zones[1], app);
     let compact = frame.area().height < 30;
     render_footer(frame, zones[2], app, compact);
 }
@@ -1074,11 +1184,8 @@ fn render_browser_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
 /// `focused` controla el color del borde (acento cuando tiene foco,
 /// apagado cuando el panel del explorador tiene el foco).
-fn render_library(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
+fn render_library(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool, queue_view: bool) {
     let folder = library_folder_label(app);
-    // La solapa Cola solo existe en el panel lateral (con player); en el
-    // explorador a pantalla completa siempre se ve la Biblioteca.
-    let queue_view = app.explorer_open && app.queue_panel;
     // Buscando: borde y título en el color de aviso (warn) en vez del acento
     // normal, para que el modo búsqueda se note de un vistazo y no sólo por
     // el texto "Buscar:" (que puede pasar desapercibido).
@@ -1111,7 +1218,8 @@ fn render_library(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
     // PANEL lateral (sesión de audio con Tab abierto): en el explorador a
     // pantalla completa sin player no hay panel y no se dibuja. Sin próximo
     // no agrega ruido, igual que la línea del reproductor.
-    let has_next = app.has_player
+    let has_next = queue_view
+        && app.has_player
         && matches!(
             &app.next_up,
             Some(title) if !title.is_empty()
@@ -1359,7 +1467,7 @@ pub(super) fn queue_rows(app: &App, width: u16, height: u16) -> Vec<Line<'static
     }
     if app.queue.is_empty() {
         return vec![Line::styled(
-            " La cola está vacía: apretá a en la Biblioteca para encolar ",
+            " La cola está vacía: apretá a en Locales para encolar ",
             Style::default().fg(theme().dim),
         )];
     }
@@ -1536,7 +1644,7 @@ pub(super) fn library_title(app: &App, folder: &str) -> String {
         )
     } else {
         match &app.library {
-            None => format!(" Biblioteca · {folder} "),
+            None => format!(" Locales · {folder} "),
             Some(library) => {
                 let count = if app.filter.is_some() {
                     format!("{}/{}", app.view.len(), library.len())
@@ -1544,9 +1652,9 @@ pub(super) fn library_title(app: &App, folder: &str) -> String {
                     format!("{}", library.len())
                 };
                 let mut base = if app.scan_rx.is_some() {
-                    format!(" Biblioteca · {count} pistas · {folder} · actualizando… ")
+                    format!(" Locales · {count} pistas · {folder} · actualizando… ")
                 } else {
-                    format!(" Biblioteca · {count} pistas · {folder} ")
+                    format!(" Locales · {count} pistas · {folder} ")
                 };
                 if let Some(filter) = &app.filter {
                     base.push_str(&format!("· filtro \"{filter}\" "));
@@ -2549,10 +2657,6 @@ pub(super) fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
         return spotify_search_footer(search);
     }
 
-    if let Some(library) = &app.spotify_library {
-        return spotify_library_footer(library);
-    }
-
     if app.history_modal.is_some() {
         return history_modal_footer(app);
     }
@@ -2612,16 +2716,21 @@ pub(super) fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
 
     let keys = &config::config().keys;
     match app.mode {
-        // Panel lateral abierto: 3 líneas — lista, reproducción y el
-        // recordatorio de que ↑/↓ son volumen solo con el panel cerrado.
-        // `sig/ant` se expande porque entra en 78 reagrupando. La búsqueda
-        // (`u`) se anuncia en el borde del pie, no en estas líneas.
-        // La línea de acciones de la lista cambia según la solapa: en
-        // Biblioteca `a: encolar`; en Cola, `d: borrar` y `c: biblio`.
+        // Vista de lista: 4 líneas — navegación, acciones de la columna con
+        // foco, reproducción y las teclas de Spotify. `v` vuelve al reproductor
+        // (donde ↑/↓ son volumen). La búsqueda (`u`) se anuncia en el borde.
         Mode::Player if app.explorer_open => {
-            let list_hint = if app.queue_panel {
-                format!(
-                    " {}: pausa   {}/{}: ±5s   {}: borrar   {}: vaciar   {}: biblio   {}×2: salir",
+            let column_hint = match focused_panel(app) {
+                ListPanel::Playlists => format!(
+                    " {}/{}: plegar/desplegar   {}: pausa   {}: foco   {}×2: salir",
+                    key_labels(&keys.seek_back),
+                    key_labels(&keys.seek_fwd),
+                    key_labels(&keys.play_pause),
+                    key_labels(&keys.queue_panel),
+                    key_labels(&keys.quit),
+                ),
+                ListPanel::Queue => format!(
+                    " {}: pausa   {}/{}: ±5s   {}: borrar   {}: vaciar   {}: foco   {}×2: salir",
                     key_labels(&keys.play_pause),
                     key_labels(&keys.seek_back),
                     key_labels(&keys.seek_fwd),
@@ -2629,10 +2738,9 @@ pub(super) fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
                     key_labels(&keys.clear_queue),
                     key_labels(&keys.queue_panel),
                     key_labels(&keys.quit),
-                )
-            } else {
-                format!(
-                    " {}: pausa   {}/{}: ±5s   {}: encolar   {}: cola   {}: vaciar   {}×2: salir",
+                ),
+                ListPanel::Local => format!(
+                    " {}: pausa   {}/{}: ±5s   {}: encolar   {}: foco   {}: vaciar   {}×2: salir",
                     key_labels(&keys.play_pause),
                     key_labels(&keys.seek_back),
                     key_labels(&keys.seek_fwd),
@@ -2640,7 +2748,7 @@ pub(super) fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
                     key_labels(&keys.queue_panel),
                     key_labels(&keys.clear_queue),
                     key_labels(&keys.quit),
-                )
+                ),
             };
             vec![
                 Line::from(format!(
@@ -2652,11 +2760,12 @@ pub(super) fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
                     key_labels(&keys.back),
                     key_labels(&keys.explorer),
                 )),
-                Line::from(list_hint),
+                Line::from(column_hint),
                 Line::from(format!(
-                    " {}/{}: pista siguiente/anterior   volumen {}/{}: con el panel cerrado   {}/{}: vel",
+                    " {}/{}: pista siguiente/anterior   {}: reproductor (volumen {}/{})   {}/{}: vel",
                     key_labels(&keys.next_track),
                     key_labels(&keys.prev_track),
+                    key_labels(&keys.player_view),
                     key_labels(&keys.volume_up),
                     key_labels(&keys.volume_down),
                     key_labels(&keys.speed_down),
@@ -2671,9 +2780,10 @@ pub(super) fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
         // config/salida.
         Mode::Player => vec![
             Line::from(format!(
-                " {}: biblio   {}: buscar   {}: pausa   {}/{}: vol   {}/{}: ±5s   \
+                " {}/{}: lista   {}: buscar   {}: pausa   {}/{}: vol   {}/{}: ±5s   \
                  {}/{}: pista",
                 key_labels(&keys.explorer),
+                key_labels(&keys.player_view),
                 key_labels(&keys.search),
                 key_labels(&keys.play_pause),
                 key_labels(&keys.volume_up),
@@ -2824,7 +2934,6 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App, compact: bool) {
 fn modal_open(app: &App) -> bool {
     app.url_input.is_some()
         || app.spotify_search.is_some()
-        || app.spotify_library.is_some()
         || app.history_modal.is_some()
         || app.search.is_some()
         || app.theme_menu.is_some()

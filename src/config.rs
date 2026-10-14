@@ -911,8 +911,13 @@ pub struct Keys {
     pub search: Vec<KeyCode>,
     /// Abrir el buscador (Spotify, URLs y rutas locales). Por defecto 'u'.
     pub spotify_search: Vec<KeyCode>,
-    /// Abrir el panel con tus playlists de Spotify y sus temas. Por defecto 'l'.
+    /// Enfocar (y abrir) el árbol de playlists de Spotify en la vista de
+    /// lista. Por defecto 'l'. Conserva el nombre `spotify_library` por
+    /// compatibilidad con configs existentes.
     pub spotify_library: Vec<KeyCode>,
+    /// Alternar entre la vista de lista (Locales │ Playlists │ Cola) y la
+    /// vista Reproductor a pantalla completa. Por defecto 'v'.
+    pub player_view: Vec<KeyCode>,
     /// Abrir el historial de playlists y álbumes de Spotify. Por defecto 'h'.
     pub playlist_history: Vec<KeyCode>,
     pub speed_up: Vec<KeyCode>,
@@ -939,8 +944,8 @@ pub struct Keys {
     /// Encolar el ítem seleccionado de la Biblioteca (pista local o URL del
     /// historial) al final de la cola. Por defecto 'a'.
     pub enqueue: Vec<KeyCode>,
-    /// Alternar la solapa del panel lateral entre Biblioteca y Cola. Por
-    /// defecto 'c'.
+    /// Rotar el foco de la vista de lista entre Locales, Playlists y Cola.
+    /// Por defecto 'c'.
     pub queue_panel: Vec<KeyCode>,
     /// Eliminar el ítem seleccionado de la cola. Por defecto 'd'.
     pub queue_delete: Vec<KeyCode>,
@@ -973,6 +978,7 @@ impl Default for Keys {
             search: keys(&[KeyCode::Char('b')]),
             spotify_search: keys(&[KeyCode::Char('u')]),
             spotify_library: keys(&[KeyCode::Char('l')]),
+            player_view: keys(&[KeyCode::Char('v')]),
             playlist_history: keys(&[KeyCode::Char('h')]),
             speed_up: keys(&[KeyCode::Char(']')]),
             speed_down: keys(&[KeyCode::Char('[')]),
@@ -1011,6 +1017,7 @@ fn parse_keybindings(section: &toml::Table, keys: &mut Keys, warnings: &mut Vec<
             "search" => &mut keys.search,
             "spotify_search" => &mut keys.spotify_search,
             "spotify_library" => &mut keys.spotify_library,
+            "player_view" => &mut keys.player_view,
             "playlist_history" => &mut keys.playlist_history,
             "open_url" => &mut keys.open_url,
             "enqueue" => &mut keys.enqueue,
@@ -1108,6 +1115,7 @@ fn resolve_key_collisions(keys: &mut Keys, warnings: &mut Vec<String>) {
             &mut keys.playlist_history,
             &defaults.playlist_history,
         ),
+        ("player_view", &mut keys.player_view, &defaults.player_view),
         ("open_url", &mut keys.open_url, &defaults.open_url),
         ("enqueue", &mut keys.enqueue, &defaults.enqueue),
         ("queue_panel", &mut keys.queue_panel, &defaults.queue_panel),
@@ -2476,6 +2484,24 @@ zoom = 2",
     }
 
     #[test]
+    fn player_view_default_is_v_and_can_be_remapped() {
+        assert_eq!(Keys::default().player_view, vec![KeyCode::Char('v')]);
+        let config = parse("[keybindings]\nplayer_view = \"m\"");
+        assert_eq!(config.keys.player_view, vec![KeyCode::Char('m')]);
+        assert!(config.warnings.is_empty(), "{:?}", config.warnings);
+    }
+
+    #[test]
+    fn player_view_collision_warns_and_the_earlier_action_wins() {
+        let config = parse("[keybindings]\nplayer_view = \"h\"");
+        // playlist_history va antes: player_view pierde 'h' y vuelve a 'v'.
+        assert_eq!(config.keys.playlist_history, vec![KeyCode::Char('h')]);
+        assert_eq!(config.keys.player_view, vec![KeyCode::Char('v')]);
+        assert_eq!(config.warnings.len(), 1, "{:?}", config.warnings);
+        assert!(config.warnings[0].contains("player_view"), "{:?}", config.warnings);
+    }
+
+    #[test]
     fn playlist_history_default_is_h_and_can_be_remapped() {
         assert_eq!(Keys::default().playlist_history, vec![KeyCode::Char('h')]);
         let config = parse("[keybindings]\nplaylist_history = \"j\"");
@@ -2518,7 +2544,7 @@ zoom = 2",
         assert_eq!(
             keys.queue_panel,
             vec![KeyCode::Char('c')],
-            "c alterna Biblioteca/Cola"
+            "c rota el foco entre las columnas"
         );
         assert_eq!(
             keys.queue_delete,

@@ -37,6 +37,10 @@ pub struct SpotifyPlaylist {
     pub name: String,
     pub owner: Option<String>,
     pub tracks_total: Option<u64>,
+    /// Pública (`Some(true)`) o privada (`Some(false)`); `None` cuando Spotify
+    /// no informa el campo.
+    pub public: Option<bool>,
+    pub collaborative: bool,
 }
 
 /// Artista de Spotify, con lo mínimo para mostrar resultados de búsqueda.
@@ -377,6 +381,8 @@ impl SpotifyPlaylist {
                 .and_then(|owner| owner.display_name)
                 .filter(|n| !n.is_empty()),
             tracks_total: playlist.tracks.and_then(|tracks| tracks.total),
+            public: playlist.public,
+            collaborative: playlist.collaborative.unwrap_or(false),
         }
     }
 }
@@ -491,6 +497,10 @@ struct ApiPlaylist {
     owner: Option<ApiOwner>,
     #[serde(default)]
     tracks: Option<ApiTracksRef>,
+    #[serde(default)]
+    public: Option<bool>,
+    #[serde(default)]
+    collaborative: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -762,6 +772,35 @@ mod tests {
     }
 
     // --- paginación ---
+
+    #[test]
+    fn test_my_playlists_reads_public_and_collaborative_with_defaults() {
+        let path = temp_path("playlist_visibility");
+        write_tokens(&path, "TOKEN-1");
+        let stub = Stub::spawn(|_| {
+            vec![json_response(
+                200,
+                r#"{"items":[
+                    {"id":"a","name":"Publica","public":true,"collaborative":false},
+                    {"id":"b","name":"Privada","public":false,"collaborative":true},
+                    {"id":"c","name":"Sin campos"},
+                    {"id":"d","name":"Nulo","public":null}
+                ],"next":null}"#,
+            )]
+        });
+        let client = client_with(&stub.base_url, "http://127.0.0.1:1/api/token", &path);
+        let playlists = client.my_playlists().unwrap();
+        stub.finish();
+
+        assert_eq!(playlists[0].public, Some(true));
+        assert!(!playlists[0].collaborative);
+        assert_eq!(playlists[1].public, Some(false));
+        assert!(playlists[1].collaborative);
+        // Spotify no siempre informa el campo: ausente o null = desconocido.
+        assert_eq!(playlists[2].public, None);
+        assert!(!playlists[2].collaborative);
+        assert_eq!(playlists[3].public, None);
+    }
 
     #[test]
     fn test_playlist_tracks_follows_next_pages() {

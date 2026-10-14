@@ -410,6 +410,8 @@ mod tests {
             name: name.to_string(),
             owner: owner.map(str::to_string),
             tracks_total: total,
+            public: None,
+            collaborative: false,
         }
     }
 

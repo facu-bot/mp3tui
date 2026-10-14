@@ -497,6 +497,8 @@ mod tests {
             name: "Mix".into(),
             owner: Some("yo".into()),
             tracks_total: Some(2),
+            public: None,
+            collaborative: false,
         };
         let connect = library_connect(
             Ok(vec![playlist.clone()]),

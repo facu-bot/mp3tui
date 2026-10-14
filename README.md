@@ -62,9 +62,32 @@ reproduce. **El audio no sale de Spotify**: la Web API solo entrega metadatos
 igual que cualquier link de YouTube. Por eso **no hace falta Spotify Premium ni
 cookies de Spotify**; sí necesitás `yt-dlp` instalado.
 
-Con `l` abrís un panel con **tus playlists** (incluye las privadas, requiere haber
-hecho `mp3tui --spotify-login`): al elegir una ves sus temas y podés reproducir
-toda la playlist o un tema suelto, sin volcar nada a la cola.
+Con `l` enfocás el **árbol de playlists** (la columna del medio de la vista de
+lista, ver más abajo): tus playlists y las de otros que seguís, incluidas las
+privadas (requiere haber hecho `mp3tui --spotify-login`). Se carga al enfocarlo
+por primera vez y se ve así:
+
+```
+▸ Rock                       pub
+▾ Jazz                      priv
+    Miles Davis - So What
+    John Coltrane - Naima
+▸ Mix                          ?
+```
+
+- **`▸` / `▾`**: playlist plegada / desplegada. `→` la despliega y `←` la pliega
+  (desde una canción, `←` vuelve a su playlist). Las canciones se piden a
+  Spotify **recién al desplegar** (una llamada por playlist abierta) y
+  quedan en memoria: plegar y volver a desplegar no vuelve a pedirlas.
+- **`pub` / `priv` / `?`**: pública, privada, o `?` cuando Spotify no informa el
+  campo. `colab` se suma si la playlist es colaborativa.
+- **`Enter`** sobre una playlist la reproduce (la primera suena y el resto entra
+  a la cola, como al pegar su URL); sobre una canción reproduce esa canción.
+- Se navega con las mismas teclas que las otras listas (`↑` `↓` `PgUp` `PgDn`
+  `Inicio` `Fin`).
+- Los errores se ven en la misma columna: sin `client_id` (con cómo configurarlo),
+  sin sesión (correr `mp3tui --spotify-login`) y límite de tasa de Spotify (429,
+  con los segundos de espera). `Enter` reintenta.
 
 Cada playlist o álbum de Spotify que ponés queda registrado (nombre, cantidad de
 canciones y las primeras) y con `h` abrís el historial para volver a ponerlo.
@@ -72,6 +95,32 @@ El historial viejo de URLs sueltas ya no existe: el archivo anterior se ignora
 sin avisar de corrupción. Si pegaste el link de la playlist, el nombre que se
 guarda es genérico ("Playlist de Spotify"); al elegirla desde `u` o `l` se
 guarda con su nombre real.
+
+## Vistas
+
+La pantalla principal (la que ves al abrir una carpeta o sin argumentos; al
+abrir un archivo o una URL arrancás en el reproductor y llegás con `v`) tiene
+**tres columnas**:
+
+```
+ ▶ Artista - Título                                       1:23 / 4:00
+┌ Locales ──────────┐┌ Playlists ────────┐┌ Cola · 3 ítems ─────┐
+│ tus archivos      ││ ▸ Rock        pub ││ …                   │
+└───────────────────┘└───────────────────┘└─────────────────────┘
+```
+
+- **Locales** (izquierda): la biblioteca de archivos locales.
+- **Playlists** (centro): el árbol de playlists de Spotify.
+- **Cola** (derecha): la cola actual.
+- Arriba, una línea compacta con la canción que suena y su progreso.
+- `c` rota el foco entre las tres columnas (Locales → Playlists → Cola); el
+  pie de atajos cambia según la columna con foco. En terminales angostas
+  (menos de 66 columnas) se ve solo la columna con foco.
+- **`v`** alterna con la **vista Reproductor** a pantalla completa (info,
+  volumen, progreso y visualizador); `v` (o `Tab`) vuelve a la lista. En la lista,
+  `Esc` también vuelve al reproductor. Todas las
+  teclas son configurables en `[keybindings]` (`player_view`, `spotify_library`,
+  `queue_panel`).
 
 ### Registrar una app propia
 
@@ -211,8 +260,9 @@ src/
 ├── main.rs                 # punto de entrada
 ├── ui/                     # interfaz en terminal
 │   ├── mod.rs              #   App, ciclo de eventos y dispatch
-│   ├── render.rs           #   dibujado (player, panel, visualizador, barras)
+│   ├── render.rs           #   dibujado (player, columnas, visualizador, barras)
 │   ├── queue.rs            #   cola de reproducción y flujos de URL
+│   ├── playlist_tree.rs    #   árbol de playlists de Spotify (carga perezosa)
 │   ├── keys.rs             #   atajos, menús y prompt
 │   ├── mouse.rs            #   clics y zonas interactivas
 │   └── tests_common.rs     #   helpers de los tests
@@ -244,22 +294,22 @@ request — las contribuciones son bienvenidas.
 | `←` / `→` | Seek ±5 s |
 | `n` / `p` | Pista siguiente / anterior (con la Cola cargada, la recorre) |
 | `s` / `r` | Aleatorio / repetir |
-| `Tab` | Biblioteca (panel lateral) |
+| `v` / `Tab` | Alternar la vista de lista (Locales │ Playlists │ Cola) y la vista Reproductor |
 | `b` | Buscar |
 | `u` | Buscar en Spotify, o pegar una URL / ruta local (una playlist se lista y encola el resto) |
-| `a` | Encolar la pista seleccionada de la Biblioteca |
-| `c` | Alternar el panel lateral entre Biblioteca y Cola |
+| `a` | Encolar la pista seleccionada de Locales |
+| `c` | Rotar el foco entre Locales, Playlists y Cola |
 | `d` | Borrar el ítem seleccionado de la Cola |
 | `x` | Vaciar toda la Cola (lo que suena sigue sonando) |
-| `l` | Mis playlists de Spotify: elegí una para ver sus temas (`espacio` reproduce toda la playlist, `Enter` un tema suelto) |
+| `l` | Enfocar el árbol de playlists de Spotify (`→`/`←` despliegan/pliegan, `Enter` reproduce la playlist o la canción) |
 | `h` | Historial de playlists y álbumes de Spotify que pusiste (`Enter` la vuelve a reproducir y **reemplaza la cola**) |
 | `Ctrl+P` | Configuración (temas, bandas, modo) |
 | `Esc` `Esc` | Salir |
 
 ## Cola de reproducción
 
-Encolá pistas con `a` (Biblioteca) o pegando una URL. Los ítems
-encolados se ven en el panel lateral con `c`. La cola es una lista con un
+Encolá pistas con `a` (Locales) o pegando una URL. Los ítems
+encolados se ven en la columna Cola de la vista de lista. La cola es una lista con un
 **cursor** sobre el ítem que está sonando desde ella: `n` y el fin de pista
 avanzan el cursor, `p` retrocede uno y reproduce el anterior. Los ítems no se
 consumen al sonar: los ya sonados quedan atenuados en el panel y el ítem parado

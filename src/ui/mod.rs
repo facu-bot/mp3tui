@@ -319,12 +319,11 @@ struct App {
     /// descarta. Independiente de `ytdlp_request_id` para que buscar no corte
     /// la reproducción en curso.
     spotify_search_id: u64,
-    /// Panel «Mis playlists» de Spotify: `Some` mientras está abierto.
-    spotify_library: Option<SpotifyLibrary>,
-    /// Receiver de la carga (playlists o temas) en curso, en un hilo aparte.
-    spotify_library_rx: Option<Receiver<SpotifyLibraryMessage>>,
-    /// Id de la carga vigente: un resultado con otro id llegó tarde.
-    spotify_library_id: u64,
+    /// Árbol de playlists de Spotify (columna central de la vista de lista).
+    playlist_tree: PlaylistTree,
+    /// El foco de la vista de lista está en el árbol de playlists (si no,
+    /// `queue_panel` elige entre la cola y los archivos locales).
+    tree_focus: bool,
     /// Modal del historial de playlists: `Some` mientras está abierto.
     history_modal: Option<HistoryModal>,
     /// Pedido de listado cuyo resultado REEMPLAZA la cola (replay desde el
@@ -552,9 +551,8 @@ pub fn run(engine: &mut AudioEngine, start: StartMode) -> io::Result<()> {
         spotify_search: None,
         spotify_search_rx: None,
         spotify_search_id: 0,
-        spotify_library: None,
-        spotify_library_rx: None,
-        spotify_library_id: 0,
+        playlist_tree: PlaylistTree::new(),
+        tree_focus: false,
         history_modal: None,
         replace_queue_req: None,
         is_url: is_url_start,
@@ -641,7 +639,7 @@ fn event_loop(tui: &mut Tui, app: &mut App, engine: &mut AudioEngine) -> io::Res
 
         // Búsqueda de Spotify en su hilo: el resultado llena el modal.
         poll_spotify_search(app);
-        poll_spotify_library(app);
+        poll_playlist_tree(app);
 
         if let Some(rx) = &app.ytdlp_rx {
             match rx.try_recv() {
@@ -795,12 +793,6 @@ fn dispatch_key(key: KeyEvent, app: &mut App, engine: &mut AudioEngine) {
 
     if app.history_modal.is_some() {
         handle_history_key(key, app);
-        return;
-    }
-
-    // Panel de playlists de Spotify: modal sin campo de texto.
-    if app.spotify_library.is_some() {
-        handle_spotify_library_key(key, app);
         return;
     }
 
@@ -992,7 +984,7 @@ mod mouse;
 mod queue;
 mod render;
 mod playlist_history;
-mod spotify_library;
+mod playlist_tree;
 mod spotify_search;
 #[cfg(test)]
 mod tests_common;
@@ -1002,7 +994,7 @@ use self::mouse::*;
 use self::queue::*;
 use self::render::*;
 use self::playlist_history::*;
-use self::spotify_library::*;
+use self::playlist_tree::*;
 use self::spotify_search::*;
 
 #[cfg(test)]
@@ -2191,43 +2183,44 @@ mod tests {
     }
 
     #[test]
-    fn player_areas_shrinks_the_main_column_and_keeps_the_footer_full_width() {
+    fn player_view_takes_the_whole_screen_with_a_five_row_footer() {
         let area = Rect::new(0, 0, 100, 30);
-
-        let (info, visual, footer, panel) = player_areas(area, false);
-        assert_eq!(panel, None, "panel cerrado = layout clásico");
+        let (info, visual, footer) = player_areas(area);
         assert_eq!((info.x, info.width), (0, 100));
         assert_eq!((visual.x, visual.width), (0, 100));
+        assert_eq!(footer.width, 100);
         assert_eq!(footer.height, 5, "pie clásico con 3 líneas");
+        assert_eq!(visual.y, info.y + info.height);
+        assert_eq!(info.height + visual.height + footer.height, 30, "sin solapes");
 
-        let (info, visual, footer, panel) = player_areas(area, true);
-        let panel = panel.expect("panel abierto");
+        let (_, _, compact_footer) = player_areas(Rect::new(0, 0, 100, 29));
+        assert_eq!(compact_footer.height, 2, "bajo 30 filas el pie se comprime");
+    }
+
+    #[test]
+    fn list_view_is_a_now_playing_line_three_columns_and_a_full_width_footer() {
+        let area = Rect::new(0, 0, 120, 40);
+        let (now, columns, footer) = list_areas(area);
+        assert_eq!(now.height, 1, "línea compacta de la canción actual");
+        assert_eq!(footer.height, 6);
+        assert_eq!(footer.width, 120, "el pie sigue a todo lo ancho");
+        assert_eq!(now.height + columns.height + footer.height, 40, "sin solapes");
+
+        let cols = list_columns(columns, ListPanel::Local);
+        let panels: Vec<ListPanel> = cols.iter().map(|(panel, _)| *panel).collect();
         assert_eq!(
-            (panel.x, panel.width),
-            (64, 36),
-            "36% derecho para la lista"
+            panels,
+            vec![ListPanel::Local, ListPanel::Playlists, ListPanel::Queue],
+            "Locales │ Playlists │ Cola, de izquierda a derecha"
         );
-        assert_eq!(info.x + info.width, 64, "la info se achica antes del panel");
-        assert_eq!(
-            visual.x + visual.width,
-            64,
-            "el visualizador sigue visible (comprimido) a la izquierda"
-        );
-        assert_eq!(
-            visual.y,
-            info.y + info.height,
-            "el visualizador arranca debajo de la info"
-        );
-        assert_eq!(footer.width, 100, "el pie sigue a todo lo ancho");
-        assert_eq!(
-            footer.height, 6,
-            "pie con 4 líneas para los atajos del panel"
-        );
-        assert_eq!(
-            info.y + info.height + visual.height,
-            footer.y,
-            "sin solapes entre zonas"
-        );
+        let widths: Vec<u16> = cols.iter().map(|(_, rect)| rect.width).collect();
+        assert_eq!(widths.iter().sum::<u16>(), 120);
+        assert!(widths.iter().all(|w| (39..=41).contains(w)), "{widths:?}");
+        assert!(cols.windows(2).all(|w| w[0].1.x + w[0].1.width == w[1].1.x));
+
+        // Angosto: solo la columna con el foco, a todo el ancho.
+        let narrow = list_columns(Rect::new(0, 0, 50, 20), ListPanel::Playlists);
+        assert_eq!(narrow, vec![(ListPanel::Playlists, Rect::new(0, 0, 50, 20))]);
     }
 
     #[test]
@@ -2426,7 +2419,7 @@ mod tests {
         // Pie del player reequilibrado en 2 líneas — restaura
         // `Tab: biblio`; `↑/↓: vol` abrevia para que entre en 78 cols.
         for hint in [
-            "Tab: biblio",
+            "Tab/v: lista",
             "b: buscar",
             "espacio: pausa",
             "↑/↓: vol",
@@ -2505,7 +2498,7 @@ mod tests {
             "[/]: vel",
             "n/p: pista siguiente/anterior",
             "Esc×2: salir",
-            "volumen ↑/↓: con el panel cerrado",
+            "v: reproductor (volumen ↑/↓)",
         ] {
             assert!(
                 panel.contains(hint),
@@ -5736,10 +5729,10 @@ mod tests {
         assert_eq!(app.view.len(), 3, "la lista no cambia");
     }
 
-    /// `c` alterna Biblioteca y Cola dentro del panel; cada lista conserva su
-    /// propia selección.
+    /// `c` rota el foco Locales → Playlists → Cola → Locales; cada lista
+    /// conserva su propia selección.
     #[test]
-    fn queue_panel_key_toggles_lists_and_keeps_two_selections() {
+    fn queue_panel_key_cycles_the_three_columns_and_keeps_their_selections() {
         let Some(mut engine) = engine_or_skip() else {
             return;
         };
@@ -5747,20 +5740,26 @@ mod tests {
         app.mode = Mode::Player;
         app.has_player = true;
         app.explorer_open = true;
+        // Árbol ya cargado: rotar el foco no lanza ningún pedido de red.
+        app.playlist_tree.load = TreeLoad::Ready;
         app.selected = 2;
         app.queue.push(QueueItem::Local(track_named("uno")));
         app.queue.push(QueueItem::Local(track_named("dos")));
+        assert_eq!(focused_panel(&app), ListPanel::Local);
 
         handle_list_key(theme_menu_key(KeyCode::Char('c')), &mut app, &mut engine);
-        assert!(app.queue_panel, "c muestra la Cola en el panel");
-        assert_eq!(app.selected, 2, "la selección de Biblioteca no se toca");
+        assert_eq!(focused_panel(&app), ListPanel::Playlists, "c pasa al árbol");
+        assert_eq!(app.selected, 2, "la selección de Locales no se toca");
+
+        handle_list_key(theme_menu_key(KeyCode::Char('c')), &mut app, &mut engine);
+        assert_eq!(focused_panel(&app), ListPanel::Queue, "c pasa a la Cola");
 
         handle_list_key(theme_menu_key(KeyCode::Down), &mut app, &mut engine);
         assert_eq!(app.queue_selected, 1, "↓ mueve la selección de la Cola");
-        assert_eq!(app.selected, 2, "y no la de Biblioteca");
+        assert_eq!(app.selected, 2, "y no la de Locales");
 
         handle_list_key(theme_menu_key(KeyCode::Char('c')), &mut app, &mut engine);
-        assert!(!app.queue_panel, "c vuelve a Biblioteca");
+        assert_eq!(focused_panel(&app), ListPanel::Local, "c vuelve a Locales");
         assert_eq!(app.queue_selected, 1, "la Cola conserva su selección");
     }
 
