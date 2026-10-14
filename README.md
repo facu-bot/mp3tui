@@ -235,10 +235,11 @@ request — las contribuciones son bienvenidas.
 | `s` / `r` | Aleatorio / repetir |
 | `Tab` | Biblioteca (panel lateral) |
 | `b` | Buscar |
-| `u` | Reproducir una URL (una URL de playlist se lista y encola el resto) |
+| `u` | Buscar en Spotify, o pegar una URL / ruta local (una playlist se lista y encola el resto) |
 | `a` | Encolar la pista seleccionada de la Biblioteca |
 | `c` | Alternar el panel lateral entre Biblioteca y Cola |
 | `d` | Borrar el ítem seleccionado de la Cola |
+| `x` | Vaciar toda la Cola (lo que suena sigue sonando) |
 | `Ctrl+P` | Configuración (temas, bandas, modo) |
 | `Esc` `Esc` | Salir |
 
@@ -259,7 +260,7 @@ cuántas faltan detrás). Sin nada por delante esa línea no aparece.
 
 ### Playlists de YouTube
 
-Si la URL que das (por el prompt `u` o como argumento `mp3tui "URL"`) es una
+Si la URL que das (por el buscador `u` o como argumento `mp3tui "URL"`) es una
 playlist —tiene `list=` en la query o su path es `/playlist`—, se lista con
 `yt-dlp --flat-playlist` (solo títulos, sin bajar audio). La primera canción se
 reproduce enseguida y el resto entra a la cola **al final** de la existente;

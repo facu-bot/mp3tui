@@ -466,9 +466,10 @@ mod tests {
     // --- entrada ---
 
     #[test]
-    fn slash_is_the_default_key_and_opens_an_empty_search_field() {
+    fn u_is_the_default_key_and_opens_an_empty_search_field() {
         let keys = &config::config().keys;
-        assert!(config::pressed(&keys.spotify_search, KeyCode::Char('/')));
+        assert!(config::pressed(&keys.spotify_search, KeyCode::Char('u')));
+        assert!(!config::pressed(&keys.spotify_search, KeyCode::Char('/')));
 
         let mut app = test_app();
         open_spotify_search(&mut app);
@@ -482,7 +483,7 @@ mod tests {
     }
 
     #[test]
-    fn slash_key_opens_the_search_from_the_list_and_the_player() {
+    fn u_key_opens_the_search_from_the_list_and_the_player() {
         let Some(mut engine) = engine_or_skip() else {
             return;
         };
@@ -495,9 +496,10 @@ mod tests {
             app.mode = mode;
             app.explorer_open = explorer_open;
             app.has_player = mode == Mode::Player;
-            dispatch_key(key(KeyCode::Char('/')), &mut app, &mut engine);
+            dispatch_key(key(KeyCode::Char('u')), &mut app, &mut engine);
             assert!(
                 app.spotify_search.is_some(),
+
                 "{mode:?} explorer={explorer_open}"
             );
         }
@@ -937,9 +939,9 @@ mod tests {
     }
 
     #[test]
-    fn slash_in_results_or_failure_returns_to_editing_the_same_query() {
+    fn u_in_results_or_failure_returns_to_editing_the_same_query() {
         let mut app = results_app();
-        press(&mut app, KeyCode::Char('/'));
+        press(&mut app, KeyCode::Char('u'));
         let state = app.spotify_search.as_ref().unwrap();
         assert_eq!(state.phase, SearchPhase::Input);
         assert_eq!(state.query, "daft punk");
@@ -1067,7 +1069,7 @@ mod tests {
                     hits: sample_hits(),
                     selected: 0,
                 },
-                vec!["Enter: reproducir", "/: nueva búsqueda", "Esc: cerrar"],
+                vec!["Enter: reproducir", "u: nueva búsqueda", "Esc: cerrar"],
             ),
             (
                 SearchPhase::Failed("x".into()),
@@ -1103,7 +1105,7 @@ mod tests {
             app.has_player = has_player;
             app.explorer_open = explorer_open;
             assert!(
-                screen_text(&app, &engine).contains("/: Spotify"),
+                screen_text(&app, &engine).contains("u: Spotify"),
                 "{mode:?} explorer={explorer_open}"
             );
             // El pie de cada modo no cambió: la pista vive en el borde.
@@ -1120,7 +1122,7 @@ mod tests {
         };
         let mut app = test_app();
         app.spotify_search = Some(search_in(SearchPhase::Input));
-        assert!(!screen_text(&app, &engine).contains("/: Spotify"));
+        assert!(!screen_text(&app, &engine).contains("u: Spotify"));
     }
 
     #[test]

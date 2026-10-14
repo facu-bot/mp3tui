@@ -161,6 +161,8 @@ pub(super) fn key_for_chip(keys_text: &str) -> Option<KeyCode> {
         &keys.enqueue,
         &keys.queue_panel,
         &keys.queue_delete,
+        &keys.clear_queue,
+        &keys.spotify_search,
         &keys.settings,
     ]
     .into_iter()

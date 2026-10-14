@@ -2677,31 +2677,31 @@ pub(super) fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
     match app.mode {
         // Panel lateral abierto: 3 líneas — lista, reproducción y el
         // recordatorio de que ↑/↓ son volumen solo con el panel cerrado.
-        // `u: URL` también vale con el panel abierto; `sig/ant` se
-        // expande porque entra en 78 reagrupando (`u` pasa a la línea 2).
+        // `sig/ant` se expande porque entra en 78 reagrupando. La búsqueda
+        // (`u`) se anuncia en el borde del pie, no en estas líneas.
         // La línea de acciones de la lista cambia según la solapa: en
         // Biblioteca `a: encolar`; en Cola, `d: borrar` y `c: biblio`.
         Mode::Player if app.explorer_open => {
             let list_hint = if app.queue_panel {
                 format!(
-                    " {}: pausa   {}/{}: ±5s   {}: borrar   {}: biblio   {}: URL   {}×2: salir",
+                    " {}: pausa   {}/{}: ±5s   {}: borrar   {}: vaciar   {}: biblio   {}×2: salir",
                     key_labels(&keys.play_pause),
                     key_labels(&keys.seek_back),
                     key_labels(&keys.seek_fwd),
                     key_labels(&keys.queue_delete),
+                    key_labels(&keys.clear_queue),
                     key_labels(&keys.queue_panel),
-                    key_labels(&keys.open_url),
                     key_labels(&keys.quit),
                 )
             } else {
                 format!(
-                    " {}: pausa   {}/{}: ±5s   {}: encolar   {}: cola   {}: URL   {}×2: salir",
+                    " {}: pausa   {}/{}: ±5s   {}: encolar   {}: cola   {}: vaciar   {}×2: salir",
                     key_labels(&keys.play_pause),
                     key_labels(&keys.seek_back),
                     key_labels(&keys.seek_fwd),
                     key_labels(&keys.enqueue),
                     key_labels(&keys.queue_panel),
-                    key_labels(&keys.open_url),
+                    key_labels(&keys.clear_queue),
                     key_labels(&keys.quit),
                 )
             };
@@ -2746,12 +2746,11 @@ pub(super) fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
                 key_labels(&keys.prev_track),
             )),
             Line::from(format!(
-                " {}: shuffle   {}: repeat   {}/{}: vel   {}: URL   Ctrl+{}: config   {}×2: salir",
+                " {}: shuffle   {}: repeat   {}/{}: vel   Ctrl+{}: config   {}×2: salir",
                 key_labels(&keys.shuffle),
                 key_labels(&keys.repeat),
                 key_labels(&keys.speed_down),
                 key_labels(&keys.speed_up),
-                key_labels(&keys.open_url),
                 settings_key_display(),
                 key_labels(&keys.quit),
             )),
@@ -2782,10 +2781,9 @@ pub(super) fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
                 key_labels(&keys.search),
             )),
             Line::from(format!(
-                " {}/{}: primera/última   {}: URL   Ctrl+{}: config   {}×2: salir",
+                " {}/{}: primera/última   Ctrl+{}: config   {}×2: salir",
                 key_labels(&keys.home),
                 key_labels(&keys.end),
-                key_labels(&keys.open_url),
                 settings_key_display(),
                 key_labels(&keys.quit),
             )),

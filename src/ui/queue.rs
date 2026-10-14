@@ -621,6 +621,14 @@ pub(super) fn delete_selected_queue_item(app: &mut App) {
     app.queue_selected = app.queue_selected.min(app.queue.len().saturating_sub(1));
 }
 
+/// Vacía toda la cola y resetea su cursor y selección. Solo toca la cola: la
+/// pista que suena sigue sonando y no se cancela ninguna resolución.
+pub(super) fn clear_queue(app: &mut App) {
+    app.queue.clear();
+    app.queue_cursor = None;
+    app.queue_selected = 0;
+}
+
 /// Posiciones de la vista del pool de navegación (lo que recorren `n`/`p` y
 /// el fin natural): siempre las pistas de la biblioteca, y además las
 /// entradas del historial cuando el shuffle está activo, para que una

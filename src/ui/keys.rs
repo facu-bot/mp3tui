@@ -135,6 +135,8 @@ pub(super) fn handle_list_key(key: KeyEvent, app: &mut App, engine: &mut AudioEn
         if app.queue_panel {
             delete_selected_queue_item(app);
         }
+    } else if config::pressed(&keys.clear_queue, code) {
+        clear_queue(app);
     } else if config::pressed(&keys.play_pause, code) {
         toggle_play(app, engine);
     } else if config::pressed(&keys.next_track, code) {

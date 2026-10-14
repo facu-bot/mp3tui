@@ -2500,7 +2500,6 @@ mod tests {
             "s: shuffle",
             "r: repeat",
             "[/]: vel",
-            "u: URL",
             "Ctrl+P: config",
             "Esc×2: salir",
         ] {
@@ -2530,7 +2529,6 @@ mod tests {
             "r: repeat",
             "b: buscar",
             "Inicio/Fin: primera/última",
-            "u: URL",
             "Ctrl+P: config",
             "Esc×2: salir",
         ] {
@@ -2560,7 +2558,6 @@ mod tests {
             "←/→: ±5s",
             "[/]: vel",
             "n/p: pista siguiente/anterior",
-            "u: URL",
             "Esc×2: salir",
             "volumen ↑/↓: con el panel cerrado",
         ] {
@@ -2983,14 +2980,41 @@ mod tests {
     }
 
     #[test]
-    fn test_footer_shows_open_url_key() {
-        let app = test_app();
-        let lines = footer_lines(&app, false);
-        let joined: String = lines.iter().map(line_text).collect::<Vec<_>>().join(" ");
-        assert!(
-            joined.contains("u: URL") || joined.contains("u: url") || joined.contains("URL"),
-            "footer debe mencionar atajo de URL: {joined}"
+    fn test_footer_no_longer_advertises_the_old_url_prompt() {
+        for (mode, explorer_open, queue_panel) in [
+            (Mode::Browser, false, false),
+            (Mode::Player, false, false),
+            (Mode::Player, true, false),
+            (Mode::Player, true, true),
+        ] {
+            let mut app = test_app();
+            app.mode = mode;
+            app.explorer_open = explorer_open;
+            app.queue_panel = queue_panel;
+            app.has_player = mode == Mode::Player;
+            let lines = footer_lines(&app, false);
+            let joined: String = lines.iter().map(line_text).collect::<Vec<_>>().join(" ");
+            assert!(!joined.contains(": URL"), "{mode:?}: {joined}");
+        }
+    }
+
+    #[test]
+    fn test_footer_border_advertises_u_for_spotify_and_queue_panel_advertises_clear() {
+        assert_eq!(
+            crate::config::key_label(crate::config::config().keys.spotify_search[0]),
+            "u"
         );
+        let mut app = test_app();
+        app.mode = Mode::Player;
+        app.has_player = true;
+        app.explorer_open = true;
+        app.queue_panel = true;
+        let joined: String = footer_lines(&app, false)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(joined.contains("x: vaciar"), "{joined}");
     }
 
     // -------------------------------------------------------------------------
@@ -6355,6 +6379,54 @@ mod tests {
         let labels: Vec<&str> = app.queue.iter().map(QueueItem::label).collect();
         assert_eq!(labels, vec!["uno", "tres"], "borra el seleccionado");
         assert_eq!(app.queue_selected, 1, "la selección cae en el siguiente");
+    }
+
+    /// `x` vacía TODA la cola, resetea el cursor y la selección, y no corta la
+    /// reproducción en curso.
+    #[test]
+    fn clear_queue_key_empties_the_queue_without_stopping_playback() {
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
+        let mut app = test_app();
+        app.explorer_open = true;
+        app.queue_panel = true;
+        app.queue.push(QueueItem::Local(track_named("uno")));
+        app.queue.push(QueueItem::Local(track_named("dos")));
+        app.queue.push(QueueItem::Local(track_named("tres")));
+        app.queue_selected = 2;
+        app.queue_cursor = Some(1);
+        app.has_player = true;
+        app.status = Status::Playing;
+        app.track_label = "sonando".to_string();
+        app.current_url = Some(("https://example.com/a.mp3".to_string(), "sonando".to_string()));
+
+        handle_list_key(theme_menu_key(KeyCode::Char('x')), &mut app, &mut engine);
+
+        assert!(app.queue.is_empty());
+        assert_eq!(app.queue_cursor, None);
+        assert_eq!(app.queue_selected, 0);
+        assert_eq!(app.status, Status::Playing, "la reproducción sigue");
+        assert_eq!(app.track_label, "sonando");
+        assert!(app.current_url.is_some());
+        assert!(app.has_player);
+    }
+
+    #[test]
+    fn clear_queue_key_works_from_the_library_tab_and_on_an_empty_queue() {
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
+        let mut app = test_app();
+        app.explorer_open = true;
+        app.queue_panel = false;
+        app.queue.push(QueueItem::Local(track_named("uno")));
+        handle_list_key(theme_menu_key(KeyCode::Char('x')), &mut app, &mut engine);
+        assert!(app.queue.is_empty());
+        // Vaciar una cola vacía no hace nada ni entra en pánico.
+        handle_list_key(theme_menu_key(KeyCode::Char('x')), &mut app, &mut engine);
+        assert!(app.queue.is_empty());
+        assert_eq!(app.queue_selected, 0);
     }
 
     /// PRESERVE: con la lista Biblioteca activa, las flechas siguen moviendo

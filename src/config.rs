@@ -909,7 +909,7 @@ pub struct Keys {
     pub repeat: Vec<KeyCode>,
     /// Abrir la búsqueda incremental.
     pub search: Vec<KeyCode>,
-    /// Abrir la búsqueda de Spotify (canciones y playlists). Por defecto '/'.
+    /// Abrir el buscador (Spotify, URLs y rutas locales). Por defecto 'u'.
     pub spotify_search: Vec<KeyCode>,
     pub speed_up: Vec<KeyCode>,
     pub speed_down: Vec<KeyCode>,
@@ -929,7 +929,8 @@ pub struct Keys {
     /// player en pantalla completa, sale de la app. Solo `Esc` por defecto
     /// `Tab` vive en `explorer` y acá salía de la app sin player.
     pub back: Vec<KeyCode>,
-    /// Abrir prompt para reproducir URL: por defecto 'u'.
+    /// Prompt de URL legado. Sin tecla por defecto: 'u' abre el buscador, que
+    /// ya acepta URLs y rutas. Sigue funcionando si el usuario lo configura.
     pub open_url: Vec<KeyCode>,
     /// Encolar el ítem seleccionado de la Biblioteca (pista local o URL del
     /// historial) al final de la cola. Por defecto 'a'.
@@ -939,6 +940,8 @@ pub struct Keys {
     pub queue_panel: Vec<KeyCode>,
     /// Eliminar el ítem seleccionado de la cola. Por defecto 'd'.
     pub queue_delete: Vec<KeyCode>,
+    /// Vaciar toda la cola sin cortar la reproducción en curso. Por defecto 'x'.
+    pub clear_queue: Vec<KeyCode>,
     /// Abrir el panel de configuración (shell con filas Temas/Mouse/Bandas).
     /// Se dispara con Ctrl+tecla (por defecto `Ctrl+P`): a diferencia de
     /// `explorer` (donde Tab y Ctrl+Tab valen por igual porque el dispatch
@@ -964,7 +967,7 @@ impl Default for Keys {
             shuffle: keys(&[KeyCode::Char('s')]),
             repeat: keys(&[KeyCode::Char('r')]),
             search: keys(&[KeyCode::Char('b')]),
-            spotify_search: keys(&[KeyCode::Char('/')]),
+            spotify_search: keys(&[KeyCode::Char('u')]),
             speed_up: keys(&[KeyCode::Char(']')]),
             speed_down: keys(&[KeyCode::Char('[')]),
             explorer: keys(&[KeyCode::Tab]),
@@ -976,10 +979,11 @@ impl Default for Keys {
             end: keys(&[KeyCode::End]),
             select: keys(&[KeyCode::Enter]),
             back: keys(&[KeyCode::Esc]),
-            open_url: keys(&[KeyCode::Char('u')]),
+            open_url: keys(&[]),
             enqueue: keys(&[KeyCode::Char('a')]),
             queue_panel: keys(&[KeyCode::Char('c')]),
             queue_delete: keys(&[KeyCode::Char('d')]),
+            clear_queue: keys(&[KeyCode::Char('x')]),
             settings: keys(&[KeyCode::Char('p')]),
         }
     }
@@ -1004,6 +1008,7 @@ fn parse_keybindings(section: &toml::Table, keys: &mut Keys, warnings: &mut Vec<
             "enqueue" => &mut keys.enqueue,
             "queue_panel" => &mut keys.queue_panel,
             "queue_delete" => &mut keys.queue_delete,
+            "clear_queue" => &mut keys.clear_queue,
             "settings" => &mut keys.settings,
             "speed_up" => &mut keys.speed_up,
             "speed_down" => &mut keys.speed_down,
@@ -1092,6 +1097,11 @@ fn resolve_key_collisions(keys: &mut Keys, warnings: &mut Vec<String>) {
             "queue_delete",
             &mut keys.queue_delete,
             &defaults.queue_delete,
+        ),
+        (
+            "clear_queue",
+            &mut keys.clear_queue,
+            &defaults.clear_queue,
         ),
         ("settings", &mut keys.settings, &defaults.settings),
         ("move_up", &mut keys.move_up, &defaults.move_up),
@@ -1932,8 +1942,8 @@ zoom = 2",
     }
 
     #[test]
-    fn default_spotify_search_key_is_slash_and_can_be_remapped() {
-        assert_eq!(Keys::default().spotify_search, vec![KeyCode::Char('/')]);
+    fn default_spotify_search_key_is_u_and_can_be_remapped() {
+        assert_eq!(Keys::default().spotify_search, vec![KeyCode::Char('u')]);
         let config = parse(
             r#"
             [keybindings]
@@ -1985,7 +1995,7 @@ zoom = 2",
             text = "#101010"
 
             [keybindings]
-            quit = "x"
+            quit = "q"
             play_pause = "space,plus"
             seek_fwd = "right"
             speed_up = "]"
@@ -1994,7 +2004,7 @@ zoom = 2",
         assert_eq!(config.theme.accent, Color::Rgb(255, 0, 255));
         assert_eq!(config.theme.spectrum_low, Color::Blue);
         assert_eq!(config.theme.text, Color::Rgb(16, 16, 16));
-        assert_eq!(config.keys.quit, vec![KeyCode::Char('x')]);
+        assert_eq!(config.keys.quit, vec![KeyCode::Char('q')]);
         assert_eq!(
             config.keys.play_pause,
             vec![KeyCode::Char(' '), KeyCode::Char('+')]
@@ -2375,17 +2385,18 @@ zoom = 2",
 
     #[test]
     fn test_open_url_default_and_parse() {
-        // Default debe ser 'u'
-        assert_eq!(Keys::default().open_url, vec![KeyCode::Char('u')]);
+        // Sin default: 'u' abre el buscador, que ya acepta URLs. Se puede
+        // seguir configurando a mano.
+        assert!(Keys::default().open_url.is_empty());
 
         // Parseo desde TOML
         let config = parse(
             r#"
             [keybindings]
-            open_url = "U"
+            open_url = "O"
             "#,
         );
-        assert_eq!(config.keys.open_url, vec![KeyCode::Char('U')]);
+        assert_eq!(config.keys.open_url, vec![KeyCode::Char('O')]);
         assert!(
             config.warnings.is_empty(),
             "warnings: {:?}",
@@ -2398,11 +2409,11 @@ zoom = 2",
         let config = parse(
             r#"
             [keybindings]
-            shuffle = "u"
-            open_url = "u"
+            shuffle = "o"
+            open_url = "o"
             "#,
         );
-        // shuffle va antes en dispatch de prioridad; open_url pierde 'u' y vuelve al default si está libre
+        // shuffle va antes en dispatch de prioridad; open_url pierde 'o'.
         assert_eq!(config.warnings.len(), 1, "warnings: {:?}", config.warnings);
         assert!(
             config.warnings[0].contains("open_url"),
@@ -2414,6 +2425,36 @@ zoom = 2",
             "{:?}",
             config.warnings
         );
+    }
+
+    /// Quien tenía `open_url = "u"` en su config no rompe: el buscador gana
+    /// 'u' y se avisa; `open_url` queda sin teclas (el prompt viejo no se abre).
+    #[test]
+    fn test_legacy_open_url_u_loses_to_spotify_search_with_a_warning() {
+        let config = parse("[keybindings]\nopen_url = \"u\"");
+        assert_eq!(config.keys.spotify_search, vec![KeyCode::Char('u')]);
+        assert!(config.keys.open_url.is_empty(), "{:?}", config.keys.open_url);
+        assert_eq!(config.warnings.len(), 1, "warnings: {:?}", config.warnings);
+        assert!(config.warnings[0].contains("open_url"), "{:?}", config.warnings);
+        assert!(config.warnings[0].contains("spotify_search"), "{:?}", config.warnings);
+    }
+
+    #[test]
+    fn clear_queue_default_is_x_and_can_be_remapped() {
+        assert_eq!(Keys::default().clear_queue, vec![KeyCode::Char('x')]);
+        let config = parse("[keybindings]\nclear_queue = \"z\"");
+        assert_eq!(config.keys.clear_queue, vec![KeyCode::Char('z')]);
+        assert!(config.warnings.is_empty(), "{:?}", config.warnings);
+    }
+
+    #[test]
+    fn clear_queue_collision_warns_and_the_earlier_action_wins() {
+        let config = parse("[keybindings]\nclear_queue = \"d\"");
+        // queue_delete va antes: clear_queue pierde 'd' y vuelve a su default.
+        assert_eq!(config.keys.queue_delete, vec![KeyCode::Char('d')]);
+        assert_eq!(config.keys.clear_queue, vec![KeyCode::Char('x')]);
+        assert_eq!(config.warnings.len(), 1, "{:?}", config.warnings);
+        assert!(config.warnings[0].contains("clear_queue"), "{:?}", config.warnings);
     }
 
     #[test]
