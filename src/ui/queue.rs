@@ -295,7 +295,11 @@ pub(super) fn start_boot_url_with(
     list_playlist: impl FnOnce(String, u64) -> Receiver<YtDlpListMessage>,
 ) {
     match kind {
-        crate::source::UrlKind::DirectAudio | crate::source::UrlKind::Unknown => {
+        // Spotify: placeholder hasta que T5b cablee la resolución.
+        crate::source::UrlKind::DirectAudio
+        | crate::source::UrlKind::Unknown
+        | crate::source::UrlKind::SpotifyTrack
+        | crate::source::UrlKind::SpotifyPlaylist => {
             let label = url_display_label(&url);
             start_url_playback(app, engine, url.clone(), url, label);
         }

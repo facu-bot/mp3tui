@@ -170,6 +170,14 @@ impl SpotifyClient {
         })
     }
 
+    /// Metadatos de una canción por id (`GET /v1/tracks/{id}`).
+    pub fn track(&self, id: &str) -> Result<SpotifyTrack, SpotifyError> {
+        let value = self.fetch(&self.resolve(&format!("/v1/tracks/{id}")), &[])?;
+        let parsed: ApiTrack =
+            serde_json::from_value(value).map_err(|_| SpotifyError::BadResponse)?;
+        Ok(SpotifyTrack::from_api(parsed))
+    }
+
     /// Canciones de una playlist, siguiendo la paginación de `next`.
     pub fn playlist_tracks(&self, id: &str) -> Result<Vec<SpotifyTrack>, SpotifyError> {
         let path = format!("/v1/playlists/{id}/tracks");
@@ -897,5 +905,65 @@ mod tests {
         let text = err.to_string();
         assert!(!text.contains("SUPER-SECRET-TOKEN"), "{text}");
         assert!(!text.contains("boom"), "{text}");
+    }
+
+    // --- track ---
+
+    #[test]
+    fn test_track_fetches_a_single_track() {
+        let path = temp_path("track");
+        write_tokens(&path, "TOKEN-T");
+        let stub = Stub::spawn(|_| {
+            vec![json_response(
+                200,
+                r#"{"id":"t9","name":"Around the World","artists":[{"id":"a1","name":"Daft Punk"}],
+                    "album":{"name":"Homework"},"duration_ms":429000,
+                    "external_ids":{"isrc":"GBDUW9700001"}}"#,
+            )]
+        });
+        let client = client_with(&stub.base_url, "http://127.0.0.1:1/api/token", &path);
+        let track = client.track("t9").unwrap();
+        let seen = stub.finish();
+
+        assert_eq!(track.id, "t9");
+        assert_eq!(track.title, "Around the World");
+        assert_eq!(track.artists, vec!["Daft Punk".to_string()]);
+        assert_eq!(track.album.as_deref(), Some("Homework"));
+        assert_eq!(track.duration_ms, 429_000);
+        assert_eq!(track.isrc.as_deref(), Some("GBDUW9700001"));
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].target, "/v1/tracks/t9");
+        assert_eq!(seen[0].bearer.as_deref(), Some("TOKEN-T"));
+    }
+
+    #[test]
+    fn test_track_not_found_is_a_status_error_without_token() {
+        let path = temp_path("track_404");
+        write_tokens(&path, "SUPER-SECRET-TOKEN");
+        let stub = Stub::spawn(|_| {
+            vec![json_response(404, r#"{"error":{"status":404,"message":"Non existing id"}}"#)]
+        });
+        let client = client_with(&stub.base_url, "http://127.0.0.1:1/api/token", &path);
+        let err = client.track("nope").unwrap_err();
+        stub.finish();
+
+        assert_eq!(
+            err,
+            SpotifyError::Status {
+                status: 404,
+                message: Some("Non existing id".to_string())
+            }
+        );
+        assert!(!err.to_string().contains("SUPER-SECRET-TOKEN"));
+    }
+
+    #[test]
+    fn test_track_with_unexpected_body_is_bad_response() {
+        let path = temp_path("track_bad");
+        write_tokens(&path, "TOKEN-B");
+        let stub = Stub::spawn(|_| vec![json_response(200, "[1,2,3]")]);
+        let client = client_with(&stub.base_url, "http://127.0.0.1:1/api/token", &path);
+        assert_eq!(client.track("t1").unwrap_err(), SpotifyError::BadResponse);
+        stub.finish();
     }
 }

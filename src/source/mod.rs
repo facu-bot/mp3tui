@@ -27,6 +27,12 @@ pub enum UrlKind {
     /// Se lista con yt-dlp `--flat-playlist` (títulos + URLs de página, sin
     /// resolver audio), no como una página única.
     Playlist,
+    /// Canción de Spotify (`open.spotify.com/track/<id>` o `spotify:track:<id>`).
+    /// No tiene audio propio: se resuelve a YouTube por búsqueda.
+    SpotifyTrack,
+    /// Playlist o álbum de Spotify; un álbum sigue el mismo camino que una
+    /// playlist.
+    SpotifyPlaylist,
     /// URL sin extensión ni host reconocido; requiere inspeccionar Content-Type.
     Unknown,
 }
@@ -83,6 +89,14 @@ fn has_list_query_param(query: &str) -> bool {
 /// Clasifica una entrada de usuario como ruta local o URL remota.
 pub fn classify(input: &str) -> Input {
     let trimmed = input.trim();
+    // Spotify va antes que el resto: `/playlist/<id>` en open.spotify.com
+    // no es una playlist de YouTube.
+    if let Some(reference) = spotify_ref(trimmed) {
+        return Input::Url {
+            url: trimmed.to_string(),
+            kind: reference.kind,
+        };
+    }
     let scheme_len = if starts_with_ignore_ascii_case(trimmed, "http://") {
         7
     } else if starts_with_ignore_ascii_case(trimmed, "https://") {
@@ -174,6 +188,78 @@ pub fn classify(input: &str) -> Input {
     }
 }
 
+/// Referencia a un recurso de Spotify extraída de una URL web o un URI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpotifyRef {
+    /// [`UrlKind::SpotifyTrack`] o [`UrlKind::SpotifyPlaylist`] (un álbum
+    /// cuenta como playlist).
+    pub kind: UrlKind,
+    /// Id base62 del recurso; solo alfanumérico, así que es seguro como
+    /// segmento de path de la Web API.
+    pub id: String,
+}
+
+/// Reconoce `https://open.spotify.com/{track,playlist,album}/<id>` (con o sin
+/// query, fragmento, barra final o prefijo de locale `/intl-xx/`) y los URIs
+/// `spotify:{track,playlist,album}:<id>`. Cualquier otra cosa devuelve `None`.
+pub fn spotify_ref(input: &str) -> Option<SpotifyRef> {
+    let input = input.trim();
+    if starts_with_ignore_ascii_case(input, "spotify:") {
+        let mut parts = input["spotify:".len()..].split(':');
+        let (resource, id) = (parts.next()?, parts.next()?);
+        if parts.next().is_some() {
+            return None;
+        }
+        return build_spotify_ref(resource, id);
+    }
+
+    let scheme_len = if starts_with_ignore_ascii_case(input, "https://") {
+        8
+    } else if starts_with_ignore_ascii_case(input, "http://") {
+        7
+    } else {
+        return None;
+    };
+    let rest = &input[scheme_len..];
+    let (host, path) = rest.split_once('/')?;
+    if !host.eq_ignore_ascii_case("open.spotify.com") {
+        return None;
+    }
+    let path = path.split(['?', '#']).next().unwrap_or("");
+    let path = path.strip_suffix('/').unwrap_or(path);
+    let mut segments = path.split('/').peekable();
+    if segments.peek().is_some_and(|s| is_intl_locale(s)) {
+        segments.next();
+    }
+    let (resource, id) = (segments.next()?, segments.next()?);
+    if segments.next().is_some() {
+        return None;
+    }
+    build_spotify_ref(resource, id)
+}
+
+fn build_spotify_ref(resource: &str, id: &str) -> Option<SpotifyRef> {
+    let kind = match resource.to_ascii_lowercase().as_str() {
+        "track" => UrlKind::SpotifyTrack,
+        "playlist" | "album" => UrlKind::SpotifyPlaylist,
+        _ => return None,
+    };
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    Some(SpotifyRef {
+        kind,
+        id: id.to_string(),
+    })
+}
+
+/// Prefijo de locale de open.spotify.com: `intl-es`, `intl-pt-br`, etc.
+fn is_intl_locale(segment: &str) -> bool {
+    segment
+        .strip_prefix("intl-")
+        .is_some_and(|tag| !tag.is_empty() && tag.chars().all(|c| c.is_ascii_alphabetic() || c == '-'))
+}
+
 /// Clasifica una cabecera HTTP `Content-Type`. Sin consumidor en producción
 /// todavía: ver [`ContentKind`].
 #[allow(dead_code)]
@@ -197,6 +283,121 @@ pub fn classify_content_type(header: &str) -> ContentKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn kind_of(input: &str) -> Input {
+        classify(input)
+    }
+
+    fn spotify(input: &str, kind: UrlKind) -> Input {
+        Input::Url {
+            url: input.to_string(),
+            kind,
+        }
+    }
+
+    #[test]
+    fn test_classify_spotify_web_urls() {
+        let id = "4uLU6hMCjMI75M1A2tKUQC";
+        for (input, kind) in [
+            (format!("https://open.spotify.com/track/{id}"), UrlKind::SpotifyTrack),
+            (format!("https://open.spotify.com/track/{id}?si=abc123"), UrlKind::SpotifyTrack),
+            (format!("https://open.spotify.com/track/{id}/"), UrlKind::SpotifyTrack),
+            (format!("https://open.spotify.com/intl-es/track/{id}"), UrlKind::SpotifyTrack),
+            (format!("https://open.spotify.com/intl-pt-br/track/{id}?si=x"), UrlKind::SpotifyTrack),
+            (format!("http://open.spotify.com/track/{id}"), UrlKind::SpotifyTrack),
+            (format!("HTTPS://OPEN.SPOTIFY.COM/track/{id}"), UrlKind::SpotifyTrack),
+            (format!("https://open.spotify.com/playlist/{id}"), UrlKind::SpotifyPlaylist),
+            (format!("https://open.spotify.com/playlist/{id}?si=zz"), UrlKind::SpotifyPlaylist),
+            (format!("https://open.spotify.com/intl-fr/playlist/{id}"), UrlKind::SpotifyPlaylist),
+            (format!("https://open.spotify.com/album/{id}"), UrlKind::SpotifyPlaylist),
+            (format!("https://open.spotify.com/intl-de/album/{id}?si=q#frag"), UrlKind::SpotifyPlaylist),
+        ] {
+            assert_eq!(kind_of(&input), spotify(&input, kind), "{input}");
+        }
+    }
+
+    #[test]
+    fn test_classify_spotify_uris() {
+        let id = "4uLU6hMCjMI75M1A2tKUQC";
+        for (input, kind) in [
+            (format!("spotify:track:{id}"), UrlKind::SpotifyTrack),
+            (format!("spotify:playlist:{id}"), UrlKind::SpotifyPlaylist),
+            (format!("spotify:album:{id}"), UrlKind::SpotifyPlaylist),
+        ] {
+            assert_eq!(kind_of(&input), spotify(&input, kind), "{input}");
+        }
+        assert_eq!(
+            kind_of(&format!("  spotify:track:{id}  ")),
+            spotify(&format!("spotify:track:{id}"), UrlKind::SpotifyTrack)
+        );
+    }
+
+    #[test]
+    fn test_spotify_ref_extracts_kind_and_id() {
+        assert_eq!(
+            spotify_ref("https://open.spotify.com/intl-es/album/AbC123?si=x"),
+            Some(SpotifyRef { kind: UrlKind::SpotifyPlaylist, id: "AbC123".to_string() })
+        );
+        assert_eq!(
+            spotify_ref("spotify:track:XyZ9"),
+            Some(SpotifyRef { kind: UrlKind::SpotifyTrack, id: "XyZ9".to_string() })
+        );
+        assert_eq!(spotify_ref("https://youtube.com/watch?v=1"), None);
+    }
+
+    #[test]
+    fn test_classify_spotify_negative_cases() {
+        for input in [
+            "https://open.spotify.com/artist/4uLU6hMCjMI75M1A2tKUQC",
+            "https://open.spotify.com/track/",
+            "https://open.spotify.com/track",
+            "https://open.spotify.com/",
+            "https://open.spotify.com/track/abc/extra",
+            "https://open.spotify.com/track/ab$c",
+            "https://open.spotify.com/intl-es/",
+            "https://open.spotify.com.evil.com/track/abc",
+            "https://evil.com/open.spotify.com/track/abc",
+            "https://example.com/track/abc",
+            "spotify:artist:abc",
+            "spotify:track:",
+            "spotify:track:a:b",
+            "spotify:track:ab/../c",
+            "spotify:user:me",
+            "spotify:track",
+        ] {
+            let got = kind_of(input);
+            assert!(
+                !matches!(
+                    got,
+                    Input::Url { kind: UrlKind::SpotifyTrack | UrlKind::SpotifyPlaylist, .. }
+                ),
+                "{input} -> {got:?}"
+            );
+        }
+        // Un `spotify:` no reconocido sigue siendo una ruta local, como antes.
+        assert_eq!(
+            kind_of("spotify:artist:abc"),
+            Input::Local(PathBuf::from("spotify:artist:abc"))
+        );
+    }
+
+    #[test]
+    fn test_classify_youtube_playlist_still_works_next_to_spotify() {
+        assert_eq!(
+            classify("https://www.youtube.com/playlist?list=PL123"),
+            Input::Url {
+                url: "https://www.youtube.com/playlist?list=PL123".to_string(),
+                kind: UrlKind::Playlist,
+            }
+        );
+        assert_eq!(
+            classify("https://www.youtube.com/playlist/abc"),
+            Input::Url {
+                url: "https://www.youtube.com/playlist/abc".to_string(),
+                kind: UrlKind::Playlist,
+            }
+        );
+    }
 
     #[test]
     fn test_classify_empty_string_is_local() {

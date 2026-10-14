@@ -1378,7 +1378,7 @@ mod tests {
         assert_eq!(cache.len(), 2);
         assert!(path.exists(), "put debe persistir la caché");
 
-        let mut reloaded = ResolveCache::at_path(path.clone());
+        let reloaded = ResolveCache::at_path(path.clone());
         assert_eq!(
             reloaded.get("spotify:track:abc"),
             Some("https://www.youtube.com/watch?v=abc")
@@ -1404,7 +1404,7 @@ mod tests {
         let path = dir.join(CACHE_FILE_NAME);
         std::fs::write(&path, "no es [[[ toml").unwrap();
 
-        let mut cache = ResolveCache::at_path(path.clone());
+        let cache = ResolveCache::at_path(path.clone());
         assert_eq!(cache.len(), 0, "una caché corrupta se ignora y queda vacía");
         assert_eq!(cache.get("spotify:track:abc"), None);
 

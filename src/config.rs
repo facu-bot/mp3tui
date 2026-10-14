@@ -54,6 +54,8 @@ pub struct Config {
     pub theme_overrides: Vec<(String, Color)>,
     pub keys: Keys,
     pub library: LibraryConfig,
+    /// `[spotify]`: ajustes de la integración con Spotify.
+    pub spotify: SpotifyConfig,
     /// `[ui] mouse`: captura del mouse (clic, arrastre, rueda). Activada por
     /// defecto; con `false` la terminal conserva su selección de texto nativa.
     pub mouse: bool,
@@ -84,6 +86,7 @@ impl Default for Config {
             theme_overrides: Vec::new(),
             keys: Keys::default(),
             library: LibraryConfig::default(),
+            spotify: SpotifyConfig::default(),
             mouse: true,
             visualizer_style: VisualizerStyle::default(),
             visualizer_mode: VisualizerMode::default(),
@@ -216,7 +219,7 @@ pub fn parse(text: &str) -> Config {
 
     for section in table.keys() {
         match section.as_str() {
-            "theme" | "keybindings" | "library" | "ui" | "visualizer" => {}
+            "theme" | "keybindings" | "library" | "ui" | "visualizer" | "spotify" => {}
             other => warnings.push(format!("sección desconocida «[{other}]» (se ignora)")),
         }
     }
@@ -273,6 +276,16 @@ pub fn parse(text: &str) -> Config {
                 "[library] debe ser una tabla con claves de la forma \
                  roots = [\"ruta\", ...]"
                     .to_string(),
+            ),
+        },
+    }
+
+    match table.get("spotify") {
+        None => {}
+        Some(value) => match value.as_table() {
+            Some(section) => parse_spotify(section, &mut config.spotify, &mut warnings),
+            None => warnings.push(
+                "[spotify] debe ser una tabla, por ejemplo: client_id = \"...\"".to_string(),
             ),
         },
     }
@@ -1266,6 +1279,14 @@ pub struct LibraryConfig {
     pub roots: Vec<PathBuf>,
 }
 
+/// Sección `[spotify]` del config.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SpotifyConfig {
+    /// `client_id` de la app registrada por el usuario en el dashboard de
+    /// Spotify (PKCE no usa secret). `MP3TUI_SPOTIFY_CLIENT_ID` tiene prioridad.
+    pub client_id: Option<String>,
+}
+
 /// Carpetas conocidas típicas bajo el home: la biblioteca por defecto
 /// cubre las cuatro sin que el usuario configure nada.
 const KNOWN_DIR_NAMES: [&str; 4] = ["Music", "Downloads", "Desktop", "Documents"];
@@ -1728,6 +1749,21 @@ fn parse_library(section: &toml::Table, library: &mut LibraryConfig, warnings: &
                 ),
             },
             other => warnings.push(format!("[library] clave desconocida «{other}»")),
+        }
+    }
+}
+
+fn parse_spotify(section: &toml::Table, spotify: &mut SpotifyConfig, warnings: &mut Vec<String>) {
+    for (key, value) in section {
+        match key.as_str() {
+            "client_id" => match value.as_str().map(str::trim) {
+                Some(id) if !id.is_empty() => spotify.client_id = Some(id.to_string()),
+                Some(_) => warnings.push("[spotify] client_id está vacío; se ignora".to_string()),
+                None => warnings.push(
+                    "[spotify] client_id debe ser un texto entre comillas".to_string(),
+                ),
+            },
+            other => warnings.push(format!("[spotify] clave desconocida «{other}»")),
         }
     }
 }
@@ -2266,6 +2302,29 @@ zoom = 2",
             "{:?}",
             config.warnings
         );
+    }
+
+    #[test]
+    fn spotify_section_parses_client_id() {
+        assert_eq!(parse("").spotify, SpotifyConfig::default());
+
+        let config = parse("[spotify]\nclient_id = \"  abc123  \"");
+        assert_eq!(config.spotify.client_id.as_deref(), Some("abc123"));
+        assert!(config.warnings.is_empty(), "{:?}", config.warnings);
+    }
+
+    #[test]
+    fn invalid_spotify_section_warns_and_keeps_the_default() {
+        for text in [
+            "[spotify]\nclient_id = \"\"",
+            "[spotify]\nclient_id = 3",
+            "[spotify]\nsecret = \"x\"",
+            "spotify = 1",
+        ] {
+            let config = parse(text);
+            assert_eq!(config.spotify, SpotifyConfig::default(), "{text}");
+            assert_eq!(config.warnings.len(), 1, "{text}: {:?}", config.warnings);
+        }
     }
 
     #[test]

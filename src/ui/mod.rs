@@ -120,7 +120,10 @@ pub fn classify_submit_input(input: &str) -> SubmitAction {
             crate::source::UrlKind::DirectAudio => SubmitAction::DirectAudio(url),
             crate::source::UrlKind::Page => SubmitAction::Page(url),
             crate::source::UrlKind::Playlist => SubmitAction::Playlist(url),
-            crate::source::UrlKind::Unknown => SubmitAction::Unknown(url),
+            // Placeholder hasta que T5b cablee la resolución de Spotify.
+            crate::source::UrlKind::Unknown
+            | crate::source::UrlKind::SpotifyTrack
+            | crate::source::UrlKind::SpotifyPlaylist => SubmitAction::Unknown(url),
         },
     }
 }
