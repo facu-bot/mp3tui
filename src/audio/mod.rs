@@ -1926,8 +1926,10 @@ mod tests {
             let (mut socket, _) = listener.accept().unwrap();
             let mut buf = [0u8; 1024];
             let _ = socket.read(&mut buf);
-            // El servidor demora 500 ms en responder
-            thread::sleep(Duration::from_millis(500));
+            // El servidor demora 1500 ms en responder: el margen es amplio
+            // para que el test no dependa de la carga de la máquina, pero
+            // sigue probando que `play_url` no espera esta respuesta.
+            thread::sleep(Duration::from_millis(1500));
             let response =
                 "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             let _ = socket.write_all(response.as_bytes());
@@ -1948,12 +1950,12 @@ mod tests {
 
         assert!(play_res.is_ok(), "play_url debe retornar Ok inmediatamente");
         assert!(
-            elapsed < Duration::from_millis(200),
+            elapsed < Duration::from_millis(750),
             "play_url no debe bloquear al llamador, tardó {elapsed:?}"
         );
 
         // Esperar a que el hilo de fondo complete la conexión demorada y reporte el error
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(5);
         let mut err_found = None;
         while Instant::now() < deadline {
             if let Some(err) = engine.take_error() {
