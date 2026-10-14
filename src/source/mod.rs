@@ -2,6 +2,7 @@
 //! y detección por URL o cabecera Content-Type.
 
 pub mod http_stream;
+pub mod spotify;
 pub mod ytdlp;
 
 use std::path::PathBuf;
