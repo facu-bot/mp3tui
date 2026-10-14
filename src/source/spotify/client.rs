@@ -206,6 +206,21 @@ impl SpotifyClient {
         Ok(items.into_iter().map(SpotifyTrack::from_api).collect())
     }
 
+    /// Nombre de una playlist (`GET /v1/playlists/{id}?fields=name`).
+    pub fn playlist_name(&self, id: &str) -> Result<String, SpotifyError> {
+        let value = self.fetch(
+            &self.resolve(&format!("/v1/playlists/{id}")),
+            &[("fields", "name")],
+        )?;
+        collection_name_from(value)
+    }
+
+    /// Nombre de un álbum (`GET /v1/albums/{id}`).
+    pub fn album_name(&self, id: &str) -> Result<String, SpotifyError> {
+        let value = self.fetch(&self.resolve(&format!("/v1/albums/{id}")), &[])?;
+        collection_name_from(value)
+    }
+
     /// Playlists del usuario autenticado (incluye las privadas), con paginación.
     pub fn my_playlists(&self) -> Result<Vec<SpotifyPlaylist>, SpotifyError> {
         let items: Vec<ApiPlaylist> = self.collect_pages("/v1/me/playlists", &[])?;
@@ -385,6 +400,18 @@ fn parse_error_message(body: &str) -> Option<String> {
 }
 
 // --- Formas JSON de la API (privadas) -------------------------------------
+
+/// Extrae el `name` de la respuesta de una playlist o álbum; vacío o ausente
+/// es una respuesta inesperada.
+fn collection_name_from(value: serde_json::Value) -> Result<String, SpotifyError> {
+    value
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .ok_or(SpotifyError::BadResponse)
+}
 
 #[derive(Deserialize)]
 #[serde(bound(deserialize = "T: Deserialize<'de>"))]
@@ -1099,5 +1126,61 @@ mod tests {
         let tracks = client.album_tracks("loop").unwrap();
         stub.finish();
         assert_eq!(tracks.len(), 1, "un next repetido no debe dar un bucle");
+    }
+
+    // --- nombres de colección ---
+
+    #[test]
+    fn test_playlist_name_reads_the_name_field() {
+        let path = temp_path("pl_name");
+        write_tokens(&path, "TOKEN-N");
+        let stub = Stub::spawn(|_| {
+            vec![json_response(200, r#"{"id":"p1","name":"Mi mezcla","owner":{"display_name":"yo"}}"#)]
+        });
+        let client = client_with(&stub.base_url, "http://127.0.0.1:1/api/token", &path);
+        assert_eq!(client.playlist_name("p1").unwrap(), "Mi mezcla");
+        let seen = stub.finish();
+        assert!(seen[0].target.starts_with("/v1/playlists/p1"), "{}", seen[0].target);
+        assert!(seen[0].target.contains("fields=name"), "{}", seen[0].target);
+        assert_eq!(seen[0].bearer.as_deref(), Some("TOKEN-N"));
+    }
+
+    #[test]
+    fn test_album_name_reads_the_name_field() {
+        let path = temp_path("al_name");
+        write_tokens(&path, "TOKEN-N");
+        let stub = Stub::spawn(|_| vec![json_response(200, r#"{"id":"a1","name":"Discovery"}"#)]);
+        let client = client_with(&stub.base_url, "http://127.0.0.1:1/api/token", &path);
+        assert_eq!(client.album_name("a1").unwrap(), "Discovery");
+        let seen = stub.finish();
+        assert_eq!(seen[0].target, "/v1/albums/a1");
+    }
+
+    #[test]
+    fn test_collection_name_errors_follow_the_usual_mapping() {
+        let path = temp_path("name_err");
+        write_tokens(&path, "SUPER-SECRET-TOKEN");
+        let stub = Stub::spawn(|_| {
+            vec![
+                json_response(404, r#"{"error":{"status":404,"message":"Not found"}}"#),
+                json_response(200, r#"{"id":"a1"}"#),
+                StubResponse {
+                    status: 429,
+                    headers: vec![("Retry-After", "9".to_string())],
+                    body: String::new(),
+                },
+            ]
+        });
+        let client = client_with(&stub.base_url, "http://127.0.0.1:1/api/token", &path);
+        let err = client.playlist_name("nope").unwrap_err();
+        assert!(matches!(err, SpotifyError::Status { status: 404, .. }), "{err:?}");
+        assert!(!err.to_string().contains("SUPER-SECRET-TOKEN"));
+        // Sin campo `name` la respuesta no sirve.
+        assert_eq!(client.album_name("a1").unwrap_err(), SpotifyError::BadResponse);
+        assert_eq!(
+            client.playlist_name("p").unwrap_err(),
+            SpotifyError::RateLimited { retry_after_secs: Some(9) }
+        );
+        stub.finish();
     }
 }

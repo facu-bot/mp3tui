@@ -32,7 +32,7 @@ pub(super) fn handle_ytdlp_result(
 pub(super) fn handle_playlist_result(
     app: &mut App,
     request_id: u64,
-    result: Result<Vec<crate::source::ytdlp::PlaylistEntry>, crate::source::ytdlp::YtDlpError>,
+    result: Result<crate::source::ytdlp::Collection, crate::source::ytdlp::YtDlpError>,
     resolve_page: &mut impl FnMut(String, u64) -> Receiver<YtDlpMessage>,
 ) {
     if request_id != app.ytdlp_request_id {
@@ -40,19 +40,20 @@ pub(super) fn handle_playlist_result(
         return;
     }
     match result {
-        Ok(entries) if entries.is_empty() => {
+        Ok(collection) if collection.entries.is_empty() => {
             app.replace_queue_req = None;
             app.status = Status::Stopped;
             app.error = Some(PLAYLIST_EMPTY_MSG.to_string());
             app.ytdlp_failed = true;
         }
-        Ok(entries) => {
+        Ok(collection) => {
+            let entries = &collection.entries;
             // Volver a poner una playlist del historial REEMPLAZA la cola; el
             // vaciado espera al listado exitoso para no perderla si falla.
             if app.replace_queue_req.take() == Some(request_id) {
                 clear_queue(app);
             }
-            record_collection(app, &entries);
+            record_collection(app, &collection);
             // Las siguientes van al final de la cola existente, sin
             // tocar el cursor de la cola. Cada una se resuelve recién
             // cuando le toque sonar.
@@ -173,6 +174,7 @@ pub(super) fn spawn_ytdlp_listing(url: String, req_id: u64) -> Receiver<YtDlpLis
             crate::source::spotify::play::list_playlist(&url, &connect_spotify)
         } else {
             crate::source::ytdlp::list_flat(&url, &crate::source::ytdlp::ProcessCommandRunner)
+                .map(crate::source::ytdlp::Collection::unnamed)
         };
         let _ = tx.send((req_id, url_clone, result));
     });

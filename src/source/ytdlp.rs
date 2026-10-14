@@ -223,6 +223,24 @@ pub struct PlaylistEntry {
     pub page_url: String,
 }
 
+/// Una colección listada: las entradas a encolar y, si la fuente lo da, su
+/// nombre real (Spotify lo trae; el listado plano de yt-dlp no).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Collection {
+    pub name: Option<String>,
+    pub entries: Vec<PlaylistEntry>,
+}
+
+impl Collection {
+    /// Colección sin nombre conocido.
+    pub fn unnamed(entries: Vec<PlaylistEntry>) -> Self {
+        Self {
+            name: None,
+            entries,
+        }
+    }
+}
+
 /// Errores posibles al resolver o invocar `yt-dlp`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum YtDlpError {

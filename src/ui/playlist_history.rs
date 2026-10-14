@@ -8,8 +8,8 @@ use super::*;
 use crate::history::{CollectionKind, HistoryEntry};
 use crate::source::spotify::play;
 
-/// Nombre de reserva cuando la playlist llegó por una URL pegada y no hay
-/// nombre a mano (la Web API no se consulta en el listado).
+/// Nombre de reserva: solo si Spotify no entregó el nombre real y la sesión
+/// tampoco traía uno elegido por el usuario.
 const FALLBACK_PLAYLIST_NAME: &str = "Playlist de Spotify";
 const FALLBACK_ALBUM_NAME: &str = "Álbum de Spotify";
 
@@ -27,7 +27,8 @@ pub(super) fn open_history_modal(app: &mut App) {
 
 /// Registra la playlist o álbum de Spotify que acaba de listarse (la que
 /// describe `app.current_url`). Otra cosa (una URL de YouTube) no se registra.
-pub(super) fn record_collection(app: &mut App, entries: &[crate::source::ytdlp::PlaylistEntry]) {
+pub(super) fn record_collection(app: &mut App, collection: &crate::source::ytdlp::Collection) {
+    let entries = &collection.entries;
     let Some((url, label)) = app.current_url.clone() else {
         return;
     };
@@ -41,11 +42,20 @@ pub(super) fn record_collection(app: &mut App, entries: &[crate::source::ytdlp::
         crate::source::UrlKind::SpotifyAlbum => (CollectionKind::Album, FALLBACK_ALBUM_NAME),
         _ => return,
     };
-    // Sin nombre propio la etiqueta es la de la URL («<id>» o el marcador).
-    let name = if label.trim().is_empty() || label == url_display_label(&url) {
-        fallback.to_string()
-    } else {
-        label
+    // El nombre real que dio Spotify manda; sin él, el que traía la sesión (lo
+    // eligió el usuario en el buscador o el panel); y si la etiqueta es solo la
+    // de la URL («<id>» o el marcador), el nombre de respaldo.
+    let real = collection
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty());
+    let name = match real {
+        Some(name) => name.to_string(),
+        None if label.trim().is_empty() || label == url_display_label(&url) => {
+            fallback.to_string()
+        }
+        None => label,
     };
     let titles: Vec<String> = entries.iter().map(|entry| entry.title.clone()).collect();
     app.history
@@ -313,7 +323,7 @@ mod tests {
     fn listing_a_spotify_playlist_records_name_count_and_first_five_tracks() {
         let mut app = test_app();
         app.current_url = Some(("spotify:playlist:p9".to_string(), "Mi mezcla".to_string()));
-        record_collection(&mut app, &entries(8));
+        record_collection(&mut app, &Collection::unnamed(entries(8)));
 
         let saved = app.history.get(0).expect("registró la playlist");
         assert_eq!(saved.kind, CollectionKind::Playlist);
@@ -329,7 +339,7 @@ mod tests {
         let mut app = test_app();
         let url = "https://open.spotify.com/album/alb7?si=x".to_string();
         app.current_url = Some((url.clone(), "Disco".to_string()));
-        record_collection(&mut app, &entries(3));
+        record_collection(&mut app, &Collection::unnamed(entries(3)));
         let saved = app.history.get(0).unwrap();
         assert_eq!(saved.kind, CollectionKind::Album);
         assert_eq!(saved.id, "alb7");
@@ -341,8 +351,69 @@ mod tests {
         let mut app = test_app();
         let url = "https://open.spotify.com/playlist/p3".to_string();
         app.current_url = Some((url.clone(), url_display_label(&url)));
-        record_collection(&mut app, &entries(2));
+        record_collection(&mut app, &Collection::unnamed(entries(2)));
         assert_eq!(app.history.get(0).unwrap().name, "Playlist de Spotify");
+    }
+
+    fn named(name: &str, n: usize) -> Collection {
+        Collection {
+            name: Some(name.to_string()),
+            entries: entries(n),
+        }
+    }
+
+    #[test]
+    fn the_real_name_from_spotify_is_what_gets_saved() {
+        // URL pegada: la etiqueta es solo la de la URL, pero Spotify dio el nombre.
+        let mut app = test_app();
+        let url = "https://open.spotify.com/playlist/p3?si=x".to_string();
+        app.current_url = Some((url.clone(), url_display_label(&url)));
+        record_collection(&mut app, &named("Éxitos de los 90", 4));
+        assert_eq!(app.history.get(0).unwrap().name, "Éxitos de los 90");
+        assert_eq!(app.history.get(0).unwrap().track_count, 4);
+
+        // Un álbum, igual.
+        let mut app = test_app();
+        app.current_url = Some(("spotify:album:a1".to_string(), "spotify:album:a1".to_string()));
+        record_collection(&mut app, &named("Discovery", 2));
+        assert_eq!(app.history.get(0).unwrap().name, "Discovery");
+        assert_eq!(app.history.get(0).unwrap().kind, CollectionKind::Album);
+    }
+
+    #[test]
+    fn the_real_name_wins_over_the_session_label_and_the_fallback_only_applies_without_one() {
+        let mut app = test_app();
+        app.current_url = Some(("spotify:playlist:p1".to_string(), "Etiqueta vieja".to_string()));
+        record_collection(&mut app, &named("Nombre actual", 2));
+        assert_eq!(app.history.get(0).unwrap().name, "Nombre actual");
+
+        // Sin nombre de Spotify queda el de la sesión.
+        record_collection(&mut app, &Collection::unnamed(entries(2)));
+        assert_eq!(app.history.get(0).unwrap().name, "Etiqueta vieja");
+
+        // Un nombre en blanco cuenta como ausente: respaldo si la etiqueta es de la URL.
+        let mut app = test_app();
+        let url = "https://open.spotify.com/playlist/p3".to_string();
+        app.current_url = Some((url.clone(), url_display_label(&url)));
+        record_collection(&mut app, &named("   ", 2));
+        assert_eq!(app.history.get(0).unwrap().name, "Playlist de Spotify");
+    }
+
+    #[test]
+    fn handle_playlist_result_carries_the_real_name_into_the_history() {
+        let mut app = test_app();
+        let url = "spotify:playlist:p9".to_string();
+        app.current_url = Some((url.clone(), url_display_label(&url)));
+        let calls = RefCell::new(Vec::new());
+        let mut resolve = empty_resolve_rx(&calls);
+        let req = app.ytdlp_request_id;
+        handle_playlist_result(&mut app, req, Ok(named("Mi playlist real", 3)), &mut resolve);
+        assert_eq!(app.history.get(0).map(|e| e.name.as_str()), Some("Mi playlist real"));
+        // Y el nombre persiste en disco.
+        let (reloaded, warning) = crate::history::load_from(app.history_path.as_ref().unwrap());
+        assert!(warning.is_none());
+        assert_eq!(reloaded.get(0).map(|e| e.name.as_str()), Some("Mi playlist real"));
+        let _ = std::fs::remove_file(app.history_path.as_ref().unwrap());
     }
 
     #[test]
@@ -353,11 +424,11 @@ mod tests {
         ] {
             let mut app = test_app();
             app.current_url = Some((url.to_string(), "x".to_string()));
-            record_collection(&mut app, &entries(2));
+            record_collection(&mut app, &Collection::unnamed(entries(2)));
             assert!(app.history.is_empty(), "{url}");
         }
         let mut app = test_app();
-        record_collection(&mut app, &entries(2));
+        record_collection(&mut app, &Collection::unnamed(entries(2)));
         assert!(app.history.is_empty(), "sin current_url no hay nada que registrar");
     }
 
@@ -366,8 +437,8 @@ mod tests {
         let mut app = test_app();
         let path = app.history_path.clone().unwrap();
         app.current_url = Some(("spotify:playlist:p1".to_string(), "Rock".to_string()));
-        record_collection(&mut app, &entries(2));
-        record_collection(&mut app, &entries(4));
+        record_collection(&mut app, &Collection::unnamed(entries(2)));
+        record_collection(&mut app, &Collection::unnamed(entries(4)));
         assert_eq!(app.history.len(), 1);
         assert_eq!(app.history.get(0).unwrap().track_count, 4);
         let (reloaded, warning) = crate::history::load_from(&path);
@@ -383,7 +454,7 @@ mod tests {
         let calls = RefCell::new(Vec::new());
         let mut resolve = empty_resolve_rx(&calls);
         let req = app.ytdlp_request_id;
-        handle_playlist_result(&mut app, req, Ok(entries(3)), &mut resolve);
+        handle_playlist_result(&mut app, req, Ok(Collection::unnamed(entries(3))), &mut resolve);
         assert_eq!(app.history.get(0).map(|e| e.name.as_str()), Some("Disco"));
         assert_eq!(app.history.get(0).map(|e| e.track_count), Some(3));
         // Un listado que falla no registra nada.
@@ -509,7 +580,7 @@ mod tests {
 
         let mut resolve_seam = empty_resolve_rx(&resolve_calls);
         let req = app.ytdlp_request_id;
-        handle_playlist_result(&mut app, req, Ok(entries(3)), &mut resolve_seam);
+        handle_playlist_result(&mut app, req, Ok(Collection::unnamed(entries(3))), &mut resolve_seam);
 
         let labels: Vec<&str> = app.queue.iter().map(QueueItem::label).collect();
         assert_eq!(labels, vec!["Artista - Tema 2", "Artista - Tema 3"]);
@@ -552,7 +623,7 @@ mod tests {
         let calls = RefCell::new(Vec::<String>::new());
         let mut resolve_seam = empty_resolve_rx(&calls);
         let req = app.ytdlp_request_id;
-        handle_playlist_result(&mut app, req, Ok(entries(3)), &mut resolve_seam);
+        handle_playlist_result(&mut app, req, Ok(Collection::unnamed(entries(3))), &mut resolve_seam);
         let labels: Vec<&str> = app.queue.iter().map(QueueItem::label).collect();
         assert_eq!(labels, vec!["previa", "Artista - Tema 2", "Artista - Tema 3"]);
     }

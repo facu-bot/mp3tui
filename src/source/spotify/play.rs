@@ -13,13 +13,15 @@ use super::resolve::{ResolveError, resolve_track};
 use super::{MissingClientId, client_id};
 use crate::config::Config;
 use crate::source::{self, UrlKind, ytdlp};
-use ytdlp::{CommandRunner, PlaylistEntry, Resolved, ResolveCache, YtDlpError};
+use ytdlp::{Collection, CommandRunner, PlaylistEntry, Resolved, ResolveCache, YtDlpError};
 
 /// Lo mínimo del cliente que necesita la reproducción (seam para tests).
 pub trait TrackSource {
     fn track(&self, id: &str) -> Result<SpotifyTrack, SpotifyError>;
     fn playlist_tracks(&self, id: &str) -> Result<Vec<SpotifyTrack>, SpotifyError>;
     fn album_tracks(&self, id: &str) -> Result<Vec<SpotifyTrack>, SpotifyError>;
+    fn playlist_name(&self, id: &str) -> Result<String, SpotifyError>;
+    fn album_name(&self, id: &str) -> Result<String, SpotifyError>;
 }
 
 impl TrackSource for SpotifyClient {
@@ -33,6 +35,14 @@ impl TrackSource for SpotifyClient {
 
     fn album_tracks(&self, id: &str) -> Result<Vec<SpotifyTrack>, SpotifyError> {
         SpotifyClient::album_tracks(self, id)
+    }
+
+    fn playlist_name(&self, id: &str) -> Result<String, SpotifyError> {
+        SpotifyClient::playlist_name(self, id)
+    }
+
+    fn album_name(&self, id: &str) -> Result<String, SpotifyError> {
+        SpotifyClient::album_name(self, id)
     }
 }
 
@@ -229,13 +239,17 @@ pub fn resolve_page(
     Ok(resolved)
 }
 
-/// Lista una playlist o álbum de Spotify como entradas de cola: título
-/// `"Artistas - Título"` y marcador `spotify:track:<id>`. Las canciones sin id
-/// (archivos locales) se omiten porque no se pueden buscar.
+/// Lista una playlist o álbum de Spotify: las entradas de cola (título
+/// `"Artistas - Título"` y marcador `spotify:track:<id>`) y su nombre real. Las
+/// canciones sin id (archivos locales) se omiten porque no se pueden buscar.
+///
+/// Es una sola pasada: primero los temas (si fallan, el listado falla) y
+/// después el nombre, que es un extra: si no se puede pedir queda `None` y la
+/// UI usa su nombre de respaldo.
 pub fn list_playlist(
     url: &str,
     connect: &dyn Fn() -> Result<Box<dyn TrackSource>, ConnectError>,
-) -> Result<Vec<PlaylistEntry>, YtDlpError> {
+) -> Result<Collection, YtDlpError> {
     let target = match (playlist_id(url), album_id(url)) {
         (Some(id), _) => (id, false),
         (None, Some(id)) => (id, true),
@@ -253,14 +267,23 @@ pub fn list_playlist(
         client.playlist_tracks(&id)
     }
     .map_err(failure)?;
-    Ok(tracks
+    let name = if is_album {
+        client.album_name(&id)
+    } else {
+        client.playlist_name(&id)
+    }
+    .ok()
+    .map(|name| name.trim().to_string())
+    .filter(|name| !name.is_empty());
+    let entries = tracks
         .iter()
         .filter(|track| !track.id.is_empty())
         .map(|track| PlaylistEntry {
             title: track_label(track),
             page_url: track_marker(&track.id),
         })
-        .collect())
+        .collect();
+    Ok(Collection { name, entries })
 }
 
 /// `mp3tui --spotify-login`: autoriza la app y guarda los tokens. El login
@@ -297,6 +320,7 @@ mod tests {
 
     struct FakeSource {
         tracks: Vec<SpotifyTrack>,
+        name: Result<String, SpotifyError>,
         seen: Mutex<Vec<String>>,
     }
 
@@ -319,12 +343,30 @@ mod tests {
             self.seen.lock().unwrap().push(format!("album:{id}"));
             Ok(self.tracks.clone())
         }
+
+        fn playlist_name(&self, id: &str) -> Result<String, SpotifyError> {
+            self.seen.lock().unwrap().push(format!("playlist_name:{id}"));
+            self.name.clone()
+        }
+
+        fn album_name(&self, id: &str) -> Result<String, SpotifyError> {
+            self.seen.lock().unwrap().push(format!("album_name:{id}"));
+            self.name.clone()
+        }
     }
 
     fn connect_to(tracks: Vec<SpotifyTrack>) -> impl Fn() -> Result<Box<dyn TrackSource>, ConnectError> {
+        connect_named(tracks, Ok("Nombre real".to_string()))
+    }
+
+    fn connect_named(
+        tracks: Vec<SpotifyTrack>,
+        name: Result<String, SpotifyError>,
+    ) -> impl Fn() -> Result<Box<dyn TrackSource>, ConnectError> {
         move || {
             Ok(Box::new(FakeSource {
                 tracks: tracks.clone(),
+                name: name.clone(),
                 seen: Mutex::new(Vec::new()),
             }) as Box<dyn TrackSource>)
         }
@@ -636,6 +678,12 @@ mod tests {
             fn album_tracks(&self, _: &str) -> Result<Vec<SpotifyTrack>, SpotifyError> {
                 Err(SpotifyError::Auth(AuthError::NotAuthorized))
             }
+            fn playlist_name(&self, _: &str) -> Result<String, SpotifyError> {
+                unreachable!("el nombre se pide después de los temas")
+            }
+            fn album_name(&self, _: &str) -> Result<String, SpotifyError> {
+                unreachable!("el nombre se pide después de los temas")
+            }
         }
         let connect = || Ok(Box::new(Expired) as Box<dyn TrackSource>);
         let err = resolve_page("spotify:track:t1", &FakeRunner::new(), &mut cache("exp"), &connect)
@@ -664,6 +712,14 @@ mod tests {
                 self.0.lock().unwrap().push(format!("album:{id}"));
                 Ok(vec![track("t2", "Two", &["B"])])
             }
+            fn playlist_name(&self, id: &str) -> Result<String, SpotifyError> {
+                self.0.lock().unwrap().push(format!("playlist_name:{id}"));
+                Ok("Lista".to_string())
+            }
+            fn album_name(&self, id: &str) -> Result<String, SpotifyError> {
+                self.0.lock().unwrap().push(format!("album_name:{id}"));
+                Ok("Disco".to_string())
+            }
         }
         let shared = std::sync::Arc::clone(&seen);
         let connect = move || Ok(Box::new(Recording(std::sync::Arc::clone(&shared))) as Box<dyn TrackSource>);
@@ -671,9 +727,15 @@ mod tests {
         let album = list_playlist("https://open.spotify.com/album/alb1", &connect).unwrap();
         let playlist = list_playlist("spotify:playlist:pl1", &connect).unwrap();
 
-        assert_eq!(*seen.lock().unwrap(), vec!["album:alb1", "playlist:pl1"]);
-        assert_eq!(album[0].page_url, "spotify:track:t2");
-        assert_eq!(playlist[0].page_url, "spotify:track:t1");
+        // Una sola pasada por colección: temas y después su nombre real.
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["album:alb1", "album_name:alb1", "playlist:pl1", "playlist_name:pl1"]
+        );
+        assert_eq!(album.entries[0].page_url, "spotify:track:t2");
+        assert_eq!(album.name.as_deref(), Some("Disco"));
+        assert_eq!(playlist.entries[0].page_url, "spotify:track:t1");
+        assert_eq!(playlist.name.as_deref(), Some("Lista"));
     }
 
     #[test]
@@ -684,15 +746,39 @@ mod tests {
             track("t2", "Two", &["C", "D"]),
         ]);
 
-        let entries = list_playlist("https://open.spotify.com/album/p1?si=x", &connect).unwrap();
+        let collection =
+            list_playlist("https://open.spotify.com/album/p1?si=x", &connect).unwrap();
 
+        assert_eq!(collection.name.as_deref(), Some("Nombre real"));
         assert_eq!(
-            entries,
+            collection.entries,
             vec![
                 PlaylistEntry { title: "A - One".into(), page_url: "spotify:track:t1".into() },
                 PlaylistEntry { title: "C, D - Two".into(), page_url: "spotify:track:t2".into() },
             ]
         );
+    }
+
+    /// El nombre es un extra: si falla (429, red) el listado igual sale, sin
+    /// nombre, y la UI usa su respaldo.
+    #[test]
+    fn test_list_playlist_survives_a_failing_name_lookup() {
+        for failure in [
+            SpotifyError::RateLimited { retry_after_secs: Some(3) },
+            SpotifyError::BadResponse,
+            SpotifyError::Auth(AuthError::NotAuthorized),
+        ] {
+            let connect = connect_named(vec![track("t1", "One", &["A"])], Err(failure));
+            let collection = list_playlist("spotify:playlist:p1", &connect).unwrap();
+            assert_eq!(collection.name, None);
+            assert_eq!(collection.entries.len(), 1);
+        }
+    }
+
+    #[test]
+    fn test_list_playlist_treats_a_blank_name_as_missing() {
+        let connect = connect_named(vec![track("t1", "One", &["A"])], Ok("   ".to_string()));
+        assert_eq!(list_playlist("spotify:playlist:p1", &connect).unwrap().name, None);
     }
 
     #[test]

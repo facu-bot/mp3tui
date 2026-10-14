@@ -336,6 +336,7 @@ pub(crate) fn empty_list_rx(
         rx
     }
 }
+pub(crate) use crate::source::ytdlp::Collection;
 pub(crate) fn playlist_entry(title: &str, id: &str) -> crate::source::ytdlp::PlaylistEntry {
     crate::source::ytdlp::PlaylistEntry {
         title: title.to_string(),

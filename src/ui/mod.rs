@@ -225,12 +225,13 @@ type YtDlpMessage = (
     Result<crate::source::ytdlp::Resolved, crate::source::ytdlp::YtDlpError>,
 );
 
-/// Mensaje del listado `--flat-playlist`: id de pedido, URL original de la
-/// playlist y la lista de entradas (título + URL de página).
+/// Mensaje del listado de una playlist: id de pedido, URL original y la
+/// colección (entradas con título + URL de página y, si la fuente lo da, el
+/// nombre real).
 type YtDlpListMessage = (
     u64,
     String,
-    Result<Vec<crate::source::ytdlp::PlaylistEntry>, crate::source::ytdlp::YtDlpError>,
+    Result<crate::source::ytdlp::Collection, crate::source::ytdlp::YtDlpError>,
 );
 
 /// Disparador que inició el avance por la cola. Al agotarse la cola tras
@@ -2818,7 +2819,7 @@ mod tests {
         handle_playlist_result(
             &mut app,
             req_id,
-            Ok(vec![entry("A - Uno", "t1"), entry("B - Dos", "t2"), entry("C - Tres", "t3")]),
+            Ok(Collection::unnamed(vec![entry("A - Uno", "t1"), entry("B - Dos", "t2"), entry("C - Tres", "t3")])),
             &mut resolve_seam,
         );
 
@@ -2866,7 +2867,7 @@ mod tests {
         handle_playlist_result(
             &mut app,
             req_id,
-            Ok(vec![entry("A - Uno", "t1"), entry("A - Dos", "t2")]),
+            Ok(Collection::unnamed(vec![entry("A - Uno", "t1"), entry("A - Dos", "t2")])),
             &mut resolve_seam,
         );
         let labels: Vec<&str> = app.queue.iter().map(QueueItem::label).collect();
@@ -6600,11 +6601,11 @@ mod tests {
         handle_playlist_result(
             &mut app,
             req_id,
-            Ok(vec![
+            Ok(Collection::unnamed(vec![
                 playlist_entry("Primera", "a"),
                 playlist_entry("Segunda", "b"),
                 playlist_entry("Tercera", "c"),
-            ]),
+            ])),
             &mut resolve_seam,
         );
 
@@ -6644,11 +6645,11 @@ mod tests {
         handle_playlist_result(
             &mut app,
             req_id,
-            Ok(vec![
+            Ok(Collection::unnamed(vec![
                 playlist_entry("Primera", "a"),
                 playlist_entry("", "b"),
                 playlist_entry("Tercera", "c"),
-            ]),
+            ])),
             &mut resolve_seam,
         );
         let labels: Vec<&str> = app.queue.iter().map(QueueItem::label).collect();
@@ -6681,7 +6682,7 @@ mod tests {
 
         let mut resolve_seam = empty_resolve_rx(&resolve_calls);
         let req_id = app.ytdlp_request_id;
-        handle_playlist_result(&mut app, req_id, Ok(vec![]), &mut resolve_seam);
+        handle_playlist_result(&mut app, req_id, Ok(Collection::unnamed(vec![])), &mut resolve_seam);
 
         assert_eq!(
             app.queue.iter().map(QueueItem::label).collect::<Vec<_>>(),
@@ -6760,10 +6761,10 @@ mod tests {
         handle_playlist_result(
             &mut app,
             req_id,
-            Ok(vec![
+            Ok(Collection::unnamed(vec![
                 playlist_entry("Primera", "a"),
                 playlist_entry("Segunda", "b"),
-            ]),
+            ])),
             &mut resolve_seam,
         );
 
@@ -6848,7 +6849,7 @@ mod tests {
         handle_playlist_result(
             &mut app,
             98,
-            Ok(vec![playlist_entry("Uno", "1"), playlist_entry("Dos", "2")]),
+            Ok(Collection::unnamed(vec![playlist_entry("Uno", "1"), playlist_entry("Dos", "2")])),
             &mut resolve_seam,
         );
 
