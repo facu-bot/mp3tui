@@ -656,6 +656,11 @@ impl ResolveCache {
     }
 
     fn save(&self) -> Result<(), String> {
+        // Sin ruta (por ejemplo si no hay config dir) no se escribe nada: un
+        // path vacío crearía el temporal en el cwd.
+        if self.path.as_os_str().is_empty() {
+            return Ok(());
+        }
         if let Some(parent) = self.path.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -1408,6 +1413,19 @@ mod tests {
         assert_eq!(cache.get("spotify:track:abc"), None);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_cache_without_path_does_not_write_into_cwd() {
+        let mut cache = ResolveCache::at_path(PathBuf::new());
+        cache
+            .put("spotify:track:x", "https://www.youtube.com/watch?v=x")
+            .expect("un put sin ruta no debe fallar");
+        assert_eq!(cache.len(), 1);
+        assert!(
+            !std::path::Path::new("toml.tmp").exists(),
+            "no debe crear el temporal en el cwd"
+        );
     }
 
     #[test]

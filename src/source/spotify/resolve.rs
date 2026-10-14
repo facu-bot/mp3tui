@@ -71,7 +71,9 @@ pub fn resolve_track(
 
     let query = search_query(track);
     let candidates = ytdlp::search(&query, runner)?;
-    let duration_secs = Some(track.duration_ms as f64 / 1000.0);
+    // Sin duración conocida (0) no se filtra por duración: usarla como 0.0
+    // descartaría todo candidato con duración real.
+    let duration_secs = (track.duration_ms != 0).then(|| track.duration_ms as f64 / 1000.0);
     let Some(best) = ytdlp::best_match(&track.artists, &track.title, duration_secs, &candidates)
     else {
         return Err(ResolveError::NoMatch { query });
@@ -132,7 +134,10 @@ mod tests {
         ) -> Result<CommandOutput, RunError> {
             self.calls.lock().unwrap().push(args.to_vec());
             let mut responses = self.responses.lock().unwrap();
-            assert!(!responses.is_empty(), "FakeRunner sin respuestas preparadas");
+            assert!(
+                !responses.is_empty(),
+                "FakeRunner sin respuestas preparadas"
+            );
             responses.remove(0)
         }
     }
@@ -197,7 +202,9 @@ One More Time (1 hour loop)\nhttps://www.youtube.com/watch?v=loop\n3600\n";
         let calls = runner.calls();
         assert_eq!(calls.len(), 1);
         assert!(
-            calls[0].iter().any(|a| a == "ytsearch5:Daft Punk - One More Time"),
+            calls[0]
+                .iter()
+                .any(|a| a == "ytsearch5:Daft Punk - One More Time"),
             "{:?}",
             calls[0]
         );
@@ -211,7 +218,9 @@ One More Time (1 hour loop)\nhttps://www.youtube.com/watch?v=loop\n3600\n";
     #[test]
     fn test_cache_hit_skips_ytdlp() {
         let mut cache = ResolveCache::at_path(temp_cache_path("hit"));
-        cache.put("spotify:t1", "https://www.youtube.com/watch?v=cached").unwrap();
+        cache
+            .put("spotify:t1", "https://www.youtube.com/watch?v=cached")
+            .unwrap();
         let runner = FakeRunner::new(vec![]);
 
         let url = resolve_track(&dead_client(), &mut cache, &track(), &runner).unwrap();
@@ -249,6 +258,18 @@ One More Time (1 hour loop)\nhttps://www.youtube.com/watch?v=loop\n3600\n";
         )]);
         let err = resolve_track(&dead_client(), &mut cache, &track(), &runner).unwrap_err();
         assert!(matches!(err, ResolveError::NoMatch { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn test_zero_duration_does_not_filter_out_candidates() {
+        let mut cache = ResolveCache::at_path(temp_cache_path("zerodur"));
+        // Una canción sin duración conocida (0) no debe usarse como 0.0: eso
+        // descartaría al candidato correcto, que sí tiene duración.
+        let mut t = track();
+        t.duration_ms = 0;
+        let runner = FakeRunner::new(vec![FakeRunner::stdout(CANDIDATES)]);
+        let url = resolve_track(&dead_client(), &mut cache, &t, &runner).unwrap();
+        assert_eq!(url, "https://www.youtube.com/watch?v=good");
     }
 
     #[test]

@@ -64,7 +64,10 @@ pub enum SpotifyError {
     /// Falla de red o de transporte HTTP.
     Http(String),
     /// Respuesta no-2xx con el `message` que reportó Spotify (si lo hubo).
-    Status { status: u16, message: Option<String> },
+    Status {
+        status: u16,
+        message: Option<String>,
+    },
     /// La API limitó la tasa de peticiones; se conserva `Retry-After`.
     RateLimited { retry_after_secs: Option<u64> },
     /// La respuesta no tenía la forma JSON esperada.
@@ -81,7 +84,10 @@ impl fmt::Display for SpotifyError {
                 None => write!(f, "la Web API de Spotify respondió HTTP {status}"),
             },
             Self::RateLimited { retry_after_secs } => match retry_after_secs {
-                Some(s) => write!(f, "Spotify limitó la tasa de peticiones; reintentar en {s} s"),
+                Some(s) => write!(
+                    f,
+                    "Spotify limitó la tasa de peticiones; reintentar en {s} s"
+                ),
                 None => write!(f, "Spotify limitó la tasa de peticiones"),
             },
             Self::BadResponse => write!(f, "respuesta inesperada de la Web API de Spotify"),
@@ -222,7 +228,13 @@ impl SpotifyClient {
         let mut collected = Vec::new();
         let mut url = self.resolve(path);
         let mut params: Vec<(&str, &str)> = query.to_vec();
+        // Un `next` que se repite (o vuelve atrás) sería un bucle infinito en
+        // un hilo de fondo: se corta al ver una URL ya visitada.
+        let mut seen = std::collections::HashSet::new();
         loop {
+            if !seen.insert(url.clone()) {
+                break;
+            }
             let value = self.fetch(&url, &params)?;
             let page: ApiPage<T> =
                 serde_json::from_value(value).map_err(|_| SpotifyError::BadResponse)?;
@@ -255,7 +267,9 @@ impl SpotifyClient {
             for (key, value) in query {
                 request = request.query(*key, *value);
             }
-            let mut response = request.call().map_err(|e| SpotifyError::Http(e.to_string()))?;
+            let mut response = request
+                .call()
+                .map_err(|e| SpotifyError::Http(e.to_string()))?;
             let status = response.status().as_u16();
             let retry_after = response
                 .headers()
@@ -322,7 +336,10 @@ impl SpotifyTrack {
                 .map(|artist| artist.name)
                 .filter(|name| !name.is_empty())
                 .collect(),
-            album: track.album.map(|album| album.name).filter(|n| !n.is_empty()),
+            album: track
+                .album
+                .map(|album| album.name)
+                .filter(|n| !n.is_empty()),
             duration_ms: track.duration_ms,
             isrc: track
                 .external_ids
@@ -484,9 +501,9 @@ mod tests {
     use std::fs;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
-    use std::thread::{self, JoinHandle};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::thread::{self, JoinHandle};
 
     // --- helpers ---
 
@@ -696,8 +713,16 @@ mod tests {
         assert_eq!(results.artists[0].name, "Daft Punk");
 
         assert_eq!(seen.len(), 1);
-        assert!(seen[0].target.starts_with("/v1/search?"), "{}", seen[0].target);
-        assert!(seen[0].target.contains("q=daft%20punk"), "{}", seen[0].target);
+        assert!(
+            seen[0].target.starts_with("/v1/search?"),
+            "{}",
+            seen[0].target
+        );
+        assert!(
+            seen[0].target.contains("q=daft%20punk"),
+            "{}",
+            seen[0].target
+        );
         assert!(
             seen[0].target.contains("type=track%2Cplaylist%2Cartist"),
             "{}",
@@ -949,7 +974,10 @@ mod tests {
         let path = temp_path("track_404");
         write_tokens(&path, "SUPER-SECRET-TOKEN");
         let stub = Stub::spawn(|_| {
-            vec![json_response(404, r#"{"error":{"status":404,"message":"Non existing id"}}"#)]
+            vec![json_response(
+                404,
+                r#"{"error":{"status":404,"message":"Non existing id"}}"#,
+            )]
         });
         let client = client_with(&stub.base_url, "http://127.0.0.1:1/api/token", &path);
         let err = client.track("nope").unwrap_err();
@@ -1013,11 +1041,20 @@ mod tests {
         assert_eq!(tracks[0].duration_ms, 61_000);
         assert_eq!(tracks[0].isrc, None);
         assert_eq!(tracks[0].album, None);
-        assert_eq!(tracks[1].artists, vec!["Band".to_string(), "Guest".to_string()]);
+        assert_eq!(
+            tracks[1].artists,
+            vec!["Band".to_string(), "Guest".to_string()]
+        );
         assert_eq!(tracks[1].isrc.as_deref(), Some("ISRC2"));
         assert_eq!(seen.len(), 2);
         assert_eq!(seen[0].target, "/v1/albums/alb1/tracks");
-        assert!(seen[1].target.starts_with("/v1/albums/alb1/tracks?offset=1"), "{}", seen[1].target);
+        assert!(
+            seen[1]
+                .target
+                .starts_with("/v1/albums/alb1/tracks?offset=1"),
+            "{}",
+            seen[1].target
+        );
         assert_eq!(seen[0].bearer.as_deref(), Some("TOKEN-AL"));
     }
 
@@ -1026,11 +1063,38 @@ mod tests {
         let path = temp_path("album_404");
         write_tokens(&path, "TOKEN-AL");
         let stub = Stub::spawn(|_| {
-            vec![json_response(404, r#"{"error":{"status":404,"message":"Non existing id"}}"#)]
+            vec![json_response(
+                404,
+                r#"{"error":{"status":404,"message":"Non existing id"}}"#,
+            )]
         });
         let client = client_with(&stub.base_url, "http://127.0.0.1:1/api/token", &path);
         let err = client.album_tracks("nope").unwrap_err();
         stub.finish();
-        assert!(matches!(err, SpotifyError::Status { status: 404, .. }), "{err:?}");
+        assert!(
+            matches!(err, SpotifyError::Status { status: 404, .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn test_collect_pages_stops_on_a_repeating_next() {
+        let path = temp_path("loop");
+        write_tokens(&path, "TOKEN");
+        let stub = Stub::spawn(|base| {
+            vec![json_response(
+                200,
+                format!(
+                    r#"{{"items":[
+                      {{"id":"a1","name":"Uno","artists":[{{"id":"x","name":"Band"}}],
+                       "duration_ms":1000}}
+                    ],"next":"{base}/v1/albums/loop/tracks"}}"#
+                ),
+            )]
+        });
+        let client = client_with(&stub.base_url, "http://127.0.0.1:1/api/token", &path);
+        let tracks = client.album_tracks("loop").unwrap();
+        stub.finish();
+        assert_eq!(tracks.len(), 1, "un next repetido no debe dar un bucle");
     }
 }
