@@ -898,9 +898,12 @@ pub struct Keys {
     /// cierra el panel (o sale) antes de que llegue acá.
     pub quit: Vec<KeyCode>,
     /// Espacio en ambos modos.
+    /// Pausa en la vista Reproductor; en la lista es la acción de la fila
+    /// (encolar).
     pub play_pause: Vec<KeyCode>,
     pub volume_up: Vec<KeyCode>,
     pub volume_down: Vec<KeyCode>,
+    /// Seek en la vista Reproductor; en la lista mueven el foco entre columnas.
     pub seek_back: Vec<KeyCode>,
     pub seek_fwd: Vec<KeyCode>,
     pub prev_track: Vec<KeyCode>,

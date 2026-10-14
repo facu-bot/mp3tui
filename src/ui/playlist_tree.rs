@@ -93,6 +93,9 @@ pub(super) struct PlaylistTree {
     pub(super) selected: usize,
     /// Se incrementa al (re)cargar: un resultado con otra generación se tira.
     pub(super) generation: u64,
+    /// Playlists cuyas canciones se están pidiendo para ENCOLARLAS (Espacio)
+    /// apenas lleguen.
+    pub(super) pending_enqueue: Vec<String>,
     tx: TreeSender,
     rx: Receiver<TreeMessage>,
 }
@@ -105,6 +108,7 @@ impl PlaylistTree {
             playlists: Vec::new(),
             selected: 0,
             generation: 0,
+            pending_enqueue: Vec::new(),
             tx,
             rx,
         }
@@ -236,6 +240,7 @@ pub(super) fn start_loading_playlists_with(
     tree.generation = tree.generation.wrapping_add(1);
     tree.load = TreeLoad::Loading;
     tree.playlists.clear();
+    tree.pending_enqueue.clear();
     tree.selected = 0;
     spawn_playlists(tree.generation, tree.tx.clone());
 }
@@ -262,10 +267,12 @@ pub(super) fn focus_playlist_tree(app: &mut App) {
 
 /// Aplica el resultado de un hilo de carga al árbol.
 pub(super) fn handle_tree_result(app: &mut App, generation: u64, payload: TreePayload) {
-    let tree = &mut app.playlist_tree;
-    if generation != tree.generation {
+    if generation != app.playlist_tree.generation {
         return;
     }
+    // Canciones que había que encolar al llegar (Espacio sobre una playlist).
+    let mut to_enqueue: Option<Result<Vec<TreeTrack>, String>> = None;
+    let tree = &mut app.playlist_tree;
     match payload {
         TreePayload::Playlists(result) if tree.load == TreeLoad::Loading => match result {
             Ok(playlists) => {
@@ -283,15 +290,49 @@ pub(super) fn handle_tree_result(app: &mut App, generation: u64, payload: TreePa
                 playlist.id == playlist_id && playlist.tracks == TrackState::Loading
             });
             if let Some(playlist) = loading {
-                playlist.tracks = match result {
-                    Ok(tracks) => TrackState::Loaded(tracks),
-                    Err(message) => TrackState::Failed(message),
+                playlist.tracks = match &result {
+                    Ok(tracks) => TrackState::Loaded(tracks.clone()),
+                    Err(message) => TrackState::Failed(message.clone()),
                 };
+                if let Some(at) = tree
+                    .pending_enqueue
+                    .iter()
+                    .position(|id| *id == playlist_id)
+                {
+                    tree.pending_enqueue.remove(at);
+                    to_enqueue = Some(result);
+                }
             }
         }
         TreePayload::Playlists(_) => {}
     }
     tree.clamp_selection();
+    match to_enqueue {
+        Some(Ok(tracks)) => enqueue_tracks(app, &tracks),
+        Some(Err(message)) => app.error = Some(message),
+        None => {}
+    }
+}
+
+/// Mensaje cuando se intenta encolar una playlist sin canciones reproducibles.
+const NOTHING_TO_QUEUE_MSG: &str = "La playlist no tiene canciones reproducibles";
+
+/// Suma las canciones al final de la cola como marcadores `spotify:track:<id>`
+/// (se resuelven recién cuando les toca sonar, como cualquier ítem de URL).
+fn enqueue_tracks(app: &mut App, tracks: &[TreeTrack]) {
+    if tracks.is_empty() {
+        app.error = Some(NOTHING_TO_QUEUE_MSG.to_string());
+        return;
+    }
+    app.queue.extend(tracks.iter().map(|track| QueueItem::Url {
+        url: play::track_marker(&track.id),
+        title: track.label.clone(),
+    }));
+}
+
+/// Nada suena ni está en pausa: encolar una playlist la hace arrancar.
+fn nothing_playing(app: &App) -> bool {
+    matches!(app.status, Status::Ended | Status::Stopped)
 }
 
 /// Recoge los resultados de los hilos sin bloquear (lo llama el event loop en
@@ -370,9 +411,9 @@ pub(super) fn handle_tree_key_with(
         None
     };
     let wants_select = config::pressed(&keys.select, code);
-    let wants_expand = config::pressed(&keys.seek_fwd, code);
-    let wants_collapse = config::pressed(&keys.seek_back, code);
-    if delta.is_none() && !wants_select && !wants_expand && !wants_collapse {
+    // En la lista la tecla de pausa es la acción de la fila: encolar.
+    let wants_enqueue = config::pressed(&keys.play_pause, code);
+    if delta.is_none() && !wants_select && !wants_enqueue {
         return false;
     }
 
@@ -388,46 +429,101 @@ pub(super) fn handle_tree_key_with(
     if let Some(delta) = delta {
         let tree = &mut app.playlist_tree;
         tree.selected = move_selection(tree.selected, delta, tree.rows().len());
-    } else if wants_expand {
-        if let Some(TreeRow::Playlist(index)) = row {
-            expand_playlist(app, index, spawn_tracks);
-        }
-    } else if wants_collapse {
-        if let Some(TreeRow::Playlist(index) | TreeRow::Track(index, _) | TreeRow::Status(index)) =
-            row
-        {
-            collapse_playlist(app, index);
-        }
-    } else if let Some(row) = row {
-        match row {
-            TreeRow::Playlist(index) => {
-                let playlist = &app.playlist_tree.playlists[index];
-                let (marker, label) = (
-                    format!("spotify:playlist:{}", playlist.id),
-                    playlist.name.clone(),
-                );
+        return true;
+    }
+    let Some(row) = row else {
+        return true;
+    };
+    match (row, wants_select) {
+        // Enter sobre una playlist: plegar / desplegar.
+        (TreeRow::Playlist(index), true) => toggle_playlist(app, index, spawn_tracks),
+        // Enter sobre una canción: reproducirla.
+        (TreeRow::Track(index, track), true) => {
+            if let TrackState::Loaded(tracks) = &app.playlist_tree.playlists[index].tracks
+                && let Some(track) = tracks.get(track)
+            {
+                let (marker, label) = (play::track_marker(&track.id), track.label.clone());
                 play_spotify_marker(app, marker, &label, resolve_page, list_playlist);
             }
-            TreeRow::Track(index, track) => {
-                if let TrackState::Loaded(tracks) = &app.playlist_tree.playlists[index].tracks
-                    && let Some(track) = tracks.get(track)
-                {
-                    let (marker, label) = (play::track_marker(&track.id), track.label.clone());
-                    play_spotify_marker(app, marker, &label, resolve_page, list_playlist);
-                }
+        }
+        // Enter sobre «falló»: reintenta esa playlist.
+        (TreeRow::Status(index), true) => {
+            if matches!(
+                app.playlist_tree.playlists[index].tracks,
+                TrackState::Failed(_)
+            ) {
+                expand_playlist(app, index, spawn_tracks);
             }
-            // Enter sobre «falló» reintenta esa playlist.
-            TreeRow::Status(index) => {
-                if matches!(
-                    app.playlist_tree.playlists[index].tracks,
-                    TrackState::Failed(_)
-                ) {
-                    expand_playlist(app, index, spawn_tracks);
-                }
+        }
+        // Espacio sobre una playlist: encolarla entera (o arrancarla si no
+        // suena nada).
+        (TreeRow::Playlist(index), false) => {
+            enqueue_playlist(app, index, spawn_tracks, resolve_page, list_playlist);
+        }
+        // Espacio sobre una canción: encolarla.
+        (TreeRow::Track(index, track), false) => {
+            if let TrackState::Loaded(tracks) = &app.playlist_tree.playlists[index].tracks
+                && let Some(track) = tracks.get(track).cloned()
+            {
+                enqueue_tracks(app, &[track]);
+            }
+        }
+        (TreeRow::Status(_), false) => {}
+    }
+    true
+}
+
+/// Enter sobre una playlist: la despliega (pidiendo sus canciones si faltan)
+/// o la pliega, y deja la selección sobre ella.
+fn toggle_playlist(
+    app: &mut App,
+    index: usize,
+    spawn_tracks: impl FnOnce(String, u64, TreeSender),
+) {
+    if app.playlist_tree.playlists[index].expanded {
+        collapse_playlist(app, index);
+    } else {
+        expand_playlist(app, index, spawn_tracks);
+    }
+}
+
+/// Espacio sobre una playlist: si no suena nada arranca con ella por el flujo
+/// de siempre; si no, suma TODAS sus canciones al final de la cola. Las que
+/// todavía no se cargaron se piden y se encolan al llegar.
+fn enqueue_playlist(
+    app: &mut App,
+    index: usize,
+    spawn_tracks: impl FnOnce(String, u64, TreeSender),
+    resolve_page: impl FnOnce(String, u64) -> Receiver<YtDlpMessage>,
+    list_playlist: impl FnOnce(String, u64) -> Receiver<YtDlpListMessage>,
+) {
+    let playlist = &app.playlist_tree.playlists[index];
+    if nothing_playing(app) {
+        let (marker, label) = (
+            format!("spotify:playlist:{}", playlist.id),
+            playlist.name.clone(),
+        );
+        play_spotify_marker(app, marker, &label, resolve_page, list_playlist);
+        return;
+    }
+    match &playlist.tracks {
+        TrackState::Loaded(tracks) => {
+            let tracks = tracks.clone();
+            enqueue_tracks(app, &tracks);
+        }
+        TrackState::Loading | TrackState::NotLoaded | TrackState::Failed(_) => {
+            let id = playlist.id.clone();
+            let needs_request = !matches!(playlist.tracks, TrackState::Loading);
+            if !app.playlist_tree.pending_enqueue.contains(&id) {
+                app.playlist_tree.pending_enqueue.push(id.clone());
+            }
+            if needs_request {
+                let tree = &mut app.playlist_tree;
+                tree.playlists[index].tracks = TrackState::Loading;
+                spawn_tracks(id, tree.generation, tree.tx.clone());
             }
         }
     }
-    true
 }
 
 pub(super) fn handle_tree_key(key: KeyEvent, app: &mut App) -> bool {
@@ -966,45 +1062,87 @@ mod tests {
         assert_eq!(run_guarded(|| Ok::<_, String>(3)), Ok(3));
     }
 
-    // --- expandir y colapsar ---
+    // --- expandir y colapsar (Enter sobre una playlist) ---
+
+    fn space() -> KeyCode {
+        KeyCode::Char(' ')
+    }
+
+    /// Tecla con un seam de canciones que anota los pedidos.
+    fn press_logging_tracks(
+        app: &mut App,
+        code: KeyCode,
+        calls: &RefCell<Vec<(String, u64)>>,
+    ) -> bool {
+        handle_tree_key_with(
+            key(code),
+            app,
+            no_playlists,
+            |id, generation, _| calls.borrow_mut().push((id, generation)),
+            no_resolve,
+            no_list,
+        )
+    }
 
     #[test]
-    fn expanding_requests_the_tracks_of_that_playlist_once() {
+    fn enter_on_a_playlist_expands_it_and_requests_its_tracks_once() {
         let mut app = app_with_tree();
         app.playlist_tree.selected = 1;
         let calls = RefCell::new(Vec::new());
         let generation = app.playlist_tree.generation;
-        assert!(handle_tree_key_with(
-            key(KeyCode::Right),
-            &mut app,
-            no_playlists,
-            |id, g, _| calls.borrow_mut().push((id, g)),
-            no_resolve,
-            no_list,
-        ));
+        assert!(press_logging_tracks(&mut app, KeyCode::Enter, &calls));
         assert_eq!(calls.borrow().as_slice(), &[("p2".to_string(), generation)]);
         assert!(app.playlist_tree.playlists[1].expanded);
         assert_eq!(app.playlist_tree.playlists[1].tracks, TrackState::Loading);
         // Las otras playlists no se tocan: la carga es perezosa.
         assert_eq!(app.playlist_tree.playlists[0].tracks, TrackState::NotLoaded);
         assert_eq!(app.playlist_tree.playlists[2].tracks, TrackState::NotLoaded);
+        // Enter no reproduce nada: sigue sin sonar ni listar.
+        assert!(app.current_url.is_none());
+    }
 
-        // Expandir una ya expandida no pide nada más.
-        assert!(press(&mut app, KeyCode::Right));
+    #[test]
+    fn enter_again_collapses_and_the_next_expand_reuses_the_loaded_tracks() {
+        let mut app = app_with_tree();
+        expand_with_tracks(&mut app, 0, vec![tr("t1", "A - Uno")]);
+        app.playlist_tree.selected = 0;
+        assert!(press(&mut app, KeyCode::Enter), "sin pedir nada");
+        assert!(!app.playlist_tree.playlists[0].expanded);
+        assert_eq!(app.playlist_tree.rows().len(), 3);
+        // Cargadas quedan: volver a expandir no hace ni un pedido más.
+        assert!(press(&mut app, KeyCode::Enter));
+        assert!(app.playlist_tree.playlists[0].expanded);
+        assert_eq!(app.playlist_tree.rows().len(), 4);
+    }
+
+    #[test]
+    fn collapsing_keeps_the_selection_on_the_playlist() {
+        let mut app = app_with_tree();
+        expand_with_tracks(&mut app, 1, vec![tr("t1", "A - Uno")]);
+        app.playlist_tree.selected = 1; // Jazz
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.playlist_tree.selected_row(), Some(TreeRow::Playlist(1)));
+    }
+
+    #[test]
+    fn left_and_right_no_longer_fold_the_tree_they_belong_to_the_column_focus() {
+        let mut app = app_with_tree();
+        expand_with_tracks(&mut app, 0, vec![tr("t1", "A - Uno")]);
+        app.playlist_tree.selected = 0;
+        assert!(!press(&mut app, KeyCode::Left));
+        assert!(!press(&mut app, KeyCode::Right));
+        assert!(app.playlist_tree.playlists[0].expanded, "nada se plegó");
+        app.playlist_tree.playlists[0].expanded = false;
+        assert!(!press(&mut app, KeyCode::Right));
+        assert!(!app.playlist_tree.playlists[0].expanded, "nada se desplegó");
     }
 
     #[test]
     fn the_tracks_arrive_and_show_indented_under_their_playlist() {
         let mut app = app_with_tree();
         app.playlist_tree.selected = 0;
-        handle_tree_key_with(
-            key(KeyCode::Right),
-            &mut app,
-            no_playlists,
-            |_, _, _| {},
-            no_resolve,
-            no_list,
-        );
+        let calls = RefCell::new(Vec::new());
+        press_logging_tracks(&mut app, KeyCode::Enter, &calls);
         let generation = app.playlist_tree.generation;
         handle_tree_result(
             &mut app,
@@ -1034,14 +1172,8 @@ mod tests {
     fn a_track_failure_stays_under_its_playlist_and_enter_retries_it() {
         let mut app = app_with_tree();
         app.playlist_tree.selected = 0;
-        handle_tree_key_with(
-            key(KeyCode::Right),
-            &mut app,
-            no_playlists,
-            |_, _, _| {},
-            no_resolve,
-            no_list,
-        );
+        let calls = RefCell::new(Vec::new());
+        press_logging_tracks(&mut app, KeyCode::Enter, &calls);
         let generation = app.playlist_tree.generation;
         handle_tree_result(
             &mut app,
@@ -1056,41 +1188,11 @@ mod tests {
 
         // Enter sobre la fila de estado reintenta esa playlist.
         app.playlist_tree.selected = 1;
-        let calls = RefCell::new(Vec::new());
-        handle_tree_key_with(
-            key(KeyCode::Enter),
-            &mut app,
-            no_playlists,
-            |id, _, _| calls.borrow_mut().push(id),
-            no_resolve,
-            no_list,
-        );
-        assert_eq!(calls.borrow().as_slice(), &["p1".to_string()]);
+        let retries = RefCell::new(Vec::new());
+        press_logging_tracks(&mut app, KeyCode::Enter, &retries);
+        assert_eq!(retries.borrow().len(), 1);
+        assert_eq!(retries.borrow()[0].0, "p1");
         assert_eq!(app.playlist_tree.playlists[0].tracks, TrackState::Loading);
-    }
-
-    #[test]
-    fn collapsing_hides_the_tracks_but_keeps_them_for_the_next_expand() {
-        let mut app = app_with_tree();
-        expand_with_tracks(&mut app, 0, vec![tr("t1", "A - Uno")]);
-        app.playlist_tree.selected = 0;
-        assert!(press(&mut app, KeyCode::Left));
-        assert!(!app.playlist_tree.playlists[0].expanded);
-        assert_eq!(app.playlist_tree.rows().len(), 3);
-        // Volver a expandir reusa lo cargado: ni un pedido más.
-        assert!(press(&mut app, KeyCode::Right));
-        assert!(app.playlist_tree.playlists[0].expanded);
-        assert_eq!(app.playlist_tree.rows().len(), 4);
-    }
-
-    #[test]
-    fn collapsing_from_a_track_jumps_back_to_its_playlist() {
-        let mut app = app_with_tree();
-        expand_with_tracks(&mut app, 1, vec![tr("t1", "A - Uno"), tr("t2", "B - Dos")]);
-        app.playlist_tree.selected = 3; // t2
-        assert!(press(&mut app, KeyCode::Left));
-        assert!(!app.playlist_tree.playlists[1].expanded);
-        assert_eq!(app.playlist_tree.selected_row(), Some(TreeRow::Playlist(1)));
     }
 
     // --- navegación ---
@@ -1122,42 +1224,17 @@ mod tests {
         let mut app = app_with_tree();
         for code in [
             KeyCode::Char('n'),
-            KeyCode::Char(' '),
+            KeyCode::Char('p'),
             KeyCode::Tab,
             KeyCode::Esc,
+            KeyCode::Left,
+            KeyCode::Right,
         ] {
             assert!(!press(&mut app, code), "{code:?}");
         }
     }
 
-    // --- reproducir ---
-
-    #[test]
-    fn enter_on_a_playlist_plays_it_through_the_existing_url_flow() {
-        let mut app = app_with_tree();
-        app.playlist_tree.selected = 1;
-        let listed = RefCell::new(Vec::new());
-        assert!(handle_tree_key_with(
-            key(KeyCode::Enter),
-            &mut app,
-            no_playlists,
-            no_tracks,
-            no_resolve,
-            |url, _| {
-                listed.borrow_mut().push(url);
-                mpsc::channel().1
-            },
-        ));
-        assert_eq!(
-            listed.borrow().as_slice(),
-            &["spotify:playlist:p2".to_string()]
-        );
-        assert_eq!(app.track_label, "Jazz");
-        assert_eq!(
-            app.current_url,
-            Some(("spotify:playlist:p2".to_string(), "Jazz".to_string()))
-        );
-    }
+    // --- reproducir (Enter sobre una canción) ---
 
     #[test]
     fn enter_on_a_track_plays_that_track_through_the_existing_url_flow() {
@@ -1181,11 +1258,14 @@ mod tests {
             &["spotify:track:t2".to_string()]
         );
         assert_eq!(app.track_label, "B - Dos");
+        assert!(app.queue.is_empty(), "reproducir no encola");
     }
 
     #[test]
-    fn playing_does_not_close_the_list_view() {
+    fn playing_a_track_does_not_close_the_list_view() {
         let mut app = app_with_tree();
+        expand_with_tracks(&mut app, 0, vec![tr("t1", "A - Uno")]);
+        app.playlist_tree.selected = 1;
         app.mode = Mode::Player;
         app.has_player = true;
         app.explorer_open = true;
@@ -1194,11 +1274,176 @@ mod tests {
             &mut app,
             no_playlists,
             no_tracks,
-            no_resolve,
             |_, _| mpsc::channel().1,
+            no_list,
         );
         assert!(app.explorer_open);
         assert!(app.tree_focus);
+    }
+
+    // --- encolar (Espacio) ---
+
+    fn queued(app: &App) -> Vec<(String, String)> {
+        app.queue
+            .iter()
+            .map(|item| match item {
+                QueueItem::Url { url, title } => (url.clone(), title.clone()),
+                other => panic!("se esperaba una URL en la cola: {}", other.label()),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn space_on_a_playlist_with_nothing_playing_starts_it_through_the_url_flow() {
+        let mut app = app_with_tree();
+        app.status = Status::Ended;
+        app.playlist_tree.selected = 1;
+        let listed = RefCell::new(Vec::new());
+        assert!(handle_tree_key_with(
+            key(space()),
+            &mut app,
+            no_playlists,
+            no_tracks,
+            no_resolve,
+            |url, _| {
+                listed.borrow_mut().push(url);
+                mpsc::channel().1
+            },
+        ));
+        assert_eq!(
+            listed.borrow().as_slice(),
+            &["spotify:playlist:p2".to_string()]
+        );
+        assert_eq!(app.track_label, "Jazz");
+        assert_eq!(
+            app.current_url,
+            Some(("spotify:playlist:p2".to_string(), "Jazz".to_string()))
+        );
+    }
+
+    #[test]
+    fn space_on_a_loaded_playlist_while_playing_appends_all_its_tracks_to_the_queue() {
+        let mut app = app_with_tree();
+        app.status = Status::Playing;
+        app.queue.push(QueueItem::Url {
+            url: "spotify:track:antes".into(),
+            title: "Antes".into(),
+        });
+        expand_with_tracks(&mut app, 0, vec![tr("t1", "A - Uno"), tr("t2", "B - Dos")]);
+        app.playlist_tree.selected = 0;
+        assert!(press(&mut app, space()), "sin tocar la red ni lo que suena");
+        assert_eq!(
+            queued(&app),
+            vec![
+                ("spotify:track:antes".to_string(), "Antes".to_string()),
+                ("spotify:track:t1".to_string(), "A - Uno".to_string()),
+                ("spotify:track:t2".to_string(), "B - Dos".to_string()),
+            ]
+        );
+        assert_eq!(app.status, Status::Playing);
+        assert!(app.current_url.is_none(), "no arrancó otra reproducción");
+    }
+
+    #[test]
+    fn space_on_an_unloaded_playlist_loads_its_tracks_and_queues_them_when_they_arrive() {
+        let mut app = app_with_tree();
+        app.status = Status::Paused;
+        app.playlist_tree.selected = 2; // Mix
+        let calls = RefCell::new(Vec::new());
+        assert!(press_logging_tracks(&mut app, space(), &calls));
+        assert_eq!(calls.borrow().len(), 1);
+        assert_eq!(calls.borrow()[0].0, "p3");
+        assert!(
+            !app.playlist_tree.playlists[2].expanded,
+            "encolar no despliega la playlist"
+        );
+        assert!(app.queue.is_empty(), "todavía no llegaron");
+
+        // Otro Espacio mientras carga no repite el pedido ni duplica la cola.
+        assert!(press(&mut app, space()));
+
+        let generation = app.playlist_tree.generation;
+        handle_tree_result(
+            &mut app,
+            generation,
+            TreePayload::Tracks {
+                playlist_id: "p3".into(),
+                result: Ok(vec![tr("t1", "A - Uno"), tr("t2", "B - Dos")]),
+            },
+        );
+        assert_eq!(
+            queued(&app),
+            vec![
+                ("spotify:track:t1".to_string(), "A - Uno".to_string()),
+                ("spotify:track:t2".to_string(), "B - Dos".to_string()),
+            ]
+        );
+        // Quedan cargadas: un segundo Espacio las encola sin pedir nada.
+        press(&mut app, space());
+        assert_eq!(app.queue.len(), 4);
+    }
+
+    #[test]
+    fn a_failed_load_for_a_queued_playlist_shows_the_error_and_queues_nothing() {
+        let mut app = app_with_tree();
+        app.status = Status::Playing;
+        app.playlist_tree.selected = 0;
+        let calls = RefCell::new(Vec::new());
+        press_logging_tracks(&mut app, space(), &calls);
+        let generation = app.playlist_tree.generation;
+        handle_tree_result(
+            &mut app,
+            generation,
+            TreePayload::Tracks {
+                playlist_id: "p1".into(),
+                result: Err("Spotify limitó la tasa de peticiones".into()),
+            },
+        );
+        assert!(app.queue.is_empty());
+        assert_eq!(
+            app.error.as_deref(),
+            Some("Spotify limitó la tasa de peticiones")
+        );
+        // Un reintento posterior no encola por su cuenta lo que ya falló.
+        assert!(app.playlist_tree.pending_enqueue.is_empty());
+    }
+
+    #[test]
+    fn space_on_an_empty_playlist_says_so() {
+        let mut app = app_with_tree();
+        app.status = Status::Playing;
+        expand_with_tracks(&mut app, 0, Vec::new());
+        app.playlist_tree.playlists[0].expanded = false;
+        app.playlist_tree.selected = 0;
+        press(&mut app, space());
+        assert!(app.queue.is_empty());
+        assert!(app.error.is_some());
+    }
+
+    #[test]
+    fn space_on_a_track_appends_it_to_the_end_of_the_queue_without_playing_it() {
+        let mut app = app_with_tree();
+        expand_with_tracks(&mut app, 0, vec![tr("t1", "A - Uno"), tr("t2", "B - Dos")]);
+        app.playlist_tree.selected = 2; // t2
+        for status in [Status::Playing, Status::Ended] {
+            app.queue.clear();
+            app.status = status;
+            assert!(press(&mut app, space()), "sin resolver ni listar");
+            assert_eq!(
+                queued(&app),
+                vec![("spotify:track:t2".to_string(), "B - Dos".to_string())]
+            );
+        }
+    }
+
+    #[test]
+    fn space_on_a_status_row_does_nothing() {
+        let mut app = app_with_tree();
+        app.playlist_tree.playlists[0].expanded = true;
+        app.playlist_tree.playlists[0].tracks = TrackState::Loading;
+        app.playlist_tree.selected = 1; // fila de estado
+        assert!(press(&mut app, space()));
+        assert!(app.queue.is_empty());
     }
 
     // --- estados sin datos ---
@@ -1358,7 +1603,7 @@ mod tests {
         assert!(screen.contains("en_cola"), "{screen}");
         // El pie conserva los atajos y suma la tecla de vista.
         assert!(screen.contains("v: reproductor"), "{screen}");
-        assert!(screen.contains("plegar/desplegar"), "{screen}");
+        assert!(screen.contains("plegar playlist"), "{screen}");
     }
 
     #[test]
@@ -1388,6 +1633,24 @@ mod tests {
         assert!(screen.contains("Playlists"), "{screen}");
         assert!(screen.contains("Cola"), "{screen}");
         assert!(screen.contains("Rock"), "{screen}");
+    }
+
+    #[test]
+    fn the_list_view_has_no_player_mouse_zones_but_the_player_view_does() {
+        let Some(engine) = engine_or_skip() else {
+            return;
+        };
+        let mut app = player_app();
+        app.explorer_open = true;
+        screen_text_sized(&app, &engine, 120, 36);
+        let hit = app.hit.borrow().clone();
+        assert!(hit.player.is_none(), "la rueda no cambia el volumen");
+        assert!(hit.buttons.is_empty() && hit.progress.is_none() && hit.volume.is_none());
+        drop(hit);
+
+        app.explorer_open = false;
+        screen_text_sized(&app, &engine, 120, 36);
+        assert!(app.hit.borrow().player.is_some());
     }
 
     #[test]
@@ -1438,28 +1701,95 @@ mod tests {
         assert!(idle.contains('—'), "{idle}");
     }
 
+    fn footer_text(app: &App) -> String {
+        footer_lines(app, false)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     #[test]
     fn the_footer_explains_the_keys_of_the_focused_column() {
         let mut app = player_app();
         app.explorer_open = true;
-        let text = |app: &App| {
-            footer_lines(app, false)
-                .iter()
-                .map(line_text)
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        assert!(text(&app).contains("encolar"));
+        let local = footer_text(&app);
+        assert!(local.contains("espacio: encolar"), "{local}");
+        assert!(local.contains("Enter: reproducir"), "{local}");
+
         app.tree_focus = true;
-        let tree = text(&app);
-        assert!(tree.contains("←/→: plegar/desplegar"), "{tree}");
-        assert!(!tree.contains("encolar"), "{tree}");
+        let tree = footer_text(&app);
+        assert!(
+            tree.contains("Enter: plegar playlist / reproducir canción"),
+            "{tree}"
+        );
+        assert!(tree.contains("espacio: encolar"), "{tree}");
+
         app.tree_focus = false;
         app.queue_panel = true;
-        assert!(text(&app).contains("borrar"));
-        for line in footer_lines(&app, false) {
-            assert!(line.width() <= 78, "{}", line_text(&line));
+        let queue = footer_text(&app);
+        assert!(queue.contains("borrar"), "{queue}");
+        assert!(!queue.contains("espacio"), "{queue}");
+
+        for panel in [(false, false), (true, false), (false, true)] {
+            app.tree_focus = panel.0;
+            app.queue_panel = panel.1;
+            for line in footer_lines(&app, false) {
+                assert!(line.width() <= 78, "{}", line_text(&line));
+            }
         }
+    }
+
+    #[test]
+    fn no_footer_announces_player_controls_where_they_do_not_work() {
+        let mut app = player_app();
+        // Lista (con player y sin player) y todas las columnas.
+        for (mode, explorer) in [(Mode::Player, true), (Mode::Browser, false)] {
+            app.mode = mode;
+            app.explorer_open = explorer;
+            for panel in [(false, false), (true, false), (false, true)] {
+                app.tree_focus = panel.0;
+                app.queue_panel = panel.1;
+                let text = footer_text(&app);
+                for hint in ["pausa", "±5s", "n/p", "vel", "shuffle", "repeat"] {
+                    assert!(!text.contains(hint), "{mode:?} {panel:?} '{hint}':\n{text}");
+                }
+                assert!(text.contains("←/→: columna"), "{text}");
+            }
+        }
+        // La vista Reproductor sí los anuncia.
+        app.mode = Mode::Player;
+        app.explorer_open = false;
+        app.tree_focus = false;
+        let player = footer_text(&app);
+        for hint in ["pausa", "±5s", "pista", "shuffle", "repeat"] {
+            assert!(player.contains(hint), "'{hint}':\n{player}");
+        }
+    }
+
+    #[test]
+    fn the_focused_column_has_an_accent_border_and_the_others_a_dim_one() {
+        let Some(engine) = engine_or_skip() else {
+            return;
+        };
+        let mut app = player_app();
+        app.explorer_open = true;
+        let border_colors = |app: &App| {
+            let backend = ratatui::backend::TestBackend::new(120, 36);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal.draw(|frame| render(frame, app, &engine)).unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            // Esquina superior izquierda de cada columna (fila 1, bajo la
+            // línea de reproducción).
+            [0u16, 40, 80].map(|x| buffer[(x, 1)].fg)
+        };
+        let (accent, dim) = (theme().accent, theme().dim);
+        assert_eq!(border_colors(&app), [accent, dim, dim], "Locales");
+        app.tree_focus = true;
+        assert_eq!(border_colors(&app), [dim, accent, dim], "Playlists");
+        app.tree_focus = false;
+        app.queue_panel = true;
+        assert_eq!(border_colors(&app), [dim, dim, accent], "Cola");
     }
 
     #[test]

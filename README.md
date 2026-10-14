@@ -75,19 +75,23 @@ por primera vez y se ve así:
 ▸ Mix                          ?
 ```
 
-- **`▸` / `▾`**: playlist plegada / desplegada. `→` la despliega y `←` la pliega
-  (desde una canción, `←` vuelve a su playlist). Las canciones se piden a
-  Spotify **recién al desplegar** (una llamada por playlist abierta) y
-  quedan en memoria: plegar y volver a desplegar no vuelve a pedirlas.
+- **`▸` / `▾`**: playlist plegada / desplegada. `Enter` sobre una playlist la
+  despliega o la pliega. Las canciones se piden a Spotify **recién al
+  desplegar** (una llamada por playlist abierta) y quedan en memoria: plegar y
+  volver a desplegar no vuelve a pedirlas.
 - **`pub` / `priv` / `?`**: pública, privada, o `?` cuando Spotify no informa el
   campo. `colab` se suma si la playlist es colaborativa.
-- **`Enter`** sobre una playlist la reproduce (la primera suena y el resto entra
-  a la cola, como al pegar su URL); sobre una canción reproduce esa canción.
+- **`Enter`** sobre una canción la reproduce.
+- **`espacio`** sobre una playlist la **encola entera** al final de la cola (si
+  no suena nada, arranca con ella: la primera suena y el resto entra a la cola,
+  como al pegar su URL); sobre una canción, la encola. Encolar no despliega la
+  playlist y no corta lo que suena.
 - Se navega con las mismas teclas que las otras listas (`↑` `↓` `PgUp` `PgDn`
   `Inicio` `Fin`).
 - Los errores se ven en la misma columna: sin `client_id` (con cómo configurarlo),
   sin sesión (correr `mp3tui --spotify-login`) y límite de tasa de Spotify (429,
   con los segundos de espera). `Enter` reintenta.
+- `←` / `→` no pliegan nada: mueven el foco entre columnas (ver Vistas).
 
 Cada playlist o álbum de Spotify que ponés queda registrado (nombre, cantidad de
 canciones y las primeras) y con `h` abrís el historial para volver a ponerlo.
@@ -113,9 +117,18 @@ abrir un archivo o una URL arrancás en el reproductor y llegás con `v`) tiene
 - **Playlists** (centro): el árbol de playlists de Spotify.
 - **Cola** (derecha): la cola actual.
 - Arriba, una línea compacta con la canción que suena y su progreso.
-- `c` rota el foco entre las tres columnas (Locales → Playlists → Cola); el
-  pie de atajos cambia según la columna con foco. En terminales angostas
-  (menos de 66 columnas) se ve solo la columna con foco.
+- **`←` / `→`** mueven el foco entre las columnas (Locales ↔ Playlists ↔ Cola,
+  sin dar la vuelta); `c` las rota. `↑` `↓` `PgUp` `PgDn` `Inicio` `Fin` se
+  mueven dentro de la columna con foco. La columna enfocada se ve con el borde y
+  el título en el color de acento (las otras, apagadas). El pie de atajos
+  cambia según la columna con foco. En terminales angostas (menos de 66
+  columnas) se ve solo la columna con foco.
+- En la lista, **`espacio` es la acción de la fila**: encola la pista de
+  Locales, la playlist o canción del árbol; en la Cola no hace nada.
+- **Los controles del reproductor solo funcionan en la vista Reproductor**: con
+  la lista enfocada no hacen nada ni pausa, ni seek (`←` `→`), ni `n` / `p`, ni
+  velocidad, shuffle o repeat, ni la rueda del mouse para el volumen. Para usarlos,
+  `v`.
 - **`v`** alterna con la **vista Reproductor** a pantalla completa (info,
   volumen, progreso y visualizador); `v` (o `Tab`) vuelve a la lista. En la lista,
   `Esc` también vuelve al reproductor. Todas las
@@ -289,11 +302,12 @@ request — las contribuciones son bienvenidas.
 
 | Tecla | Acción |
 | --- | --- |
-| `espacio` | Reproducir / pausar |
-| `↑` / `↓` | Volumen |
-| `←` / `→` | Seek ±5 s |
-| `n` / `p` | Pista siguiente / anterior (con la Cola cargada, la recorre) |
-| `s` / `r` | Aleatorio / repetir |
+| `espacio` | **Vista Reproductor:** reproducir / pausar. **Lista:** encolar la fila (pista de Locales, playlist o canción del árbol) |
+| `↑` / `↓` | **Vista Reproductor:** volumen. **Lista:** mover dentro de la columna |
+| `←` / `→` | **Vista Reproductor:** seek ±5 s. **Lista:** mover el foco entre columnas |
+| `Enter` | **Lista:** reproducir la fila; sobre una playlist del árbol, plegar / desplegar |
+| `n` / `p` | **Solo vista Reproductor:** pista siguiente / anterior (con la Cola cargada, la recorre) |
+| `s` / `r` | **Solo vista Reproductor:** aleatorio / repetir |
 | `v` / `Tab` | Alternar la vista de lista (Locales │ Playlists │ Cola) y la vista Reproductor |
 | `b` | Buscar |
 | `u` | Buscar en Spotify, o pegar una URL / ruta local (una playlist se lista y encola el resto) |
@@ -301,7 +315,7 @@ request — las contribuciones son bienvenidas.
 | `c` | Rotar el foco entre Locales, Playlists y Cola |
 | `d` | Borrar el ítem seleccionado de la Cola |
 | `x` | Vaciar toda la Cola (lo que suena sigue sonando) |
-| `l` | Enfocar el árbol de playlists de Spotify (`→`/`←` despliegan/pliegan, `Enter` reproduce la playlist o la canción) |
+| `l` | Enfocar el árbol de playlists de Spotify (`Enter` pliega/despliega una playlist o reproduce una canción, `espacio` encola) |
 | `h` | Historial de playlists y álbumes de Spotify que pusiste (`Enter` la vuelve a reproducir y **reemplaza la cola**) |
 | `Ctrl+P` | Configuración (temas, bandas, modo) |
 | `Esc` `Esc` | Salir |

@@ -150,16 +150,15 @@ pub(super) fn handle_list_key(key: KeyEvent, app: &mut App, engine: &mut AudioEn
         }
     } else if config::pressed(&keys.clear_queue, code) {
         clear_queue(app);
+    // Gating del reproductor: con la lista enfocada ningún control de
+    // reproducción (pausa, seek, n/p, velocidad, shuffle, repeat) hace nada;
+    // viven solo en la vista Reproductor. Acá la tecla de pausa (espacio) es
+    // la acción de la fila: encolar la pista de Locales (el árbol y la Cola
+    // resuelven la suya).
     } else if config::pressed(&keys.play_pause, code) {
-        toggle_play(app, engine);
-    } else if config::pressed(&keys.next_track, code) {
-        play_step(app, engine, 1);
-    } else if config::pressed(&keys.prev_track, code) {
-        play_step(app, engine, -1);
-    } else if config::pressed(&keys.shuffle, code) {
-        toggle_shuffle(app);
-    } else if config::pressed(&keys.repeat, code) {
-        app.repeat = app.repeat.cycle();
+        if !app.queue_panel && !app.tree_focus {
+            enqueue_selected(app);
+        }
     } else if config::pressed(&keys.open_url, code) {
         open_url_prompt(app);
     } else if config::pressed(&keys.search, code) {
@@ -182,14 +181,11 @@ pub(super) fn handle_list_key(key: KeyEvent, app: &mut App, engine: &mut AudioEn
         } else {
             app.selected = move_selection(app.selected, 1, view_len);
         }
+    // ←/→ mueven el foco entre las columnas (Locales ↔ Playlists ↔ Cola).
     } else if config::pressed(&keys.seek_back, code) {
-        seek_by(app, engine, -1);
+        move_panel_focus(app, -1);
     } else if config::pressed(&keys.seek_fwd, code) {
-        seek_by(app, engine, 1);
-    } else if config::pressed(&keys.speed_down, code) {
-        step_speed(app, engine, -1.0);
-    } else if config::pressed(&keys.speed_up, code) {
-        step_speed(app, engine, 1.0);
+        move_panel_focus(app, 1);
     } else if config::pressed(&keys.page_up, code) {
         if app.queue_panel {
             app.queue_selected = move_selection(app.queue_selected, -PAGE_STEP, queue_len);
@@ -555,6 +551,36 @@ pub(super) fn toggle_explorer(app: &mut App) {
         // Al cerrar la vista de lista el foco vuelve a los archivos locales.
         app.queue_panel = false;
         app.tree_focus = false;
+    }
+}
+
+/// Mueve el foco una columna a la izquierda (`-1`) o a la derecha (`1`) sin
+/// dar la vuelta: Locales ↔ Playlists ↔ Cola. Al entrar al árbol por primera
+/// vez pide las playlists.
+pub(super) fn move_panel_focus(app: &mut App, delta: isize) {
+    move_panel_focus_with(app, delta, spawn_load_playlists);
+}
+
+pub(super) fn move_panel_focus_with(
+    app: &mut App,
+    delta: isize,
+    spawn_playlists: impl FnOnce(u64, TreeSender),
+) {
+    let current = match focused_panel(app) {
+        ListPanel::Local => 0,
+        ListPanel::Playlists => 1,
+        ListPanel::Queue => 2,
+    };
+    match (current + delta).clamp(0, 2) {
+        0 => {
+            app.tree_focus = false;
+            app.queue_panel = false;
+        }
+        1 => focus_playlist_tree_with(app, spawn_playlists),
+        _ => {
+            app.tree_focus = false;
+            app.queue_panel = true;
+        }
     }
 }
 

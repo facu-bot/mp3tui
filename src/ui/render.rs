@@ -697,7 +697,7 @@ fn render_player(frame: &mut Frame<'_>, app: &App, engine: &AudioEngine) {
 /// columnas y el pie de atajos.
 fn render_list_view(frame: &mut Frame<'_>, app: &App, engine: &AudioEngine) {
     let (now_area, columns_area, footer_area) = list_areas(frame.area());
-    app.hit.borrow_mut().player = Some(now_area);
+    // Sin zona de reproductor: la rueda no cambia el volumen desde la lista.
     let width = usize::from(now_area.width);
     frame.render_widget(
         Paragraph::new(now_playing_line(
@@ -2704,8 +2704,10 @@ pub(super) fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
         let keys = &config::config().keys;
         // Una sola fila: las teclas de Spotify y vaciar cola van antes que el
         // resto (que ya está en el pie completo).
+        // En la lista, la tecla de pausa es la acción de la fila (encolar).
+        let space_action = if is_list_view(app) { "encolar" } else { "pausa" };
         return vec![Line::from(format!(
-            " {}: Spotify   {}: playlists   {}: vaciar   {}: pausa   {}×2: salir",
+            " {}: Spotify   {}: playlists   {}: vaciar   {}: {space_action}   {}×2: salir",
             key_labels(&keys.spotify_search),
             key_labels(&keys.spotify_library),
             key_labels(&keys.clear_queue),
@@ -2716,64 +2718,7 @@ pub(super) fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
 
     let keys = &config::config().keys;
     match app.mode {
-        // Vista de lista: 4 líneas — navegación, acciones de la columna con
-        // foco, reproducción y las teclas de Spotify. `v` vuelve al reproductor
-        // (donde ↑/↓ son volumen). La búsqueda (`u`) se anuncia en el borde.
-        Mode::Player if app.explorer_open => {
-            let column_hint = match focused_panel(app) {
-                ListPanel::Playlists => format!(
-                    " {}/{}: plegar/desplegar   {}: pausa   {}: foco   {}×2: salir",
-                    key_labels(&keys.seek_back),
-                    key_labels(&keys.seek_fwd),
-                    key_labels(&keys.play_pause),
-                    key_labels(&keys.queue_panel),
-                    key_labels(&keys.quit),
-                ),
-                ListPanel::Queue => format!(
-                    " {}: pausa   {}/{}: ±5s   {}: borrar   {}: vaciar   {}: foco   {}×2: salir",
-                    key_labels(&keys.play_pause),
-                    key_labels(&keys.seek_back),
-                    key_labels(&keys.seek_fwd),
-                    key_labels(&keys.queue_delete),
-                    key_labels(&keys.clear_queue),
-                    key_labels(&keys.queue_panel),
-                    key_labels(&keys.quit),
-                ),
-                ListPanel::Local => format!(
-                    " {}: pausa   {}/{}: ±5s   {}: encolar   {}: foco   {}: vaciar   {}×2: salir",
-                    key_labels(&keys.play_pause),
-                    key_labels(&keys.seek_back),
-                    key_labels(&keys.seek_fwd),
-                    key_labels(&keys.enqueue),
-                    key_labels(&keys.queue_panel),
-                    key_labels(&keys.clear_queue),
-                    key_labels(&keys.quit),
-                ),
-            };
-            vec![
-                Line::from(format!(
-                    " {}/{}: mover   {}: reproducir   Ctrl+{}: config   {}/{}: cerrar",
-                    key_labels(&keys.move_up),
-                    key_labels(&keys.move_down),
-                    key_labels(&keys.select),
-                    settings_key_display(),
-                    key_labels(&keys.back),
-                    key_labels(&keys.explorer),
-                )),
-                Line::from(column_hint),
-                Line::from(format!(
-                    " {}/{}: pista siguiente/anterior   {}: reproductor (volumen {}/{})   {}/{}: vel",
-                    key_labels(&keys.next_track),
-                    key_labels(&keys.prev_track),
-                    key_labels(&keys.player_view),
-                    key_labels(&keys.volume_up),
-                    key_labels(&keys.volume_down),
-                    key_labels(&keys.speed_down),
-                    key_labels(&keys.speed_up),
-                )),
-                spotify_keys_line(keys, false),
-            ]
-        }
+        Mode::Player if app.explorer_open => list_footer(app, keys),
         // `Tab: biblio` vuelve; `b` sube a la línea 1 como
         // navegación y `↑/↓: vol` abrevia: es la única forma de que los 12
         // atajos entren en 2×78. Orden: navegación → reproducción → modos →
@@ -2804,41 +2749,77 @@ pub(super) fn footer_lines(app: &App, compact: bool) -> Vec<Line<'static>> {
             )),
             spotify_keys_line(keys, true),
         ],
-        // `sig/ant` expandido (`b` baja a la línea 2 para que entre);
-        // `Inicio/Fin` se documenta y sale el `Esc: volver` inexacto (sin
-        // player Esc arma la salida: lo cubre `Esc×2: salir`).
-        Mode::Browser => vec![
-            Line::from(format!(
-                " {}/{} {}/{}: mover   {}: reproducir   {}/{}: pista siguiente/anterior",
-                key_labels(&keys.move_up),
-                key_labels(&keys.move_down),
-                key_labels(&keys.page_up),
-                key_labels(&keys.page_down),
-                key_labels(&keys.select),
-                key_labels(&keys.next_track),
-                key_labels(&keys.prev_track),
-            )),
-            Line::from(format!(
-                " {}: pausa   {}/{}: ±5s   {}/{}: vel   {}: shuffle   {}: repeat   {}: buscar",
-                key_labels(&keys.play_pause),
-                key_labels(&keys.seek_back),
-                key_labels(&keys.seek_fwd),
-                key_labels(&keys.speed_down),
-                key_labels(&keys.speed_up),
-                key_labels(&keys.shuffle),
-                key_labels(&keys.repeat),
-                key_labels(&keys.search),
-            )),
-            Line::from(format!(
-                " {}/{}: primera/última   Ctrl+{}: config   {}×2: salir",
-                key_labels(&keys.home),
-                key_labels(&keys.end),
-                settings_key_display(),
-                key_labels(&keys.quit),
-            )),
-            spotify_keys_line(keys, true),
-        ],
+        Mode::Browser => list_footer(app, keys),
     }
+}
+
+/// ¿Se ve la vista de lista (las tres columnas)? Es la pantalla del
+/// explorador sin player y, con player, la que abre `v` / Tab.
+pub(super) fn is_list_view(app: &App) -> bool {
+    app.mode == Mode::Browser || app.explorer_open
+}
+
+/// Pie de la vista de lista, 4 líneas: navegación, acciones de la columna con
+/// foco, vista/config y las teclas de Spotify. Solo anuncia teclas que
+/// funcionan acá: los controles del reproductor (pausa, ±5s, pista, velocidad)
+/// viven en la vista Reproductor y no se mencionan. Sin player (`Browser`) no
+/// hay vista Reproductor a la que volver.
+fn list_footer(app: &App, keys: &config::Keys) -> Vec<Line<'static>> {
+    let has_player_view = app.mode == Mode::Player;
+    let first = if has_player_view {
+        format!(
+            " {}/{}: mover   {}/{}: columna   Ctrl+{}: config   {}/{}/{}: reproductor",
+            key_labels(&keys.move_up),
+            key_labels(&keys.move_down),
+            key_labels(&keys.seek_back),
+            key_labels(&keys.seek_fwd),
+            settings_key_display(),
+            key_labels(&keys.back),
+            key_labels(&keys.explorer),
+            key_labels(&keys.player_view),
+        )
+    } else {
+        format!(
+            " {}/{} {}/{}: mover   {}/{}: columna   {}/{}: primera/última",
+            key_labels(&keys.move_up),
+            key_labels(&keys.move_down),
+            key_labels(&keys.page_up),
+            key_labels(&keys.page_down),
+            key_labels(&keys.seek_back),
+            key_labels(&keys.seek_fwd),
+            key_labels(&keys.home),
+            key_labels(&keys.end),
+        )
+    };
+    let column = match focused_panel(app) {
+        ListPanel::Local => format!(
+            " {}: reproducir   {}: encolar   {}: buscar",
+            key_labels(&keys.select),
+            key_labels(&keys.play_pause),
+            key_labels(&keys.search),
+        ),
+        ListPanel::Playlists => format!(
+            " {}: plegar playlist / reproducir canción   {}: encolar",
+            key_labels(&keys.select),
+            key_labels(&keys.play_pause),
+        ),
+        ListPanel::Queue => format!(
+            " {}: reproducir   {}: borrar",
+            key_labels(&keys.select),
+            key_labels(&keys.queue_delete),
+        ),
+    };
+    let mut third = format!(" {}: rotar foco", key_labels(&keys.queue_panel));
+    if !has_player_view {
+        third.push_str(&format!("   Ctrl+{}: config", settings_key_display()));
+    }
+    third.push_str(&format!("   {}×2: salir", key_labels(&keys.quit)));
+    vec![
+        Line::from(first),
+        Line::from(column),
+        Line::from(third),
+        spotify_keys_line(keys, true),
+    ]
 }
 
 /// Línea del pie con las teclas de Spotify y de la cola: buscador (también

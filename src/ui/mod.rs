@@ -2452,13 +2452,9 @@ mod tests {
         // la salida, cubierto por `Esc×2: salir`).
         for hint in [
             "PgUp/PgDn: mover",
+            "←/→: columna",
             "Enter: reproducir",
-            "n/p: pista siguiente/anterior",
-            "espacio: pausa",
-            "←/→: ±5s",
-            "[/]: vel",
-            "s: shuffle",
-            "r: repeat",
+            "espacio: encolar",
             "b: buscar",
             "Inicio/Fin: primera/última",
             "Ctrl+P: config",
@@ -2467,6 +2463,13 @@ mod tests {
             assert!(
                 browser.contains(hint),
                 "footer del explorador falta '{hint}': {browser}"
+            );
+        }
+        // Gating: la lista no anuncia controles que ahí no funcionan.
+        for hint in ["pausa", "±5s", "n/p", "vel", "shuffle", "repeat"] {
+            assert!(
+                !browser.contains(hint),
+                "el explorador anuncia '{hint}' que no funciona: {browser}"
             );
         }
         for hint in ["u: Spotify", "l: playlists", "h: historial", "x: vaciar cola"] {
@@ -2481,7 +2484,8 @@ mod tests {
             "sin `Esc: volver` inexacto: {browser}"
         );
 
-        // Panel lateral abierto: lista + playback + aviso de volumen.
+        // Vista de lista con player: navegación, columna con foco y la vuelta
+        // al reproductor; sin controles de reproducción (gating).
         app.mode = Mode::Player;
         app.explorer_open = true;
         let panel: String = footer_lines(&app, false)
@@ -2491,19 +2495,20 @@ mod tests {
             .join("\n");
         for hint in [
             "↑/↓: mover",
+            "←/→: columna",
             "Enter: reproducir",
-            "Esc/Tab: cerrar",
-            "espacio: pausa",
-            "←/→: ±5s",
-            "[/]: vel",
-            "n/p: pista siguiente/anterior",
+            "espacio: encolar",
+            "Esc/Tab/v: reproductor",
+            "Ctrl+P: config",
             "Esc×2: salir",
-            "v: reproductor (volumen ↑/↓)",
         ] {
             assert!(
                 panel.contains(hint),
                 "footer del panel falta '{hint}': {panel}"
             );
+        }
+        for hint in ["pausa", "±5s", "n/p", "vel"] {
+            assert!(!panel.contains(hint), "anuncia '{hint}' sin funcionar: {panel}");
         }
         assert_eq!(
             footer_lines(&app, false).len(),
@@ -2579,14 +2584,18 @@ mod tests {
 
     #[test]
     fn compact_footer_keeps_the_spotify_and_queue_keys_within_78_columns() {
-        let app = test_app();
-        let lines = footer_lines(&app, true);
-        assert_eq!(lines.len(), 1);
-        let text = line_text(&lines[0]);
-        for hint in ["u: Spotify", "l: playlists", "x: vaciar", "espacio: pausa", "Esc×2: salir"] {
-            assert!(text.contains(hint), "falta '{hint}': {text}");
+        // Lista (la pantalla del explorador sin player): espacio encola.
+        let mut app = test_app();
+        for (list_view, action) in [(true, "espacio: encolar"), (false, "espacio: pausa")] {
+            app.mode = if list_view { Mode::Browser } else { Mode::Player };
+            let lines = footer_lines(&app, true);
+            assert_eq!(lines.len(), 1);
+            let text = line_text(&lines[0]);
+            for hint in ["u: Spotify", "l: playlists", "x: vaciar", action, "Esc×2: salir"] {
+                assert!(text.contains(hint), "falta '{hint}': {text}");
+            }
+            assert!(line_width(&lines[0]) <= 78, "{text}");
         }
-        assert!(line_width(&lines[0]) <= 78, "{text}");
     }
 
     #[test]
@@ -6895,12 +6904,10 @@ mod tests {
     }
 
     /// DIAGNÓSTICO TEMPORAL: dump del frame con el panel abierto, meta + cola
-    /// Regresión del reporte del usuario: con el panel lateral abierto (lista
-    /// Biblioteca), `n`/`N` saltan a la siguiente pista y `p` a la anterior,
-    /// igual que sin panel (los atajos de reproducción quedan activos sobre la
-    /// lista).
+    /// Gating del reproductor (S12.5): con la lista enfocada `n`/`p` NO cambian
+    /// de pista; la misma tecla sí funciona en la vista Reproductor.
     #[test]
-    fn list_mode_step_keys_change_tracks_with_the_panel_open() {
+    fn list_view_ignores_the_step_keys_but_the_player_view_honors_them() {
         let Some(mut engine) = engine_or_skip() else {
             return;
         };
@@ -6912,36 +6919,25 @@ mod tests {
         play_selected(&mut app, &mut engine);
         assert_eq!(app.current_path.as_ref(), Some(&t1));
 
-        handle_list_key(theme_menu_key(KeyCode::Char('n')), &mut app, &mut engine);
+        for code in ['n', 'N', 'p'] {
+            handle_list_key(theme_menu_key(KeyCode::Char(code)), &mut app, &mut engine);
+            assert_eq!(app.current_path.as_ref(), Some(&t1), "{code} en la lista");
+        }
+
+        app.explorer_open = false;
+        handle_player_key(theme_menu_key(KeyCode::Char('n')), &mut app, &mut engine);
         assert_eq!(
             app.current_path.as_ref(),
             Some(&t2),
-            "n cambia a la siguiente con el panel abierto"
-        );
-
-        // Mayúsculas valen igual (el matcher ignora mayúsculas); con repeat
-        // Off en la última pista n no envuelve.
-        handle_list_key(theme_menu_key(KeyCode::Char('N')), &mut app, &mut engine);
-        assert_eq!(
-            app.current_path.as_ref(),
-            Some(&t2),
-            "N no envuelve con repeat Off en la última"
-        );
-
-        handle_list_key(theme_menu_key(KeyCode::Char('p')), &mut app, &mut engine);
-        assert_eq!(
-            app.current_path.as_ref(),
-            Some(&t1),
-            "p retrocede con el panel abierto"
+            "n sí cambia de pista en la vista Reproductor"
         );
 
         let _ = std::fs::remove_file(&t2);
     }
 
-    /// Con la solapa Cola abierta, `n` avanza la cola (el cursor) desde donde
-    /// está parado, igual que sin panel.
+    /// Con el foco en la Cola, `n` tampoco avanza el cursor de la cola.
     #[test]
-    fn queue_panel_step_key_advances_the_queue_cursor() {
+    fn queue_column_ignores_the_step_key() {
         let Some(mut engine) = engine_or_skip() else {
             return;
         };
@@ -6950,20 +6946,109 @@ mod tests {
         app.has_player = true;
         app.explorer_open = true;
         app.queue_panel = true;
-        app.current_path = Some(t1);
+        app.current_path = Some(t1.clone());
         app.queue
             .push(QueueItem::Local(track_with_path(t2.clone(), "encolada")));
 
         handle_list_key(theme_menu_key(KeyCode::Char('n')), &mut app, &mut engine);
 
-        assert_eq!(
-            app.current_path.as_ref(),
-            Some(&t2),
-            "n avanza al ítem encolado con la solapa Cola abierta"
-        );
-        assert_eq!(app.queue_cursor, Some(0), "el cursor avanza");
+        assert_eq!(app.current_path.as_ref(), Some(&t1));
+        assert_eq!(app.queue_cursor, None, "el cursor no se mueve");
 
         let _ = std::fs::remove_file(&t2);
+    }
+
+    /// Ningún otro control del reproductor funciona con la lista enfocada:
+    /// shuffle, repeat, velocidad, pausa y seek; en la vista Reproductor,
+    /// shuffle y repeat sí.
+    #[test]
+    fn list_view_ignores_every_player_control() {
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
+        let mut app = library_with_three();
+        app.mode = Mode::Player;
+        app.has_player = true;
+        app.explorer_open = true;
+        app.playlist_tree.load = TreeLoad::Ready;
+        let speed = engine.speed();
+        for focus in [ListPanel::Local, ListPanel::Playlists, ListPanel::Queue] {
+            app.tree_focus = focus == ListPanel::Playlists;
+            app.queue_panel = focus == ListPanel::Queue;
+            for code in ['s', 'r', ']', '[', ' '] {
+                handle_list_key(theme_menu_key(KeyCode::Char(code)), &mut app, &mut engine);
+            }
+            assert!(!app.shuffle, "{focus:?}: shuffle");
+            assert_eq!(app.repeat, RepeatMode::Off, "{focus:?}: repeat");
+            assert_eq!(engine.speed(), speed, "{focus:?}: velocidad");
+            assert!(!engine.is_playing() && !engine.is_paused(), "{focus:?}: pausa");
+        }
+
+        app.explorer_open = false;
+        app.tree_focus = false;
+        app.queue_panel = false;
+        handle_player_key(theme_menu_key(KeyCode::Char('s')), &mut app, &mut engine);
+        handle_player_key(theme_menu_key(KeyCode::Char('r')), &mut app, &mut engine);
+        assert!(app.shuffle, "shuffle sí funciona en la vista Reproductor");
+        assert_ne!(app.repeat, RepeatMode::Off, "repeat también");
+    }
+
+    /// ←/→ mueven el foco entre columnas sin dar la vuelta; ↑/↓ siguen
+    /// moviendo dentro de la columna enfocada.
+    #[test]
+    fn left_and_right_move_the_focus_between_columns_and_up_down_stay_inside() {
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
+        let mut app = library_with_three();
+        app.mode = Mode::Player;
+        app.has_player = true;
+        app.explorer_open = true;
+        // Árbol ya cargado: mover el foco no lanza ningún pedido de red.
+        app.playlist_tree.load = TreeLoad::Ready;
+        let press = |app: &mut App, engine: &mut AudioEngine, code| {
+            handle_list_key(theme_menu_key(code), app, engine)
+        };
+
+        assert_eq!(focused_panel(&app), ListPanel::Local);
+        press(&mut app, &mut engine, KeyCode::Left);
+        assert_eq!(focused_panel(&app), ListPanel::Local, "tope izquierdo");
+        press(&mut app, &mut engine, KeyCode::Right);
+        assert_eq!(focused_panel(&app), ListPanel::Playlists);
+        press(&mut app, &mut engine, KeyCode::Right);
+        assert_eq!(focused_panel(&app), ListPanel::Queue);
+        press(&mut app, &mut engine, KeyCode::Right);
+        assert_eq!(focused_panel(&app), ListPanel::Queue, "tope derecho");
+        press(&mut app, &mut engine, KeyCode::Left);
+        press(&mut app, &mut engine, KeyCode::Left);
+        assert_eq!(focused_panel(&app), ListPanel::Local);
+
+        // ↓ mueve la selección de la columna enfocada y no cambia el foco.
+        app.selected = 0;
+        press(&mut app, &mut engine, KeyCode::Down);
+        assert_eq!(app.selected, 1);
+        assert_eq!(focused_panel(&app), ListPanel::Local);
+    }
+
+    /// En Locales, espacio es la acción de la fila: encola la pista (no pausa).
+    #[test]
+    fn space_in_the_local_column_enqueues_the_selected_track() {
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
+        let mut app = library_with_three();
+        app.mode = Mode::Player;
+        app.has_player = true;
+        app.explorer_open = true;
+        app.selected = 1;
+        handle_list_key(theme_menu_key(KeyCode::Char(' ')), &mut app, &mut engine);
+        assert_eq!(app.queue.first().map(QueueItem::label), Some("beta"));
+        assert!(!engine.is_playing() && !engine.is_paused());
+
+        // En la Cola, espacio no hace nada.
+        app.queue_panel = true;
+        handle_list_key(theme_menu_key(KeyCode::Char(' ')), &mut app, &mut engine);
+        assert_eq!(app.queue.len(), 1);
     }
 
     /// La fila de controles ajusta sus chips al ancho disponible: un chip que
