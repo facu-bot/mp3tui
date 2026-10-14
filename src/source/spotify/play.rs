@@ -19,6 +19,7 @@ use ytdlp::{CommandRunner, PlaylistEntry, Resolved, ResolveCache, YtDlpError};
 pub trait TrackSource {
     fn track(&self, id: &str) -> Result<SpotifyTrack, SpotifyError>;
     fn playlist_tracks(&self, id: &str) -> Result<Vec<SpotifyTrack>, SpotifyError>;
+    fn album_tracks(&self, id: &str) -> Result<Vec<SpotifyTrack>, SpotifyError>;
 }
 
 impl TrackSource for SpotifyClient {
@@ -28,6 +29,10 @@ impl TrackSource for SpotifyClient {
 
     fn playlist_tracks(&self, id: &str) -> Result<Vec<SpotifyTrack>, SpotifyError> {
         SpotifyClient::playlist_tracks(self, id)
+    }
+
+    fn album_tracks(&self, id: &str) -> Result<Vec<SpotifyTrack>, SpotifyError> {
+        SpotifyClient::album_tracks(self, id)
     }
 }
 
@@ -101,11 +106,24 @@ pub fn track_id(page: &str) -> Option<String> {
         .map(|r| r.id)
 }
 
-/// Id de la playlist o álbum si `url` lo es.
+/// Id de la playlist si `url` lo es.
 pub fn playlist_id(url: &str) -> Option<String> {
     source::spotify_ref(url)
         .filter(|r| r.kind == UrlKind::SpotifyPlaylist)
         .map(|r| r.id)
+}
+
+/// Id del álbum si `url` lo es.
+pub fn album_id(url: &str) -> Option<String> {
+    source::spotify_ref(url)
+        .filter(|r| r.kind == UrlKind::SpotifyAlbum)
+        .map(|r| r.id)
+}
+
+/// `true` si `url` es una playlist o un álbum de Spotify (se lista, no se
+/// resuelve como una sola canción).
+pub fn is_collection(url: &str) -> bool {
+    playlist_id(url).is_some() || album_id(url).is_some()
 }
 
 fn failure(err: SpotifyError) -> YtDlpError {
@@ -149,10 +167,23 @@ pub fn list_playlist(
     url: &str,
     connect: &dyn Fn() -> Result<Box<dyn TrackSource>, ConnectError>,
 ) -> Result<Vec<PlaylistEntry>, YtDlpError> {
-    let id = playlist_id(url)
-        .ok_or_else(|| YtDlpError::InvalidUrl("no es una playlist de Spotify".to_string()))?;
+    let target = match (playlist_id(url), album_id(url)) {
+        (Some(id), _) => (id, false),
+        (None, Some(id)) => (id, true),
+        (None, None) => {
+            return Err(YtDlpError::InvalidUrl(
+                "no es una playlist ni un álbum de Spotify".to_string(),
+            ));
+        }
+    };
     let client = connect().map_err(|e| YtDlpError::Failed(e.to_string()))?;
-    let tracks = client.playlist_tracks(&id).map_err(failure)?;
+    let (id, is_album) = target;
+    let tracks = if is_album {
+        client.album_tracks(&id)
+    } else {
+        client.playlist_tracks(&id)
+    }
+    .map_err(failure)?;
     Ok(tracks
         .iter()
         .filter(|track| !track.id.is_empty())
@@ -212,6 +243,11 @@ mod tests {
 
         fn playlist_tracks(&self, id: &str) -> Result<Vec<SpotifyTrack>, SpotifyError> {
             self.seen.lock().unwrap().push(format!("playlist:{id}"));
+            Ok(self.tracks.clone())
+        }
+
+        fn album_tracks(&self, id: &str) -> Result<Vec<SpotifyTrack>, SpotifyError> {
+            self.seen.lock().unwrap().push(format!("album:{id}"));
             Ok(self.tracks.clone())
         }
     }
@@ -296,8 +332,15 @@ mod tests {
         );
         assert_eq!(track_id("spotify:playlist:abc"), None);
         assert_eq!(track_id("https://www.youtube.com/watch?v=abc"), None);
-        assert_eq!(playlist_id("spotify:album:zz"), Some("zz".to_string()));
+        assert_eq!(playlist_id("spotify:playlist:zz"), Some("zz".to_string()));
+        assert_eq!(playlist_id("spotify:album:zz"), None);
         assert_eq!(playlist_id("spotify:track:zz"), None);
+        assert_eq!(album_id("spotify:album:zz"), Some("zz".to_string()));
+        assert_eq!(
+            album_id("https://open.spotify.com/intl-es/album/zz?si=1"),
+            Some("zz".to_string())
+        );
+        assert_eq!(album_id("spotify:playlist:zz"), None);
     }
 
     #[test]
@@ -362,6 +405,9 @@ mod tests {
             fn playlist_tracks(&self, _: &str) -> Result<Vec<SpotifyTrack>, SpotifyError> {
                 Err(SpotifyError::Auth(AuthError::NotAuthorized))
             }
+            fn album_tracks(&self, _: &str) -> Result<Vec<SpotifyTrack>, SpotifyError> {
+                Err(SpotifyError::Auth(AuthError::NotAuthorized))
+            }
         }
         let connect = || Ok(Box::new(Expired) as Box<dyn TrackSource>);
         let err = resolve_page("spotify:track:t1", &FakeRunner::new(), &mut cache("exp"), &connect)
@@ -369,6 +415,37 @@ mod tests {
         assert!(err.to_string().contains("--spotify-login"), "{err}");
         let err = list_playlist("spotify:playlist:p1", &connect).unwrap_err();
         assert!(err.to_string().contains("--spotify-login"), "{err}");
+        let err = list_playlist("spotify:album:a1", &connect).unwrap_err();
+        assert!(err.to_string().contains("--spotify-login"), "{err}");
+    }
+
+    /// Álbum y playlist usan endpoints distintos: cada URL llega al suyo.
+    #[test]
+    fn test_list_playlist_dispatches_albums_and_playlists_to_their_own_endpoint() {
+        let seen = std::sync::Arc::new(Mutex::new(Vec::<String>::new()));
+        struct Recording(std::sync::Arc<Mutex<Vec<String>>>);
+        impl TrackSource for Recording {
+            fn track(&self, _: &str) -> Result<SpotifyTrack, SpotifyError> {
+                unreachable!()
+            }
+            fn playlist_tracks(&self, id: &str) -> Result<Vec<SpotifyTrack>, SpotifyError> {
+                self.0.lock().unwrap().push(format!("playlist:{id}"));
+                Ok(vec![track("t1", "One", &["A"])])
+            }
+            fn album_tracks(&self, id: &str) -> Result<Vec<SpotifyTrack>, SpotifyError> {
+                self.0.lock().unwrap().push(format!("album:{id}"));
+                Ok(vec![track("t2", "Two", &["B"])])
+            }
+        }
+        let shared = std::sync::Arc::clone(&seen);
+        let connect = move || Ok(Box::new(Recording(std::sync::Arc::clone(&shared))) as Box<dyn TrackSource>);
+
+        let album = list_playlist("https://open.spotify.com/album/alb1", &connect).unwrap();
+        let playlist = list_playlist("spotify:playlist:pl1", &connect).unwrap();
+
+        assert_eq!(*seen.lock().unwrap(), vec!["album:alb1", "playlist:pl1"]);
+        assert_eq!(album[0].page_url, "spotify:track:t2");
+        assert_eq!(playlist[0].page_url, "spotify:track:t1");
     }
 
     #[test]

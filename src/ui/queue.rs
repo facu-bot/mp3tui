@@ -180,7 +180,7 @@ fn spawn_ytdlp_listing(url: String, req_id: u64) -> Receiver<YtDlpListMessage> {
     let (tx, rx) = mpsc::channel();
     let url_clone = url.clone();
     thread::spawn(move || {
-        let result = if crate::source::spotify::play::playlist_id(&url).is_some() {
+        let result = if crate::source::spotify::play::is_collection(&url) {
             crate::source::spotify::play::list_playlist(&url, &connect_spotify)
         } else {
             crate::source::ytdlp::list_flat(&url, &crate::source::ytdlp::ProcessCommandRunner)
@@ -241,7 +241,8 @@ pub(super) fn submit_url_prompt_with_seams(
         SubmitAction::Page(url)
         | SubmitAction::Playlist(url)
         | SubmitAction::SpotifyTrack(url)
-        | SubmitAction::SpotifyPlaylist(url) => {
+        | SubmitAction::SpotifyPlaylist(url)
+        | SubmitAction::SpotifyAlbum(url) => {
             begin_url_flow(app, url, resolve_page, list_playlist);
         }
     }
@@ -261,7 +262,9 @@ fn begin_url_flow(
     let is_playlist = matches!(
         crate::source::classify(&url),
         crate::source::Input::Url {
-            kind: crate::source::UrlKind::Playlist | crate::source::UrlKind::SpotifyPlaylist,
+            kind: crate::source::UrlKind::Playlist
+                | crate::source::UrlKind::SpotifyPlaylist
+                | crate::source::UrlKind::SpotifyAlbum,
             ..
         }
     );
@@ -324,7 +327,8 @@ pub(super) fn start_boot_url_with(
         crate::source::UrlKind::Page
         | crate::source::UrlKind::Playlist
         | crate::source::UrlKind::SpotifyTrack
-        | crate::source::UrlKind::SpotifyPlaylist => {
+        | crate::source::UrlKind::SpotifyPlaylist
+        | crate::source::UrlKind::SpotifyAlbum => {
             begin_url_flow(app, url, resolve_page, list_playlist);
         }
     }

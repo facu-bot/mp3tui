@@ -107,8 +107,10 @@ pub enum SubmitAction {
     Playlist(String),
     /// Canción de Spotify (URL web o URI): se resuelve a YouTube por búsqueda.
     SpotifyTrack(String),
-    /// Playlist o álbum de Spotify: se lista con la Web API y se encola.
+    /// Playlist de Spotify: se lista con la Web API y se encola.
     SpotifyPlaylist(String),
+    /// Álbum de Spotify: igual que la playlist, con otro endpoint de listado.
+    SpotifyAlbum(String),
     Unknown(String),
     Empty,
 }
@@ -126,6 +128,7 @@ pub fn classify_submit_input(input: &str) -> SubmitAction {
             crate::source::UrlKind::Playlist => SubmitAction::Playlist(url),
             crate::source::UrlKind::SpotifyTrack => SubmitAction::SpotifyTrack(url),
             crate::source::UrlKind::SpotifyPlaylist => SubmitAction::SpotifyPlaylist(url),
+            crate::source::UrlKind::SpotifyAlbum => SubmitAction::SpotifyAlbum(url),
             crate::source::UrlKind::Unknown => SubmitAction::Unknown(url),
         },
     }
@@ -2739,13 +2742,21 @@ mod tests {
         );
         for url in [
             "https://open.spotify.com/playlist/abc123",
-            "https://open.spotify.com/intl-es/album/abc123",
             "spotify:playlist:abc123",
-            "spotify:album:abc123",
         ] {
             assert_eq!(
                 classify_submit_input(url),
                 SubmitAction::SpotifyPlaylist(url.to_string()),
+                "{url}"
+            );
+        }
+        for url in [
+            "https://open.spotify.com/intl-es/album/abc123",
+            "spotify:album:abc123",
+        ] {
+            assert_eq!(
+                classify_submit_input(url),
+                SubmitAction::SpotifyAlbum(url.to_string()),
                 "{url}"
             );
         }
@@ -2828,6 +2839,43 @@ mod tests {
     }
 
     #[test]
+    fn spotify_album_submit_lists_then_queues_markers_like_a_playlist() {
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
+        let mut app = test_app();
+        let resolve_calls = std::cell::RefCell::new(Vec::<String>::new());
+        let list_calls = std::cell::RefCell::new(Vec::<String>::new());
+        let url = "https://open.spotify.com/album/alb1".to_string();
+        submit_url_prompt_with_seams(
+            url.clone(),
+            &mut app,
+            &mut engine,
+            empty_resolve_rx(&resolve_calls),
+            empty_list_rx(&list_calls),
+        );
+        assert!(app.playlist_rx.is_some());
+        assert!(app.ytdlp_rx.is_none());
+        assert_eq!(list_calls.borrow().as_slice(), &[url.as_str()]);
+
+        let entry = |title: &str, id: &str| crate::source::ytdlp::PlaylistEntry {
+            title: title.to_string(),
+            page_url: format!("spotify:track:{id}"),
+        };
+        let mut resolve_seam = empty_resolve_rx(&resolve_calls);
+        let req_id = app.ytdlp_request_id;
+        handle_playlist_result(
+            &mut app,
+            req_id,
+            Ok(vec![entry("A - Uno", "t1"), entry("A - Dos", "t2")]),
+            &mut resolve_seam,
+        );
+        let labels: Vec<&str> = app.queue.iter().map(QueueItem::label).collect();
+        assert_eq!(labels, vec!["A - Dos"]);
+        assert_eq!(resolve_calls.borrow().as_slice(), &["spotify:track:t1"]);
+    }
+
+    #[test]
     fn spotify_boot_urls_use_the_same_flow() {
         let Some(mut engine) = engine_or_skip() else {
             return;
@@ -2839,7 +2887,7 @@ mod tests {
             &mut app,
             &mut engine,
             "spotify:album:alb1".to_string(),
-            crate::source::UrlKind::SpotifyPlaylist,
+            crate::source::UrlKind::SpotifyAlbum,
             empty_resolve_rx(&resolve_calls),
             empty_list_rx(&list_calls),
         );

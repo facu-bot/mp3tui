@@ -189,6 +189,14 @@ impl SpotifyClient {
             .collect())
     }
 
+    /// Canciones de un álbum, con paginación. A diferencia de las playlists, los
+    /// ítems son canciones directas (sin objeto `track` anidado ni `album`).
+    pub fn album_tracks(&self, id: &str) -> Result<Vec<SpotifyTrack>, SpotifyError> {
+        let path = format!("/v1/albums/{id}/tracks");
+        let items: Vec<ApiTrack> = self.collect_pages(&path, &[])?;
+        Ok(items.into_iter().map(SpotifyTrack::from_api).collect())
+    }
+
     /// Playlists del usuario autenticado (incluye las privadas), con paginación.
     pub fn my_playlists(&self) -> Result<Vec<SpotifyPlaylist>, SpotifyError> {
         let items: Vec<ApiPlaylist> = self.collect_pages("/v1/me/playlists", &[])?;
@@ -965,5 +973,64 @@ mod tests {
         let client = client_with(&stub.base_url, "http://127.0.0.1:1/api/token", &path);
         assert_eq!(client.track("t1").unwrap_err(), SpotifyError::BadResponse);
         stub.finish();
+    }
+
+    // --- album_tracks ---
+
+    #[test]
+    fn test_album_tracks_maps_plain_items_and_follows_next() {
+        let path = temp_path("album");
+        write_tokens(&path, "TOKEN-AL");
+        let stub = Stub::spawn(|base| {
+            vec![
+                json_response(
+                    200,
+                    format!(
+                        r#"{{"items":[
+                          {{"id":"a1","name":"Intro","artists":[{{"id":"x","name":"Band"}}],
+                            "duration_ms":61000}},
+                          null
+                        ],"next":"{base}/v1/albums/alb1/tracks?offset=1&limit=1"}}"#
+                    ),
+                ),
+                json_response(
+                    200,
+                    r#"{"items":[
+                      {"id":"a2","name":"Song","artists":[{"id":"x","name":"Band"},{"id":"y","name":"Guest"}],
+                       "duration_ms":200000,"external_ids":{"isrc":"ISRC2"}}
+                    ],"next":null}"#,
+                ),
+            ]
+        });
+        let client = client_with(&stub.base_url, "http://127.0.0.1:1/api/token", &path);
+        let tracks = client.album_tracks("alb1").unwrap();
+        let seen = stub.finish();
+
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(tracks[0].id, "a1");
+        assert_eq!(tracks[0].title, "Intro");
+        assert_eq!(tracks[0].artists, vec!["Band".to_string()]);
+        assert_eq!(tracks[0].duration_ms, 61_000);
+        assert_eq!(tracks[0].isrc, None);
+        assert_eq!(tracks[0].album, None);
+        assert_eq!(tracks[1].artists, vec!["Band".to_string(), "Guest".to_string()]);
+        assert_eq!(tracks[1].isrc.as_deref(), Some("ISRC2"));
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].target, "/v1/albums/alb1/tracks");
+        assert!(seen[1].target.starts_with("/v1/albums/alb1/tracks?offset=1"), "{}", seen[1].target);
+        assert_eq!(seen[0].bearer.as_deref(), Some("TOKEN-AL"));
+    }
+
+    #[test]
+    fn test_album_tracks_not_found_is_a_status_error() {
+        let path = temp_path("album_404");
+        write_tokens(&path, "TOKEN-AL");
+        let stub = Stub::spawn(|_| {
+            vec![json_response(404, r#"{"error":{"status":404,"message":"Non existing id"}}"#)]
+        });
+        let client = client_with(&stub.base_url, "http://127.0.0.1:1/api/token", &path);
+        let err = client.album_tracks("nope").unwrap_err();
+        stub.finish();
+        assert!(matches!(err, SpotifyError::Status { status: 404, .. }), "{err:?}");
     }
 }

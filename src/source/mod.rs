@@ -30,9 +30,11 @@ pub enum UrlKind {
     /// Canción de Spotify (`open.spotify.com/track/<id>` o `spotify:track:<id>`).
     /// No tiene audio propio: se resuelve a YouTube por búsqueda.
     SpotifyTrack,
-    /// Playlist o álbum de Spotify; un álbum sigue el mismo camino que una
-    /// playlist.
+    /// Playlist de Spotify (`/playlist/<id>`, `spotify:playlist:<id>`).
     SpotifyPlaylist,
+    /// Álbum de Spotify: se encola como una playlist pero se lista con otro
+    /// endpoint (`/v1/albums/{id}/tracks`).
+    SpotifyAlbum,
     /// URL sin extensión ni host reconocido; requiere inspeccionar Content-Type.
     Unknown,
 }
@@ -191,8 +193,8 @@ pub fn classify(input: &str) -> Input {
 /// Referencia a un recurso de Spotify extraída de una URL web o un URI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpotifyRef {
-    /// [`UrlKind::SpotifyTrack`] o [`UrlKind::SpotifyPlaylist`] (un álbum
-    /// cuenta como playlist).
+    /// [`UrlKind::SpotifyTrack`], [`UrlKind::SpotifyPlaylist`] o
+    /// [`UrlKind::SpotifyAlbum`].
     pub kind: UrlKind,
     /// Id base62 del recurso; solo alfanumérico, así que es seguro como
     /// segmento de path de la Web API.
@@ -241,7 +243,8 @@ pub fn spotify_ref(input: &str) -> Option<SpotifyRef> {
 fn build_spotify_ref(resource: &str, id: &str) -> Option<SpotifyRef> {
     let kind = match resource.to_ascii_lowercase().as_str() {
         "track" => UrlKind::SpotifyTrack,
-        "playlist" | "album" => UrlKind::SpotifyPlaylist,
+        "playlist" => UrlKind::SpotifyPlaylist,
+        "album" => UrlKind::SpotifyAlbum,
         _ => return None,
     };
     if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric()) {
@@ -309,8 +312,8 @@ mod tests {
             (format!("https://open.spotify.com/playlist/{id}"), UrlKind::SpotifyPlaylist),
             (format!("https://open.spotify.com/playlist/{id}?si=zz"), UrlKind::SpotifyPlaylist),
             (format!("https://open.spotify.com/intl-fr/playlist/{id}"), UrlKind::SpotifyPlaylist),
-            (format!("https://open.spotify.com/album/{id}"), UrlKind::SpotifyPlaylist),
-            (format!("https://open.spotify.com/intl-de/album/{id}?si=q#frag"), UrlKind::SpotifyPlaylist),
+            (format!("https://open.spotify.com/album/{id}"), UrlKind::SpotifyAlbum),
+            (format!("https://open.spotify.com/intl-de/album/{id}?si=q#frag"), UrlKind::SpotifyAlbum),
         ] {
             assert_eq!(kind_of(&input), spotify(&input, kind), "{input}");
         }
@@ -322,7 +325,7 @@ mod tests {
         for (input, kind) in [
             (format!("spotify:track:{id}"), UrlKind::SpotifyTrack),
             (format!("spotify:playlist:{id}"), UrlKind::SpotifyPlaylist),
-            (format!("spotify:album:{id}"), UrlKind::SpotifyPlaylist),
+            (format!("spotify:album:{id}"), UrlKind::SpotifyAlbum),
         ] {
             assert_eq!(kind_of(&input), spotify(&input, kind), "{input}");
         }
@@ -336,7 +339,7 @@ mod tests {
     fn test_spotify_ref_extracts_kind_and_id() {
         assert_eq!(
             spotify_ref("https://open.spotify.com/intl-es/album/AbC123?si=x"),
-            Some(SpotifyRef { kind: UrlKind::SpotifyPlaylist, id: "AbC123".to_string() })
+            Some(SpotifyRef { kind: UrlKind::SpotifyAlbum, id: "AbC123".to_string() })
         );
         assert_eq!(
             spotify_ref("spotify:track:XyZ9"),
@@ -369,7 +372,10 @@ mod tests {
             assert!(
                 !matches!(
                     got,
-                    Input::Url { kind: UrlKind::SpotifyTrack | UrlKind::SpotifyPlaylist, .. }
+                    Input::Url { kind: UrlKind::SpotifyTrack
+                            | UrlKind::SpotifyPlaylist
+                            | UrlKind::SpotifyAlbum,
+                        .. }
                 ),
                 "{input} -> {got:?}"
             );
